@@ -8,6 +8,13 @@ public struct VirtualMachine: Sendable {
         /// Where the installed iBoot hands off to the kernel, for QEMU.
         public var handoffAddresses: [UInt64]?
         public var installed: String?
+        /// The OCI image it was pulled from, by digest.
+        public var image: String?
+        /// Whether the guest is told its disk encrypts inline, as QEMU's
+        /// virtio disk does by default. A disk restored by Virtualization.framework
+        /// is told it does not, so its Data volume is unencrypted and mounts
+        /// only when the guest is told the same here. Nil means true.
+        public var inlineEncryption: Bool?
     }
 
     public static let auxBytes: UInt64 = 33_570_816
@@ -36,7 +43,7 @@ public struct VirtualMachine: Sendable {
         while ecid == 0 {
             ecid = UInt64.random(in: 1...(.max >> 1))
         }
-        let configuration = Configuration(ecid: ecid, diskBytes: diskGiB << 30, handoffAddresses: nil, installed: nil)
+        let configuration = Configuration(ecid: ecid, diskBytes: diskGiB << 30, handoffAddresses: nil, installed: nil, image: nil, inlineEncryption: nil)
         let data = try JSONEncoder().encode(configuration)
         try data.write(to: configurationURL(directory))
         let machine = VirtualMachine(directory: directory, configuration: configuration)

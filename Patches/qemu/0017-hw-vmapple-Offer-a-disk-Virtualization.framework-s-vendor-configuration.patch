@@ -1,0 +1,120 @@
+From 2e6711ceac4b4549192125b199cf359355838e84 Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 19:07:01 +0800
+Subject: [PATCH] hw/vmapple: Offer a disk Virtualization.framework's vendor
+ configuration
+
+Virtualization.framework gives a macOS guest disk an Apple vendor data
+capability (VIRTIO_PCI_CAP_VENDOR_CFG, vendor 0x106b). AppleVirtIOStorage
+reads it as its vendor configuration, and legacy feature bit 0 tells it
+the disk does no inline encryption. Without the capability the guest
+assumes AES-XTS: APFS then creates the Data volume with per-file keys,
+and refuses to mount an unencrypted one ("unencrypted data volume is not
+allowed"). A disk restored by Virtualization.framework, such as a Tart
+image, has an unencrypted Data volume.
+
+Add vendor-legacy-features. When set, the device carries the capability
+with those legacy features, version 1, a compatible size of 0x1c, no
+features and no extended requests. The framework offers 0x60 byte
+extended requests, which this device does not parse; a guest offered
+them sends the disk nothing it can read. Unset, the device is as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/vmapple/virtio-blk.c | 57 ++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 56 insertions(+), 1 deletion(-)
+
+diff --git a/hw/vmapple/virtio-blk.c b/hw/vmapple/virtio-blk.c
+index 2c5c5f78e8..d605ef8cd3 100644
+--- a/hw/vmapple/virtio-blk.c
++++ b/hw/vmapple/virtio-blk.c
+@@ -22,6 +22,8 @@
+ #include "qemu/log.h"
+ #include "qemu/module.h"
+ #include "qapi/error.h"
++#include "hw/pci/pci.h"
++#include "standard-headers/linux/virtio_pci.h"
+ 
+ #define TYPE_VMAPPLE_VIRTIO_BLK  "vmapple-virtio-blk"
+ OBJECT_DECLARE_TYPE(VMAppleVirtIOBlk, VMAppleVirtIOBlkClass, VMAPPLE_VIRTIO_BLK)
+@@ -108,8 +110,50 @@ struct VMAppleVirtIOBlkPCI {
+ 
+     VMAppleVirtIOBlk vdev;
+     VMAppleVirtioBlkVariant variant;
++    uint64_t vendor_legacy_features;
+ };
+ 
++/*
++ * Virtualization.framework gives its macOS disks an Apple vendor data
++ * capability (virtio 1.3 VIRTIO_PCI_CAP_VENDOR_CFG, vendor 0x106b), which
++ * AppleVirtIOStorage reads as its vendor configuration: legacy features,
++ * version, compatible size, features and extended request size. Legacy
++ * feature bit 0 tells the guest the disk does no inline encryption. The
++ * framework offers 0x60 byte extended requests; this device does not parse
++ * them, and a guest offered them sends the disk no requests it can read. Without
++ * the capability the guest assumes AES-XTS, so it creates its Data volume
++ * with per-file keys and refuses to mount an unencrypted one, which is what
++ * a disk restored by Virtualization.framework has.
++ */
++#define VMAPPLE_VIRTIO_BLK_VENDOR_DATA_SIZE 0x1c
++
++static void vmapple_virtio_blk_pci_add_vendor_data(VMAppleVirtIOBlkPCI *dev,
++                                                   Error **errp)
++{
++    PCIDevice *pci_dev = &dev->parent_obj.pci_dev;
++    uint8_t data[VMAPPLE_VIRTIO_BLK_VENDOR_DATA_SIZE] = { 0 };
++    uint8_t len = 6 + sizeof(data);
++    uint8_t *cap;
++    int offset;
++
++    offset = pci_add_capability(pci_dev, PCI_CAP_ID_VNDR, 0, len, errp);
++    if (offset < 0) {
++        return;
++    }
++
++    stq_le_p(data + 0x00, dev->vendor_legacy_features);
++    stl_le_p(data + 0x08, 1);               /* version */
++    stl_le_p(data + 0x0c, sizeof(data));    /* compatible size */
++    stq_le_p(data + 0x10, 0);               /* features */
++    stl_le_p(data + 0x18, 0);               /* no extended requests */
++
++    cap = pci_dev->config + offset;
++    cap[2] = len;
++    cap[3] = VIRTIO_PCI_CAP_VENDOR_CFG;
++    pci_set_word(cap + 4, PCI_VENDOR_ID_APPLE);
++    memcpy(cap + 6, data, sizeof(data));
++}
++
+ static const Property vmapple_virtio_blk_pci_properties[] = {
+     DEFINE_PROP_UINT32("class", VirtIOPCIProxy, class_code, 0),
+     DEFINE_PROP_BIT("ioeventfd", VirtIOPCIProxy, flags,
+@@ -118,6 +162,8 @@ static const Property vmapple_virtio_blk_pci_properties[] = {
+                        DEV_NVECTORS_UNSPECIFIED),
+     DEFINE_PROP_VMAPPLE_VIRTIO_BLK_VARIANT("variant", VMAppleVirtIOBlkPCI, variant,
+                                            VM_APPLE_VIRTIO_BLK_VARIANT_UNSPECIFIED),
++    DEFINE_PROP_UINT64("vendor-legacy-features", VMAppleVirtIOBlkPCI,
++                       vendor_legacy_features, 0),
+ };
+ 
+ static void vmapple_virtio_blk_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
+@@ -153,7 +199,16 @@ static void vmapple_virtio_blk_pci_realize(VirtIOPCIProxy *vpci_dev, Error **err
+     /* Propagate the apple type down to the virtio-blk device */
+     dev->vdev.apple_type = dev->variant;
+     /* and spawn the virtio-blk device */
+-    qdev_realize(vdev, BUS(&vpci_dev->bus), errp);
++    if (!qdev_realize(vdev, BUS(&vpci_dev->bus), errp)) {
++        return;
++    }
++
++    if (dev->vendor_legacy_features) {
++        vmapple_virtio_blk_pci_add_vendor_data(dev, errp);
++        if (*errp) {
++            return;
++        }
++    }
+ 
+     /*
+      * The virtio-pci machinery adjusts its vendor/device ID based on whether
+-- 
+2.43.0
+

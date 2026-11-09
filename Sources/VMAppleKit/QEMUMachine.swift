@@ -64,6 +64,12 @@ public final class QEMUMachine: @unchecked Sendable {
         return Int(text.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
     }
 
+    /// Virtualization.framework's vendor configuration for a disk that does
+    /// not encrypt inline: legacy features 3 (Patches/qemu 0017).
+    private var rootDiskVendorData: String {
+        machine.configuration.inlineEncryption == false ? ",vendor-legacy-features=3" : ""
+    }
+
     var arguments: [String] {
         let id = String(machine.configuration.ecid, radix: 16, uppercase: true)
         let memory = "\(options.memoryGiB)G"
@@ -93,7 +99,7 @@ public final class QEMUMachine: @unchecked Sendable {
             "-drive", "if=none,format=raw,file.filename=\(path(machine.aux)),file.locking=off,id=aux",
             "-device", "vmapple-virtio-blk-pci,variant=aux,drive=aux,share-rw=on",
             "-drive", "if=none,format=raw,file.filename=\(path(machine.disk)),file.locking=off,discard=unmap,id=root",
-            "-device", "vmapple-virtio-blk-pci,variant=root,drive=root,share-rw=on",
+            "-device", "vmapple-virtio-blk-pci,variant=root,drive=root,share-rw=on" + rootDiskVendorData,
             "-chardev", "socket,id=vusb,path=\(path(machine.usbSocket)),server=on,wait=off",
             "-global", "vresearch-vusb.chardev=vusb",
             "-nic", "none",

@@ -99,6 +99,32 @@ drives DFU, iBSS, iBEC and the restore OS itself. idevicerestore talks to
 `--qemu` and `--rom` (or `VMAPPLE_QEMU` and `VMAPPLE_ROM`) name the patched QEMU
 and OpenAVB below.
 
+`pull` makes a VM from a Tart-format macOS image in an OCI registry, the format
+Tart, [macos-image](https://github.com/MiniMillionaire/macos-image) and
+mini-control publish:
+
+```sh
+vmapple-cli pull ghcr.io/minimillionaire/macos-golden-gate-vanilla:27.2 vms/pulled
+```
+
+It downloads the config, NVRAM and the disk chunks (zstd or Apple LZ4), checks
+every layer against its digest, writes one sparse `disk.img`, and reads the
+installed version and kernel handoff from the disk's Preboot volume, so a pulled
+VM needs no `restore` or `account`. The format and that read are covered in
+[Research/tart-images.md](Research/tart-images.md).
+
+A pulled VM boots with `Patches/qemu` 0017. Virtualization.framework tells a
+macOS guest that its disk does not encrypt inline, so a disk it restored has an
+unencrypted Data volume. QEMU's virtio disk said nothing, so the guest assumed
+AES-XTS and panicked mounting that volume (`unencrypted data volume is not
+allowed`). `pull` records `inlineEncryption: false` in `vm.json`, and `boot` then
+gives the root disk the same vendor configuration as the framework. A VM that
+`restore` made keeps the old disk, whose Data volume is encrypted. Measured on
+2026-11-09 with `macos-golden-gate-vanilla:27.2`: two cold boots to the desktop,
+logged in automatically, and no panic. The Dock icons are grey placeholders, as
+on a restored 27.2. The causes and the checks are in
+[Research/tart-images.md](Research/tart-images.md).
+
 ## Build
 
 ```sh
