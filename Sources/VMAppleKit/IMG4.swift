@@ -58,6 +58,14 @@ public enum IMG4 {
         return result
     }
 
+    /// The IM4P inside an IMG4, which also holds the ticket that signs it.
+    public static func im4p(img4: [UInt8]) throws -> [UInt8] {
+        let sequence = try DER.read(img4, at: 0)
+        let name = try DER.read(img4, at: sequence.body.lowerBound)
+        guard Array(img4[name.body]) == Array("IMG4".utf8) else { throw IMG4Error.malformed("not an IMG4") }
+        return Array(img4[name.next..<(try DER.read(img4, at: name.next).next)])
+    }
+
     public static func payload(im4p: [UInt8]) throws -> [UInt8] {
         let sequence = try DER.read(im4p, at: 0)
         var offset = sequence.body.lowerBound

@@ -7,7 +7,7 @@ struct VMAppleCLI: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "vmapple-cli",
         abstract: "Virtual Macs on arm64 Linux with KVM.",
-        subcommands: [Doctor.self, Probe.self, Create.self, Restore.self, Account.self, Boot.self, Screenshot.self, Click.self, Press.self, IBoot.self, Stop.self]
+        subcommands: [Doctor.self, Probe.self, Create.self, Pull.self, Restore.self, Account.self, Boot.self, Screenshot.self, Click.self, Press.self, IBoot.self, Stop.self]
     )
 }
 
@@ -103,6 +103,35 @@ struct Create: ParsableCommand {
     func run() throws {
         let machine = try VirtualMachine.create(at: URL(fileURLWithPath: path), diskGiB: disk)
         print("Created \(machine.directory.path), ECID \(String(machine.configuration.ecid, radix: 16))")
+    }
+}
+
+// MARK: - pull
+
+struct Pull: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Create a virtual Mac from a Tart image in an OCI registry.",
+        discussion: "Takes the images Tart, macos-image and mini-control publish, with zstd or LZ4 disk layers. The image's own account and settings come with it, so no restore or account step is needed."
+    )
+
+    @Argument(help: "The image, like ghcr.io/minimillionaire/macos-golden-gate-base:27.2.")
+    var image: String
+
+    @Argument(help: "The VM's directory. It must not exist yet.")
+    var path: String
+
+    @Option(help: "Disk layers to download at once.")
+    var jobs = 4
+
+    func run() throws {
+        let machine = try ImagePull.run(
+            try OCIReference(image),
+            to: URL(fileURLWithPath: path),
+            jobs: jobs,
+            log: say
+        )
+        let installed = machine.configuration.installed.map { "macOS \($0), " } ?? ""
+        say("Created \(machine.directory.path): \(installed)ECID \(String(machine.configuration.ecid, radix: 16))")
     }
 }
 

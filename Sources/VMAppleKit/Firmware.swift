@@ -86,6 +86,12 @@ public struct Firmware: Sendable {
 
     func decompressed(_ component: String) throws -> (compressed: [UInt8], raw: [UInt8]) {
         let payload = try IMG4.payload(im4p: try load(component))
+        return (payload, try LZFSE.decode(payload))
+    }
+}
+
+enum LZFSE {
+    static func decode(_ payload: [UInt8]) throws -> [UInt8] {
         let scratch = FileManager.default.temporaryDirectory.appending(path: "vmapple-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: scratch) }
@@ -93,7 +99,7 @@ public struct Firmware: Sendable {
         let raw = scratch.appending(path: "image.raw")
         try Data(payload).write(to: compressed)
         try Tool.run("lzfse", ["-decode", "-i", compressed.path, "-o", raw.path])
-        return (payload, Array(try Data(contentsOf: raw)))
+        return Array(try Data(contentsOf: raw))
     }
 }
 

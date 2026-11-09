@@ -99,6 +99,30 @@ drives DFU, iBSS, iBEC and the restore OS itself. idevicerestore talks to
 `--qemu` and `--rom` (or `VMAPPLE_QEMU` and `VMAPPLE_ROM`) name the patched QEMU
 and OpenAVB below.
 
+`pull` makes a VM from a Tart-format macOS image in an OCI registry, the format
+Tart, [macos-image](https://github.com/MiniMillionaire/macos-image) and
+mini-control publish:
+
+```sh
+vmapple-cli pull ghcr.io/minimillionaire/macos-golden-gate-vanilla:27.2 vms/pulled
+```
+
+It downloads the config, NVRAM and the disk chunks (zstd or Apple LZ4), checks
+every layer against its digest, writes one sparse `disk.img`, and reads the
+installed version and kernel handoff from the disk's Preboot volume, so a pulled
+VM needs no `restore` or `account`. The format and that read are covered in
+[Research/tart-images.md](Research/tart-images.md).
+
+**A pulled image does not boot on this stack yet.** These images are restored on
+a Mac by Virtualization.framework, which has a Secure Enclave; the Data volume's
+media key is sealed in the SEP's xART. QEMU's `vmapple` has no SEP, so the guest
+cannot load the xART or derive the volume key and the kernel panics mounting the
+Data volume (`unencrypted data volume is not allowed`, then, past that gate,
+`M key derive-from-D failed` in xART). This is cryptographic, not a policy gate,
+so no host-side patch opens it. A VM that vmapple-cli restored itself boots
+because its whole restore ran on the same SEP-less machine. `pull` is therefore
+format compatibility for now, not a boot path.
+
 ## Build
 
 ```sh
