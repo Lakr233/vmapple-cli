@@ -32,7 +32,7 @@ fi
 fetch() {
     local name=$1 version=$2 sha256=$3
     local archive=$work/$name-$version.tar.bz2
-    curl -fsSL --retry 5 --retry-delay 5 -o "$archive" \
+    curl -fsSL --retry 10 --retry-delay 15 --retry-all-errors -o "$archive" \
         "https://github.com/libimobiledevice/$name/releases/download/$version/$name-$version.tar.bz2"
     echo "$sha256  $archive" | sha256sum -c -
     tar -xjf "$archive" -C "$work"
