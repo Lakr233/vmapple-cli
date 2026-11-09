@@ -188,6 +188,16 @@ public final class QEMUMachine: @unchecked Sendable {
         process.waitUntilExit()
     }
 
+    /// Waits for QEMU to end, at most `timeout`. Returns whether it ended.
+    public func waitUntilExit(timeout: TimeInterval) -> Bool {
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        while process.isRunning {
+            guard Date() < deadline else { return false }
+            usleep(200_000)
+        }
+        return true
+    }
+
     public func stop() {
         guard process.isRunning else { return }
         process.terminate()

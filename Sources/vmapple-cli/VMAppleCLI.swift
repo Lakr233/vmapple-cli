@@ -224,8 +224,9 @@ struct Boot: ParsableCommand {
         if let seconds {
             let qemu = QEMUMachine(machine: machine, options: options)
             try qemu.start()
-            sleep(UInt32(seconds))
-            qemu.shutDown(timeout: 120)
+            if !qemu.waitUntilExit(timeout: TimeInterval(seconds)) {
+                qemu.shutDown(timeout: 120)
+            }
             return
         }
         // A guest restart ends QEMU; boot the guest again, keeping the last
