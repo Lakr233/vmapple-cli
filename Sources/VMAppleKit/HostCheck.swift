@@ -18,7 +18,7 @@ public enum HostChecks {
     static let minimumFreeBytes: Int64 = 100 * 1024 * 1024 * 1024
 
     public static func all() -> [HostCheck] {
-        [architecture(), kvm(), pointerAuthentication(), usbip(), vulkan(), disk()]
+        [architecture(), kvm(), pointerAuthentication(), vulkan(), disk()]
     }
 
     static func architecture() -> HostCheck {
@@ -51,20 +51,6 @@ public enum HostChecks {
             .split(separator: " ") ?? []
         let ok = features.contains("paca") && features.contains("pacg")
         return HostCheck(name: "pac", state: ok ? .ok : .missing, detail: ok ? "paca pacg" : "no paca/pacg")
-    }
-
-    /// The restore reaches the guest over USB/IP.
-    static func usbip() -> HostCheck {
-        var system = utsname()
-        uname(&system)
-        let modules = "/lib/modules/\(field(of: system.release))/kernel/drivers/usb/usbip"
-        let present = (try? FileManager.default.contentsOfDirectory(atPath: modules))?
-            .contains { $0.hasPrefix("vhci-hcd") } ?? false
-        return HostCheck(
-            name: "vhci_hcd",
-            state: present ? .ok : .missing,
-            detail: present ? modules : "no vhci-hcd module in \(modules)"
-        )
     }
 
     static func vulkan() -> HostCheck {
