@@ -25,6 +25,7 @@ Restore and boot macOS on QEMU's `vmapple` machine under KVM on arm64 Linux.
 - `Sources/CTicket`, `Sources/CTatsu`: ticket requests through libtatsu, Linux only.
 - `Patches/`: changes to QEMU, Reims, metal2vulkan and idevicerestore, applied with `git am` or `git apply`.
 - `Documents/Research`: findings and designs.
+- `.github/`: the release build, `build-linux.sh`, and the workflow that runs it.
 
 ## Swift
 
