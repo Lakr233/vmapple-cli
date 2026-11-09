@@ -1,0 +1,107 @@
+From 2af6460c2bda5be21b446e7b00cabf49501cf00b Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 06:44:42 +0800
+Subject: [PATCH 6/7] hw/display/reims-vgpu-mmio: take the BQL in an iosfc
+ write only if not held
+
+The iosfc window is lockless, so its write handler takes the BQL itself
+around the dirty harvest and the action delivery. A vCPU arrives without
+it, but an access to the window from a thread that already holds the
+BQL, the main loop or a debugger, would take it a second time and hang.
+Take it only when this thread does not hold it, and release only what
+was taken here. Such a caller keeps the BQL throughout, as before the
+window was lockless.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 32d8ef21ff59c27991131002909fb9fe89830464)
+---
+ hw/display/reims-vgpu-mmio.c | 34 ++++++++++++++++++++++++----------
+ 1 file changed, 24 insertions(+), 10 deletions(-)
+
+diff --git a/hw/display/reims-vgpu-mmio.c b/hw/display/reims-vgpu-mmio.c
+index 59f100713f..af33d7e8b8 100644
+--- a/hw/display/reims-vgpu-mmio.c
++++ b/hw/display/reims-vgpu-mmio.c
+@@ -1053,13 +1053,20 @@ static uint64_t reims_vgpu_mmio_iosfc_read(void *opaque, hwaddr offset,
+     return val;
+ }
+ 
+-/* Take the BQL; returns when it was asked for. */
+-static int64_t reims_vgpu_mmio_iosfc_bql_lock(void)
++/*
++ * Take the BQL unless this thread holds it already, noting in @asked when it
++ * was asked for; returns whether it was taken here. A vCPU arrives without
++ * it, the window being lockless; a main-loop or debugger access to the window
++ * arrives holding it, and must not take it twice.
++ */
++static bool reims_vgpu_mmio_iosfc_bql_lock(int64_t *asked)
+ {
+-    int64_t asked = get_clock();
+-
++    *asked = get_clock();
++    if (bql_locked()) {
++        return false;
++    }
+     bql_lock();
+-    return asked;
++    return true;
+ }
+ 
+ /* Count one BQL section that began waiting at `asked` and holding at `got`. */
+@@ -1106,7 +1113,9 @@ static void reims_vgpu_mmio_iosfc_bql_report(ReimsVGPUMMIOState *s)
+ }
+ 
+ /*
+- * Runs without the BQL: the iosfc window is lockless (reims_vgpu_mmio_init).
++ * A vCPU runs this without the BQL: the iosfc window is lockless
++ * (reims_vgpu_mmio_init). A caller that holds the BQL already, the main loop
++ * or a debugger, keeps it throughout, as before.
+  * The Rust call can wait for the device lock for as long as the drain worker
+  * keeps it, a whole tranche, and a vCPU holding the BQL through that wait
+  * stalled the main loop and every other vCPU exit that needed the BQL with it.
+@@ -1123,6 +1132,7 @@ static void reims_vgpu_mmio_iosfc_write(void *opaque, hwaddr offset, uint64_t da
+ {
+     ReimsVGPUMMIOState *s = opaque;
+     int64_t asked;
++    bool took;
+     int rc;
+ 
+     if (s->rust_handle == 0) {
+@@ -1138,18 +1148,20 @@ static void reims_vgpu_mmio_iosfc_write(void *opaque, hwaddr offset, uint64_t da
+      * covering both costs a predicate, not a sync. The dirty-log sync needs the
+      * BQL.
+      */
+-    asked = reims_vgpu_mmio_iosfc_bql_lock();
++    took = reims_vgpu_mmio_iosfc_bql_lock(&asked);
+     {
+         int64_t got = get_clock();
+ 
+         reims_vgpu_dirty_harvest(s->dirty);
+         reims_vgpu_mmio_iosfc_bql_note(&s->iosfc_harvest_bql, asked, got);
+     }
+-    bql_unlock();
++    if (took) {
++        bql_unlock();
++    }
+ 
+     rc = reims_vgpu_qemu_iosfc_write(s->rust_handle, offset, data, size);
+ 
+-    asked = reims_vgpu_mmio_iosfc_bql_lock();
++    took = reims_vgpu_mmio_iosfc_bql_lock(&asked);
+     {
+         int64_t got = get_clock();
+ 
+@@ -1165,7 +1177,9 @@ static void reims_vgpu_mmio_iosfc_write(void *opaque, hwaddr offset, uint64_t da
+         reims_vgpu_mmio_iosfc_bql_note(&s->iosfc_deliver_bql, asked, got);
+         reims_vgpu_mmio_iosfc_bql_report(s);
+     }
+-    bql_unlock();
++    if (took) {
++        bql_unlock();
++    }
+ }
+ 
+ static const MemoryRegionOps reims_vgpu_mmio_gfx_ops = {
+-- 
+2.43.0
+

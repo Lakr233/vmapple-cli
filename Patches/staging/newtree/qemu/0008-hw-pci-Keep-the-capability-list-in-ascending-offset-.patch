@@ -1,0 +1,58 @@
+From 39dcd340cb60b6c70ae13cbf1d595ecba539e41e Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Sun, 8 Nov 2026 11:45:11 +0800
+Subject: [PATCH 08/14] hw/pci: Keep the capability list in ascending offset
+ order
+
+macOS 27's IOPCIFamily answers extendedFindPCICapability from a cache: it
+returns the first capability in list order whose offset is past the one
+it was handed. QEMU links each new capability at the head, so a
+virtio-pci device lists them in descending order (0x98, 0x84, 0x70, ...),
+and the search after 0x70 returns 0x84 again. The 27.2 restore OS spent
+its life in that loop (72 million config reads in five minutes) and its
+disk and USB drivers never started.
+
+Insert each capability where its offset belongs. With this 27.2 restores
+and boots to Setup Assistant; 13 to 26 walk the list either way.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/pci/pci.c | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/hw/pci/pci.c b/hw/pci/pci.c
+index 0efb4eb4bb..7e992ea03a 100644
+--- a/hw/pci/pci.c
++++ b/hw/pci/pci.c
+@@ -2681,6 +2681,7 @@ int pci_add_capability(PCIDevice *pdev, uint8_t cap_id,
+                        Error **errp)
+ {
+     uint8_t *config;
++    uint8_t *link;
+     int i, overlapping_cap;
+ 
+     if (!offset) {
+@@ -2708,8 +2709,18 @@ int pci_add_capability(PCIDevice *pdev, uint8_t cap_id,
+ 
+     config = pdev->config + offset;
+     config[PCI_CAP_LIST_ID] = cap_id;
+-    config[PCI_CAP_LIST_NEXT] = pdev->config[PCI_CAPABILITY_LIST];
+-    pdev->config[PCI_CAPABILITY_LIST] = offset;
++    /*
++     * Keep the list in ascending offset order. macOS 27's IOPCIFamily
++     * continues a capability search at the first entry, in list order, past
++     * the offset it was handed, so on a descending list the search for the
++     * next virtio capability returns an earlier one and never ends.
++     */
++    link = &pdev->config[PCI_CAPABILITY_LIST];
++    while (*link && *link < offset) {
++        link = &pdev->config[*link + PCI_CAP_LIST_NEXT];
++    }
++    config[PCI_CAP_LIST_NEXT] = *link;
++    *link = offset;
+     pdev->config[PCI_STATUS] |= PCI_STATUS_CAP_LIST;
+     memset(pdev->used + offset, 0xFF, QEMU_ALIGN_UP(size, 4));
+     /* Make capability read-only by default */
+-- 
+2.43.0
+

@@ -1,0 +1,103 @@
+From 88367eebd7f66a5f7f0df0075163f2f432cc207f Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 06:44:42 +0800
+Subject: [PATCH 5/7] hw/display/reims-vgpu-shim: read a kva range whole or not
+ at all
+
+read_kva promised the rules read_gpa keeps, and did not keep them. It
+copied page by page straight into the caller's buffer, so a failure on
+a later page left the earlier pages written there; a non-zero length
+with no buffer returned success; and kva + len was never checked for
+wrapping.
+
+Check the range first: no buffer, or a range that wraps past the top of
+the address space, is -3 before anything is translated. Then read page
+by page into a buffer of our own and copy it to the caller only once
+every page has been read, so an error leaves the caller's buffer as it
+was.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit ed8f95edec08d2ee23269841127a206e7c9194bb)
+---
+ hw/display/reims-vgpu-shim.c | 39 +++++++++++++++++++++++++-----------
+ 1 file changed, 27 insertions(+), 12 deletions(-)
+
+diff --git a/hw/display/reims-vgpu-shim.c b/hw/display/reims-vgpu-shim.c
+index efef2065c5..d74bc6e0bd 100644
+--- a/hw/display/reims-vgpu-shim.c
++++ b/hw/display/reims-vgpu-shim.c
+@@ -262,15 +262,29 @@ int reims_vgpu_shim_guest_ram_regions(void *ctx, ReimsVgpuGuestRamRegion *out,
+ int reims_vgpu_shim_read_kva(void *ctx, uint64_t kva, uint8_t *buf, size_t len)
+ {
+     CPUState *cs = current_cpu;
+-    int rc = 0;
++    g_autofree uint8_t *pages = NULL;
++    size_t done = 0;
++    int rc = REIMS_VGPU_RAM_OK;
+ 
+     (void)ctx;
+-    if (!buf || len == 0) {
+-        return 0;
++    if (len == 0) {
++        return REIMS_VGPU_RAM_OK;
++    }
++    /* The same whole-range rules as read_gpa: see reims-vgpu-ram.h. */
++    if (!buf || (uint64_t)len - 1 > UINT64_MAX - kva) {
++        return REIMS_VGPU_RAM_BAD_RANGE;
+     }
+     if (!cs) {
+         return -2;
+     }
++    /*
++     * Page by page into a buffer of our own, handed over only once every
++     * page was read, so an error leaves @buf as it was.
++     */
++    pages = g_try_malloc(len);
++    if (!pages) {
++        return REIMS_VGPU_RAM_BAD_RANGE;
++    }
+     cpu_synchronize_state(cs);
+     /*
+      * RAM only, all the way down. Reims tries guest registers as pointers,
+@@ -283,28 +297,29 @@ int reims_vgpu_shim_read_kva(void *ctx, uint64_t kva, uint8_t *buf, size_t len)
+      * tables above it.
+      */
+     memory_no_dispatch_begin();
+-    while (len > 0) {
++    while (done < len) {
+         TranslateForDebugResult tres;
+         hwaddr page = qemu_target_page_size();
+         hwaddr chunk;
+         AddressSpace *as;
+ 
+-        if (!cpu_translate_for_debug(cs, kva, &tres)) {
+-            rc = -1;
++        if (!cpu_translate_for_debug(cs, kva + done, &tres)) {
++            rc = REIMS_VGPU_RAM_REFUSED;
+             break;
+         }
+-        chunk = MIN(len, page - (tres.physaddr & (page - 1)));
++        chunk = MIN(len - done, page - (tres.physaddr & (page - 1)));
+         as = cpu_get_address_space(cs, cpu_asidx_from_attrs(cs, tres.attrs));
+-        rc = reims_vgpu_shim_ram_copy(as, tres.attrs, tres.physaddr, buf, chunk,
+-                                      false);
++        rc = reims_vgpu_shim_ram_copy(as, tres.attrs, tres.physaddr,
++                                      pages + done, chunk, false);
+         if (rc != REIMS_VGPU_RAM_OK) {
+             break;
+         }
+-        kva += chunk;
+-        buf += chunk;
+-        len -= chunk;
++        done += chunk;
+     }
+     memory_no_dispatch_end();
++    if (rc == REIMS_VGPU_RAM_OK) {
++        memcpy(buf, pages, len);
++    }
+     return rc;
+ }
+ 
+-- 
+2.43.0
+

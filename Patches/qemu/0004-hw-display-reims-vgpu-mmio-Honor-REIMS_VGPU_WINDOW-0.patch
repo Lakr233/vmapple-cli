@@ -1,0 +1,34 @@
+From a484fb5bd258c12ea599573c52e3f958003265b3 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Sun, 8 Nov 2026 03:33:11 +0800
+Subject: [PATCH 2/2] hw/display/reims-vgpu-mmio: Honor REIMS_VGPU_WINDOW=0
+
+The MMIO device always opened the host window, so with no X11 session frames
+went nowhere. With 0 the QEMU console is the display, and screendump works.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/reims-vgpu-mmio.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/hw/display/reims-vgpu-mmio.c b/hw/display/reims-vgpu-mmio.c
+index c25d607d73..23f8b8c79d 100644
+--- a/hw/display/reims-vgpu-mmio.c
++++ b/hw/display/reims-vgpu-mmio.c
+@@ -1126,8 +1126,11 @@ static void reims_vgpu_mmio_realize(DeviceState *dev, Error **errp)
+     qemu_console_set_cursor(s->con, cursor_builtin_hidden());
+     qemu_console_set_mouse(s->con, 0, 0, false);
+ 
+-    rc = reims_vgpu_qemu_window_start(s->rust_handle, REIMS_VGPU_EFI_BOOT_WIDTH,
+-                               REIMS_VGPU_EFI_BOOT_HEIGHT);
++    /* REIMS_VGPU_WINDOW=0 leaves the QEMU console as the display, with no X11. */
++    rc = g_strcmp0(g_getenv("REIMS_VGPU_WINDOW"), "0") == 0 ?
++         REIMS_VGPU_QEMU_OK :
++         reims_vgpu_qemu_window_start(s->rust_handle, REIMS_VGPU_EFI_BOOT_WIDTH,
++                                      REIMS_VGPU_EFI_BOOT_HEIGHT);
+     if (rc == REIMS_VGPU_QEMU_OK) {
+         s->poll_timer = timer_new_ms(QEMU_CLOCK_HOST,
+                                      reims_vgpu_mmio_poll_tick, s);
+-- 
+2.43.0
+

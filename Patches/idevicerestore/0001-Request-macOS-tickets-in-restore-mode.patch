@@ -1,0 +1,52 @@
+diff --git a/src/idevicerestore.c b/src/idevicerestore.c
+index 82691d7..5be5b3e 100644
+--- a/src/idevicerestore.c
++++ b/src/idevicerestore.c
+@@ -1290,6 +1290,30 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
+ 				return -1;
+ 			}
+ 			plist_dict_set_item(client->tss, "ApImg4Ticket", ap_ticket);
++			if (client->macos_variant) {
++				/* vmapple: the host has already taken the guest to restored by itself. */
++				const char* nonce_hex = getenv("VMAPPLE_AP_NONCE");
++				if (!nonce_hex || strlen(nonce_hex) != 64) {
++					logger(LL_ERROR, "VMAPPLE_AP_NONCE is required with --restore-mode\n");
++					return -1;
++				}
++				client->nonce = malloc(32);
++				client->nonce_size = 32;
++				for (int i = 0; i < 32; i++) {
++					sscanf(nonce_hex + i * 2, "%2hhx", &client->nonce[i]);
++				}
++				if (get_local_policy_tss_response(client, build_identity, &client->tss_localpolicy) < 0) {
++					logger(LL_ERROR, "Unable to get SHSH blobs for this device (local policy)\n");
++					return -1;
++				}
++				if (get_recoveryos_root_ticket_tss_response(client, build_identity, &client->tss_recoveryos_root_ticket) < 0) {
++					logger(LL_ERROR, "Unable to get SHSH blobs for this device (recovery OS Root Ticket)\n");
++					return -1;
++				}
++				free(client->root_ticket);
++				client->root_ticket = NULL;
++				client->root_ticket_len = 0;
++			}
+ 		} else {
+ 			if (get_tss_response(client, build_identity, &client->tss) < 0) {
+ 				logger(LL_ERROR, "Unable to get SHSH blobs for this device\n");
+@@ -2193,6 +2217,16 @@ int get_sep_nonce(struct idevicerestore_client_t* client, unsigned char** nonce,
+ 	*nonce = NULL;
+ 	*nonce_size = 0;
+ 
++	const char* sep_hex = getenv("VMAPPLE_SEP_NONCE");
++	if (sep_hex && strlen(sep_hex) == 40) {
++		*nonce = malloc(20);
++		*nonce_size = 20;
++		for (int i = 0; i < 20; i++) {
++			sscanf(sep_hex + i * 2, "%2hhx", &(*nonce)[i]);
++		}
++		return 0;
++	}
++
+ 	if (client->mode) {
+ 		mode = client->mode->index;
+ 	}

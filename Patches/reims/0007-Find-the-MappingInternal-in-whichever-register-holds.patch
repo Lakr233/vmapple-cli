@@ -1,0 +1,78 @@
+From b37c2a79f6283f8a8996ba846f01ec66410ed1ba Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Sun, 8 Nov 2026 10:42:19 +0800
+Subject: [PATCH] Find the MappingInternal in whichever register holds it
+
+macOS 26 leaves the IOSurface mapper handoff in other registers than
+x19/x21/x22: on 26.6.2 x21 holds the MappingInternal, so every MAP failed
+mapper_capture_request_type_mismatch and no surface ever reached the
+screen. When the fixed registers do not corroborate the ring entry, try
+x0..x30 for a kernel VA whose MappingInternal names this mapping id and
+size; its back pointer is the mapper device. The QEMU side reads guest
+virtual memory from RAM only, so a register naming MMIO is refused, not
+read.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/reims-vgpu/src/runtime/mapper/mod.rs | 38 +++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+
+diff --git a/crates/reims-vgpu/src/runtime/mapper/mod.rs b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+index 8843b55e..6d00a238 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/mod.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+@@ -186,6 +186,39 @@ impl<H: HostMemory + HostOps> PagesMemory for MapperMem<'_, H> {
+     }
+ }
+ 
++/// The MappingInternal in whichever register holds it.
++///
++/// macOS 26's driver leaves the handoff in other registers than x19/x21/x22.
++/// A MappingInternal names its own mapping id and size, so the register can be
++/// found by asking each one, and its back pointer is the mapper device.
++fn find_mapping_internal<H: HostMemory + HostOps>(
++    host: &H,
++    producer: u32,
++    mid: u32,
++    request_type: u32,
++) -> Option<MapperCapture> {
++    let mem = MapperMem::new(host);
++    (0..=30u32).find_map(|reg| {
++        let internal = host.read_xreg(reg).ok().filter(|&v| guest_kernel_va(v))?;
++        let fields = read_mapper_identity(&mem, internal, false, 0).ok()?;
++        if fields.mapping_id != mid
++            || fields.internal_size != iosurface_pages::MAPPING_INTERNAL_EXPECTED_SIZE
++            || !guest_kernel_va(fields.owner_kva)
++        {
++            return None;
++        }
++        if crate::observe::first_sight("mapper_capture_register", u64::from(reg)) {
++            crate::observe::off(format!("mapper_capture_register reg=x{reg} mapping={mid}"));
++        }
++        Some(MapperCapture {
++            producer,
++            mapper_device_kva: fields.owner_kva,
++            request_type,
++            mapping_internal: internal,
++        })
++    })
++}
++
+ /// Capture mapper handoff registers while still on the publishing vCPU.
+ ///
+ /// Call from the iosfc producer MMIO write path before scheduling the drain BH.
+@@ -236,6 +269,11 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
+             return capture_xreg_failed(mid, producer, decline);
+         }
+     };
++    if rtype != request.request_type || !guest_kernel_va(internal) {
++        if let Some(capture) = find_mapping_internal(host, producer, mid, request.request_type) {
++            return Some(capture);
++        }
++    }
+     if rtype != request.request_type {
+         let decline = MapperDecline::CaptureRequestTypeMismatch;
+         note_capture_fail(
+-- 
+2.43.0
+

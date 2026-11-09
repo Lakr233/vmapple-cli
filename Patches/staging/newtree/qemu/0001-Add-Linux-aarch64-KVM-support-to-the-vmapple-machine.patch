@@ -1,0 +1,222 @@
+From c7e15e74e270fb744689530f0a0013fe2f249c05 Mon Sep 17 00:00:00 2001
+From: Icegrave0391 <chuqiz@deepseek.com>
+Date: Thu, 10 Sep 2026 14:09:16 +0800
+Subject: [PATCH 01/14] Add Linux aarch64 KVM support to the vmapple machine
+
+Enable VMAPPLE under KVM/TCG, route current EL1 xregs through a shared helper, add 16 KiB shared file-backed page aliases for scattered guest memory, and keep the Rust staticlib build on the locked Cargo manifest.
+---
+ hw/vmapple/Kconfig           |  6 ++--
+ hw/vmapple/vmapple.c         | 61 +++++++++++++++++++++++++++++++++---
+ include/hw/vmapple/vmapple.h |  2 ++
+ target/arm/kvm.c             | 51 ++++++++++++++++++++++++++++++
+ 4 files changed, 113 insertions(+), 7 deletions(-)
+
+diff --git a/hw/vmapple/Kconfig b/hw/vmapple/Kconfig
+index 37c27473e2..3a263cb891 100644
+--- a/hw/vmapple/Kconfig
++++ b/hw/vmapple/Kconfig
+@@ -14,10 +14,10 @@ config VMAPPLE_VIRTIO_BLK
+ 
+ config VMAPPLE
+     bool
+-    depends on ARM
+-    depends on HVF
++    depends on AARCH64
++    depends on TCG || HVF || KVM
+     depends on MAC_PVG
+-    default y if ARM
++    default y
+     imply PCI_DEVICES
+     select ARM_GICV3
+     select PLATFORM_BUS
+diff --git a/hw/vmapple/vmapple.c b/hw/vmapple/vmapple.c
+index 2e055b01bd..55eb98f473 100644
+--- a/hw/vmapple/vmapple.c
++++ b/hw/vmapple/vmapple.c
+@@ -33,6 +33,7 @@
+ #include "hw/core/qdev-properties.h"
+ #include "hw/core/sysbus.h"
+ #include "hw/usb/usb.h"
++#include "hw/arm/bsa.h"
+ #include "hw/arm/boot.h"
+ #include "hw/char/pl011.h"
+ #include "hw/intc/arm_gic.h"
+@@ -49,13 +50,20 @@
+ #include "qobject/qlist.h"
+ #include "standard-headers/linux/input.h"
+ #include "system/hvf.h"
++#ifdef CONFIG_HVF
+ #include "system/hvf_int.h"
++#endif
++#include "system/hw_accel.h"
++#include "system/kvm.h"
+ #include "system/reset.h"
+ #include "system/runstate.h"
+ #include "system/system.h"
+ #include "target/arm/gtimer.h"
+ #include "target/arm/cpu.h"
++#ifdef CONFIG_HVF
+ #include "target/arm/hvf_arm.h"
++#endif
++#include "kvm_arm.h"
+ 
+ struct VMAppleMachineState {
+     MachineState parent;
+@@ -78,6 +86,19 @@ struct VMAppleMachineState {
+ #define TYPE_VMAPPLE_MACHINE   MACHINE_TYPE_NAME("vmapple")
+ OBJECT_DECLARE_SIMPLE_TYPE(VMAppleMachineState, VMAPPLE_MACHINE)
+ 
++bool vmapple_read_current_xreg(unsigned int index, uint64_t *value)
++{
++    CPUState *cs = current_cpu;
++
++    if (!cs || !value || index >= ARRAY_SIZE(ARM_CPU(cs)->env.xregs)) {
++        return false;
++    }
++
++    cpu_synchronize_state(cs);
++    *value = ARM_CPU(cs)->env.xregs[index];
++    return true;
++}
++
+ /* Number of external interrupt lines to configure the GIC with */
+ #define NUM_IRQS 256
+ 
+@@ -280,11 +301,33 @@ static void create_gic(VMAppleMachineState *vms, MemoryRegion *mem)
+      */
+     for (i = 0; i < smp_cpus; i++) {
+         DeviceState *cpudev = DEVICE(qemu_get_cpu(i));
++        const int timer_irq[] = {
++            [GTIMER_PHYS] = ARCH_TIMER_NS_EL1_IRQ,
++            [GTIMER_VIRT] = ARCH_TIMER_VIRT_IRQ,
++            [GTIMER_HYP]  = ARCH_TIMER_NS_EL2_IRQ,
++            [GTIMER_SEC]  = ARCH_TIMER_S_EL1_IRQ,
++        };
++        int timer;
++
++        for (timer = 0; timer < ARRAY_SIZE(timer_irq); timer++) {
++            qdev_connect_gpio_out(cpudev, timer,
++                                  qdev_get_gpio_in(vms->gic,
++                                      arm_gic_ppi_index(i, timer_irq[timer])));
++        }
+ 
+-        /* Map the virt timer to PPI 27 */
+-        qdev_connect_gpio_out(cpudev, GTIMER_VIRT,
+-                              qdev_get_gpio_in(vms->gic,
+-                                               arm_gic_ppi_index(i, 27)));
++        qdev_connect_gpio_out_named(cpudev, "gicv3-maintenance-interrupt", 0,
++                                    qdev_get_gpio_in(vms->gic,
++                                        arm_gic_ppi_index(i,
++                                            ARCH_GIC_MAINT_IRQ)));
++        qdev_connect_gpio_out_named(cpudev, "pmu-interrupt", 0,
++                                    qdev_get_gpio_in(vms->gic,
++                                        arm_gic_ppi_index(i,
++                                            VIRTUAL_PMU_IRQ)));
++
++        if (kvm_enabled()) {
++            kvm_arm_pmu_set_irq(ARM_CPU(qemu_get_cpu(i)), VIRTUAL_PMU_IRQ);
++            kvm_arm_pmu_init(ARM_CPU(qemu_get_cpu(i)));
++        }
+ 
+         /* Map the GIC IRQ and FIQ lines to CPU */
+         sysbus_connect_irq(gicbusdev, i, qdev_get_gpio_in(cpudev, ARM_CPU_IRQ));
+@@ -667,6 +710,16 @@ static void mach_vmapple_init(MachineState *machine)
+          */
+         object_property_set_bool(cpu, "cpu-on-copies-pauth-keys", true,
+                                  &error_fatal);
++        /*
++         * Ventura's ApplePSCI driver accepts PSCI through version 1.1 and
++         * refuses to attach when newer Linux KVM hosts expose PSCI 1.2/1.3.
++         * HVF and TCG already implement 1.1, so pin the KVM guest ABI to the
++         * same version before KVM_ARM_VCPU_INIT.
++         */
++        if (kvm_enabled()) {
++            object_property_set_str(cpu, "kvm-psci-version", "1.1",
++                                    &error_fatal);
++        }
+ 
+         /* Secondary CPUs start in PSCI powered-down state */
+         if (n > 0) {
+diff --git a/include/hw/vmapple/vmapple.h b/include/hw/vmapple/vmapple.h
+index 9c1ad1bd8c..cb49130ba0 100644
+--- a/include/hw/vmapple/vmapple.h
++++ b/include/hw/vmapple/vmapple.h
+@@ -20,4 +20,6 @@
+ 
+ #define TYPE_VMAPPLE_VIRTIO_BLK_PCI "vmapple-virtio-blk-pci"
+ 
++bool vmapple_read_current_xreg(unsigned int index, uint64_t *value);
++
+ #endif /* HW_VMAPPLE_VMAPPLE_H */
+diff --git a/target/arm/kvm.c b/target/arm/kvm.c
+index 3d905f8565..0fb83f4051 100644
+--- a/target/arm/kvm.c
++++ b/target/arm/kvm.c
+@@ -653,6 +653,24 @@ int kvm_arch_init(MachineState *ms, KVMState *s)
+ 
+     cap_has_mp_state = kvm_check_extension(s, KVM_CAP_MP_STATE);
+ 
++    if (g_getenv("QEMU_VMAPPLE_PAC_DEFAULTS")) {
++        struct kvm_smccc_filter filter = {
++            .base = 0xc1000001,
++            .nr_functions = 1,
++            .action = KVM_SMCCC_FILTER_FWD_TO_USER,
++        };
++        struct kvm_device_attr attr = {
++            .group = KVM_ARM_VM_SMCCC_CTRL,
++            .attr = KVM_ARM_VM_SMCCC_FILTER,
++            .addr = (uintptr_t)&filter,
++        };
++        ret = kvm_vm_ioctl(s, KVM_SET_DEVICE_ATTR, &attr);
++        if (ret < 0) {
++            error_report("VMApple default-key filter failed: %s", strerror(-ret));
++            return ret;
++        }
++    }
++
+     /* Check whether user space can specify guest syndrome value */
+     cap_has_inject_serror_esr =
+         kvm_check_extension(s, KVM_CAP_ARM_INJECT_SERROR_ESR);
+@@ -1594,6 +1612,39 @@ int kvm_arch_handle_exit(CPUState *cs, struct kvm_run *run)
+     int ret = 0;
+ 
+     switch (run->exit_reason) {
++    case KVM_EXIT_HYPERCALL:
++        if (g_getenv("QEMU_VMAPPLE_PAC_DEFAULTS") &&
++            run->hypercall.nr == 0xc1000001) {
++            /* Diagnostic response only; no architectural key registers change. */
++            static unsigned int reported;
++            uint64_t values[] = {
++                0,
++                UINT64_C(0xfeedfacefeedfad5),
++                UINT64_C(0xfeedfacefeedfacf),
++                UINT64_C(0xfeedfacefeedfad3),
++                UINT64_C(0xfeedfacefeedfad9),
++            };
++            for (unsigned int i = 0; i < ARRAY_SIZE(values); i++) {
++                uint64_t reg = KVM_REG_ARM64 | KVM_REG_SIZE_U64 |
++                    KVM_REG_ARM_CORE |
++                    (KVM_REG_ARM_CORE_REG(regs.regs[0]) + i * 2);
++                ret = kvm_set_one_reg(cs, reg, &values[i]);
++                if (ret) {
++                    error_report("VMApple default-key response failed: %s",
++                                 strerror(-ret));
++                    return ret;
++                }
++            }
++            run->hypercall.ret = 0;
++            if (reported++ < 4) {
++                warn_report("VMApple PAC_GET_DEFAULT_KEYS answered with research "
++                            "defaults; PAC key switching is not emulated");
++            }
++        } else {
++            qemu_log_mask(LOG_UNIMP, "unhandled Arm hypercall %#" PRIx64 "\n",
++                          (uint64_t)run->hypercall.nr);
++        }
++        break;
+     case KVM_EXIT_DEBUG:
+         if (kvm_arm_handle_debug(cpu, &run->debug.arch)) {
+             ret = EXCP_DEBUG;
+-- 
+2.43.0
+

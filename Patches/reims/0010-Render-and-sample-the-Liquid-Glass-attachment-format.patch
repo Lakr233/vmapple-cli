@@ -1,0 +1,398 @@
+From 1e1a981fe9a0e70dbdd57f00047261569b56451f Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Sun, 8 Nov 2026 12:10:50 +0800
+Subject: [PATCH] Render and sample the Liquid Glass attachment formats
+
+macOS 26 and 27 draw their Setup Assistant panels through RG16Uint
+targets that a later pass samples, beside a memoryless RG32Float colour
+attachment. Neither was renderable, so every panel pass was refused and
+the panels never appeared.
+
+Both become texel layouts: rendered and sampled natively as R16G16_UINT
+and R32G32_SFLOAT, resident at their own format. An integer layout needs
+COLOR_ATTACHMENT only, since it never blends. The CPU seed, readback and
+Store converters get lossy arms so the renderable-set invariant holds;
+the resident rail is what keeps them exact. The capability word gives the
+image dimension 24 bits to make room for the two new layout bits.
+
+27.2 now draws its language panel.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../backend/vulkan/caps/device_features.rs    | 10 +-
+ .../src/backend/vulkan/engine/mod.rs          |  9 +-
+ .../src/backend/vulkan/translate/pixel.rs     | 28 ++++++
+ .../reims-vgpu/src/contract/pixel_format.rs   | 96 ++++++++++++++++++-
+ crates/reims-vgpu/src/runtime/draw/vulkan.rs  |  1 +
+ 5 files changed, 134 insertions(+), 10 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/backend/vulkan/caps/device_features.rs b/crates/reims-vgpu/src/backend/vulkan/caps/device_features.rs
+index c1302460..0ddfda08 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/caps/device_features.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/caps/device_features.rs
+@@ -686,10 +686,14 @@ pub unsafe fn query(
+             .optimal_tiling_features;
+         sampled_linear_filter[layout.index()] =
+             features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR);
+-        color_attachment_blend[layout.index()] = features.contains(
++        // An integer layout never blends, in Metal or Vulkan; rendering into it
++        // is the whole capability.
++        let needed = if layout == TexelLayout::Rg16Uint {
+             vk::FormatFeatureFlags::COLOR_ATTACHMENT
+-                | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND,
+-        );
++        } else {
++            vk::FormatFeatureFlags::COLOR_ATTACHMENT | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
++        };
++        color_attachment_blend[layout.index()] = features.contains(needed);
+     }
+ 
+     // The guest is handed ONE sample-count answer and uses it for colour
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs b/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
+index 6d29e43f..55e67294 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
+@@ -405,7 +405,10 @@ fn end_of_tranche_requires_engine(batch_open: bool, device_lost: bool) -> bool {
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ struct DeviceCapabilitySnapshot(u64);
+ 
+-const CAP_MAX_DIMENSION_BITS: u32 = u32::BITS;
++/// Wide enough for any Vulkan image dimension; the rest of the word is one bit
++/// per texel layout, twice over.
++const CAP_MAX_DIMENSION_BITS: u32 = 24;
++const CAP_MAX_DIMENSION_MASK: u64 = (1 << CAP_MAX_DIMENSION_BITS) - 1;
+ const CAP_LAYOUT_SHIFT: u32 = CAP_MAX_DIMENSION_BITS;
+ const CAP_GPU_ONLY_BIT: u32 =
+     CAP_LAYOUT_SHIFT + crate::contract::pixel_format::TexelLayout::ALL.len() as u32;
+@@ -426,7 +429,7 @@ impl DeviceCapabilitySnapshot {
+         features: &crate::backend::vulkan::caps::device_features::DeviceFeatures,
+         quirks: crate::backend::vulkan::caps::DriverQuirk,
+     ) -> Self {
+-        let mut word = u64::from(features.max_image_dimension_2d);
++        let mut word = u64::from(features.max_image_dimension_2d).min(CAP_MAX_DIMENSION_MASK);
+         for (index, supported) in features.color_attachment_blend.iter().enumerate() {
+             if *supported {
+                 word |= 1_u64 << (CAP_LAYOUT_SHIFT + index as u32);
+@@ -445,7 +448,7 @@ impl DeviceCapabilitySnapshot {
+     }
+ 
+     fn max_render_target_dimension(self) -> u32 {
+-        self.0 as u32
++        (self.0 & CAP_MAX_DIMENSION_MASK) as u32
+     }
+ 
+     fn render_target_layout_supported(
+diff --git a/crates/reims-vgpu/src/backend/vulkan/translate/pixel.rs b/crates/reims-vgpu/src/backend/vulkan/translate/pixel.rs
+index f0403017..e5762f9c 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/translate/pixel.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/translate/pixel.rs
+@@ -132,10 +132,12 @@ pub fn translate(mtl: u16) -> Result<PixelFormat, TranslateReason> {
+         p::MTL_FORMAT_RG8_UNORM => linear(vk::Format::R8G8_UNORM, 2),
+         p::MTL_FORMAT_RG8_UINT => linear(vk::Format::R8G8_UINT, 2),
+         p::MTL_FORMAT_RG16_UNORM => linear(vk::Format::R16G16_UNORM, 4),
++        p::MTL_FORMAT_RG16_UINT => linear(vk::Format::R16G16_UINT, 4),
+         p::MTL_FORMAT_R32_UINT => linear(vk::Format::R32_UINT, 4),
+         p::MTL_FORMAT_R32_SINT => linear(vk::Format::R32_SINT, 4),
+         p::MTL_FORMAT_R32_FLOAT => linear(vk::Format::R32_SFLOAT, 4),
+         p::MTL_FORMAT_RG16_FLOAT => linear(vk::Format::R16G16_SFLOAT, 4),
++        p::MTL_FORMAT_RG32_FLOAT => linear(vk::Format::R32G32_SFLOAT, 8),
+         p::MTL_FORMAT_RGBA8_UNORM => linear(vk::Format::R8G8B8A8_UNORM, 4),
+         p::MTL_FORMAT_RGBA8_UNORM_SRGB => {
+             srgb(vk::Format::R8G8B8A8_SRGB, vk::Format::R8G8B8A8_UNORM, 4)
+@@ -234,6 +236,8 @@ pub fn sampled_pixels(
+         // with mandatory linear filtering, so neither needs a capability gate.
+         vk::Format::R16_UNORM => TexelLayout::R16Unorm,
+         vk::Format::R16G16_UNORM => TexelLayout::Rg16Unorm,
++        vk::Format::R16G16_UINT => TexelLayout::Rg16Uint,
++        vk::Format::R32G32_SFLOAT => TexelLayout::Rg32Float,
+         // The half-float colour layouts. A recent macOS window server
+         // composites in `MTLPixelFormatRGBA16Float`, and every such bind used to
+         // land on the CPU re-read rung and be quantized to unorm8 on the way in
+@@ -283,6 +287,8 @@ pub fn vk_texel_layout(layout: TexelLayout) -> vk::Format {
+         TexelLayout::R32Float => vk::Format::R32_SFLOAT,
+         TexelLayout::R16Unorm => vk::Format::R16_UNORM,
+         TexelLayout::Rg16Unorm => vk::Format::R16G16_UNORM,
++        TexelLayout::Rg16Uint => vk::Format::R16G16_UINT,
++        TexelLayout::Rg32Float => vk::Format::R32G32_SFLOAT,
+         TexelLayout::Rgba16Unorm => vk::Format::R16G16B16A16_UNORM,
+         TexelLayout::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
+         TexelLayout::Rg16Float => vk::Format::R16G16_SFLOAT,
+@@ -1035,8 +1041,10 @@ mod tests {
+     fn a_texture_the_graphics_rail_samples_is_not_refused_by_the_compute_one() {
+         const EXCEPTIONS: &[(u16, &str)] = &[
+             (p::MTL_FORMAT_A8_UNORM, "needs a component mapping"),
++            (p::MTL_FORMAT_RG16_UINT, "integer: no compute storage selector yet"),
+             (p::MTL_FORMAT_RGBA8_UNORM_SRGB, "would downgrade unrecorded"),
+             (p::MTL_FORMAT_BGRA8_UNORM_SRGB, "would downgrade unrecorded"),
++            (p::MTL_FORMAT_RG32_FLOAT, "no compute storage selector yet"),
+         ];
+ 
+         let mut refused = Vec::new();
+@@ -1111,6 +1119,18 @@ mod tests {
+     /// derived from the table under test, so a mistranslation shows up as a
+     /// diff instead of agreeing with itself.
+     const EXPECTED: &[(u16, vk::Format, u32, TransferFunction)] = &[
++        (
++            p::MTL_FORMAT_RG16_UINT,
++            vk::Format::R16G16_UINT,
++            4,
++            TransferFunction::Linear,
++        ),
++        (
++            p::MTL_FORMAT_RG32_FLOAT,
++            vk::Format::R32G32_SFLOAT,
++            8,
++            TransferFunction::Linear,
++        ),
+         (
+             p::MTL_FORMAT_A8_UNORM,
+             vk::Format::R8_UNORM,
+@@ -1823,6 +1843,8 @@ mod tests {
+             (TexelLayout::R32Float, vk::Format::R32_SFLOAT, 4),
+             (TexelLayout::R16Unorm, vk::Format::R16_UNORM, 2),
+             (TexelLayout::Rg16Unorm, vk::Format::R16G16_UNORM, 4),
++            (TexelLayout::Rg16Uint, vk::Format::R16G16_UINT, 4),
++            (TexelLayout::Rg32Float, vk::Format::R32G32_SFLOAT, 8),
+         ] {
+             assert_eq!(
+                 vk_texel_layout(layout),
+@@ -1886,6 +1908,10 @@ mod tests {
+         assert_eq!(
+             sampled,
+             vec![
++                // The Liquid Glass attachments macOS 26 and 27 render and then
++                // sample: RG16Uint shapes and an RG32Float companion.
++                p::MTL_FORMAT_RG16_UINT,
++                p::MTL_FORMAT_RG32_FLOAT,
+                 // A8Unorm is present, and it is the one format here admitted
+                 // with a non-identity plan: its byte rides in `R8_UNORM` and
+                 // the plan puts it back in alpha. Binding it without the plan
+@@ -1934,6 +1960,8 @@ mod tests {
+         assert_eq!(
+             color,
+             vec![
++                p::MTL_FORMAT_RG16_UINT,
++                p::MTL_FORMAT_RG32_FLOAT,
+                 // macOS 26 renders into a single-channel half-float linear GVA
+                 // target — a blur/backdrop intermediate — and it was refused as
+                 // `rt_resolve reason=rt_linear_format` three times a driven
+diff --git a/crates/reims-vgpu/src/contract/pixel_format.rs b/crates/reims-vgpu/src/contract/pixel_format.rs
+index 12543575..03dc4c53 100644
+--- a/crates/reims-vgpu/src/contract/pixel_format.rs
++++ b/crates/reims-vgpu/src/contract/pixel_format.rs
+@@ -71,10 +71,16 @@ pub const MTL_FORMAT_RG8_UINT: u16 = 0x21;
+ /// `MTLPixelFormatRG16Unorm`. The chroma half of [`MTL_FORMAT_R16_UNORM`],
+ /// as [`MTL_FORMAT_RG8_UNORM`] is of [`MTL_FORMAT_R8_UNORM`].
+ pub const MTL_FORMAT_RG16_UNORM: u16 = 0x3c;
++/// `MTLPixelFormatRG16Uint`. macOS 26 renders Liquid Glass panels into it and
++/// samples the result back.
++pub const MTL_FORMAT_RG16_UINT: u16 = 0x3f;
+ pub const MTL_FORMAT_R32_UINT: u16 = 0x35;
+ pub const MTL_FORMAT_R32_SINT: u16 = 0x36;
+ pub const MTL_FORMAT_R32_FLOAT: u16 = 0x37;
+ pub const MTL_FORMAT_RG16_FLOAT: u16 = 0x41;
++/// `MTLPixelFormatRG32Float`. macOS 27 attaches a memoryless one as a third
++/// colour attachment of its Setup Assistant passes.
++pub const MTL_FORMAT_RG32_FLOAT: u16 = 0x69;
+ pub const MTL_FORMAT_RGBA8_UNORM: u16 = 0x46;
+ pub const MTL_FORMAT_RGBA8_UNORM_SRGB: u16 = 0x47;
+ pub const MTL_FORMAT_RGBA8_UINT: u16 = 0x49;
+@@ -254,6 +260,14 @@ pub enum TexelLayout {
+     /// 4 bytes/texel — the chroma half of [`Self::R16Unorm`], sampled natively as
+     /// `R16G16_UNORM`. Four bytes wide but **not** a colour order.
+     Rg16Unorm,
++    /// 4 bytes/texel, two sixteen-bit unsigned integer channels, sampled and
++    /// rendered natively as `R16G16_UINT`. macOS 26 renders Liquid Glass shapes
++    /// into it. Integer texels: no CPU loader, no blending, never a colour order.
++    Rg16Uint,
++    /// 8 bytes/texel, two `float32` channels, rendered natively as
++    /// `R32G32_SFLOAT`. macOS 27 attaches a memoryless one beside its colour
++    /// target. Not a colour order and no CPU loader.
++    Rg32Float,
+     /// 8 bytes/texel, four `float16` channels in R,G,B,A order, sampled
+     /// natively as `R16G16B16A16_SFLOAT`.
+     ///
+@@ -332,6 +346,8 @@ impl TexelLayout {
+         Self::Rgb10a2Unorm,
+         Self::Bgr10a2Unorm,
+         Self::Rg11b10Float,
++        Self::Rg16Uint,
++        Self::Rg32Float,
+     ];
+ 
+     /// This layout's position in [`Self::ALL`], so a host-side table can be an
+@@ -358,6 +374,8 @@ impl TexelLayout {
+             Self::Rgb10a2Unorm => 11,
+             Self::Bgr10a2Unorm => 12,
+             Self::Rg11b10Float => 13,
++            Self::Rg16Uint => 14,
++            Self::Rg32Float => 15,
+         }
+     }
+ 
+@@ -370,10 +388,10 @@ impl TexelLayout {
+             Self::R16Float => R16F_BPP,
+             Self::R32Float => R32F_BPP,
+             Self::R16Unorm => R16_BPP,
+-            Self::Rg16Unorm => RG16_BPP,
++            Self::Rg16Unorm | Self::Rg16Uint => RG16_BPP,
+             Self::Rgba16Float => RGBA16F_BPP,
+             Self::Rg16Float => RG16F_BPP,
+-            Self::Rgba16Unorm => RGBA16_BPP,
++            Self::Rgba16Unorm | Self::Rg32Float => RGBA16_BPP,
+             Self::Rgb10a2Unorm | Self::Bgr10a2Unorm | Self::Rg11b10Float => RGBA8_BPP,
+         }
+     }
+@@ -427,6 +445,8 @@ impl TexelLayout {
+             | Self::R32Float
+             | Self::R16Unorm
+             | Self::Rg16Unorm
++            | Self::Rg16Uint
++            | Self::Rg32Float
+             | Self::Rgba16Unorm
+             | Self::Rgb10a2Unorm
+             | Self::Bgr10a2Unorm
+@@ -459,6 +479,8 @@ impl TexelLayout {
+             | Self::R32Float
+             | Self::R16Unorm
+             | Self::Rg16Unorm
++            | Self::Rg16Uint
++            | Self::Rg32Float
+             | Self::Rgba16Unorm
+             | Self::Rgb10a2Unorm
+             | Self::Bgr10a2Unorm
+@@ -706,7 +728,7 @@ pub fn bytes_per_pixel(format: u16) -> Option<u32> {
+         | MTL_FORMAT_RG8_UINT
+         | MTL_FORMAT_DEPTH16_UNORM => RG8_BPP,
+         MTL_FORMAT_R16_UNORM => R16_BPP,
+-        MTL_FORMAT_RG16_UNORM => RG16_BPP,
++        MTL_FORMAT_RG16_UNORM | MTL_FORMAT_RG16_UINT => RG16_BPP,
+         MTL_FORMAT_RG16_FLOAT => RG16F_BPP,
+         MTL_FORMAT_RGBA8_UNORM
+         | MTL_FORMAT_RGBA8_UNORM_SRGB
+@@ -732,7 +754,10 @@ pub fn bytes_per_pixel(format: u16) -> Option<u32> {
+         // Depth32Float_Stencil8 / X32_Stencil8: 64-bit cells on Apple Silicon
+         // (40-bit logical DS + pad; Metal allocates 8 B/texel for this family).
+         MTL_FORMAT_DEPTH32_FLOAT_STENCIL8 | MTL_FORMAT_X32_STENCIL8 => 8,
+-        MTL_FORMAT_RGBA16_UNORM | MTL_FORMAT_RGBA16_UINT | MTL_FORMAT_RGBA16_FLOAT => RGBA16_BPP,
++        MTL_FORMAT_RGBA16_UNORM
++        | MTL_FORMAT_RGBA16_UINT
++        | MTL_FORMAT_RGBA16_FLOAT
++        | MTL_FORMAT_RG32_FLOAT => RGBA16_BPP,
+         MTL_FORMAT_RGBA32_UINT | MTL_FORMAT_RGBA32_FLOAT => RGBA32_BPP,
+         _ => return None,
+     })
+@@ -1215,7 +1240,9 @@ pub fn render_target_bpp(format: u16) -> Option<u32> {
+         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => BGRA8_BPP,
+         MTL_FORMAT_RGBA16_FLOAT => RGBA16F_BPP,
+         MTL_FORMAT_RG16_FLOAT => RG16F_BPP,
++        MTL_FORMAT_RG16_UINT => RG16_BPP,
+         MTL_FORMAT_R16_FLOAT => R16F_BPP,
++        MTL_FORMAT_RG32_FLOAT => RGBA16F_BPP,
+         MTL_FORMAT_R8_UNORM => R8_BPP,
+         _ => return None,
+     })
+@@ -1615,6 +1642,28 @@ pub fn expand_rgba8_to_texel(
+                 }
+             }
+         }
++        // The integer and two-channel float32 attachments macOS 26 and 27
++        // declare for Liquid Glass. A semantic-RGBA8 seed carries neither an
++        // integer nor a float range, so the two channels it has are kept at
++        // their eight-bit value. Lossy by construction: the resident rail is
++        // what keeps these exact, and this only runs when it is not available.
++        TexelLayout::Rg16Uint => {
++            for i in 0..px {
++                let (s, d) = (i * RGBA8_BPP as usize, i * RG16_BPP as usize);
++                for c in 0..2 {
++                    st16(&mut dst[d + c * 2..d + c * 2 + 2], u16::from(src_rgba[s + c]));
++                }
++            }
++        }
++        TexelLayout::Rg32Float => {
++            for i in 0..px {
++                let (s, d) = (i * RGBA8_BPP as usize, i * RGBA16_BPP as usize);
++                for c in 0..2 {
++                    let f = f32::from(src_rgba[s + c]) / f32::from(UNORM8_MAX);
++                    dst[d + c * 4..d + c * 4 + 4].copy_from_slice(&f.to_le_bytes());
++                }
++            }
++        }
+         // The single-channel eight-bit attachment — a coverage, mask or shadow
+         // layer, which is what a one-channel unorm target almost always is.
+         // Drops G, B and A for the same reason the float arms above do: a seed
+@@ -1723,6 +1772,32 @@ pub fn narrow_texel_to_rgba8(
+                 dst_rgba[d + COMPONENT_A] = UNORM8_MAX;
+             }
+         }
++        // The inverses of `expand_rgba8_to_texel`'s Liquid Glass arms, filled
++        // out with zero blue and opaque alpha like the float arms above.
++        TexelLayout::Rg16Uint => {
++            for i in 0..px {
++                let (s, d) = (i * RG16_BPP as usize, i * RGBA8_BPP as usize);
++                for c in 0..2 {
++                    let v = u16::from_le_bytes([src[s + c * 2], src[s + c * 2 + 1]]);
++                    dst_rgba[d + c] = v.min(u16::from(UNORM8_MAX)) as u8;
++                }
++                dst_rgba[d + COMPONENT_B] = 0;
++                dst_rgba[d + COMPONENT_A] = UNORM8_MAX;
++            }
++        }
++        TexelLayout::Rg32Float => {
++            for i in 0..px {
++                let (s, d) = (i * RGBA16_BPP as usize, i * RGBA8_BPP as usize);
++                for c in 0..2 {
++                    let mut word = [0u8; 4];
++                    word.copy_from_slice(&src[s + c * 4..s + c * 4 + 4]);
++                    let f = f32::from_le_bytes(word).clamp(0.0, 1.0);
++                    dst_rgba[d + c] = (f * f32::from(UNORM8_MAX)).round() as u8;
++                }
++                dst_rgba[d + COMPONENT_B] = 0;
++                dst_rgba[d + COMPONENT_A] = UNORM8_MAX;
++            }
++        }
+         // The single-channel eight-bit attachment, filled out the way a shader
+         // sampling it reads it and the way `texel_to_rgba8`'s `R8_UNORM` arm
+         // already does: the channels it does not carry are zero and alpha is
+@@ -1983,6 +2058,17 @@ pub fn convert_rgba8_to_row(format: u16, src_rgba: &[u8], pixels: u32, dst: &mut
+         return false;
+     }
+ 
++    // The Liquid Glass attachments have no `rgba8_to_texel` arm; a Store needs
++    // the same conversion their seed expansion is.
++    let liquid_glass = match format {
++        MTL_FORMAT_RG16_UINT => Some(TexelLayout::Rg16Uint),
++        MTL_FORMAT_RG32_FLOAT => Some(TexelLayout::Rg32Float),
++        _ => None,
++    };
++    if let Some(layout) = liquid_glass {
++        return expand_rgba8_to_texel(layout, src_rgba, pixels, dst);
++    }
++
+     if format == MTL_FORMAT_RGBA16_FLOAT {
+         let lut = unorm8_to_f16_lut();
+         for i in 0..pixels {
+@@ -2698,6 +2784,8 @@ mod tests {
+                 TexelLayout::R32Float => MTL_FORMAT_R32_FLOAT,
+                 TexelLayout::R16Unorm => MTL_FORMAT_R16_UNORM,
+                 TexelLayout::Rg16Unorm => MTL_FORMAT_RG16_UNORM,
++                TexelLayout::Rg16Uint => MTL_FORMAT_RG16_UINT,
++                TexelLayout::Rg32Float => MTL_FORMAT_RG32_FLOAT,
+                 TexelLayout::Rgba16Float => MTL_FORMAT_RGBA16_FLOAT,
+                 TexelLayout::Rg16Float => MTL_FORMAT_RG16_FLOAT,
+                 TexelLayout::Rgba16Unorm => MTL_FORMAT_RGBA16_UNORM,
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index a5c01f54..ab6cd1f9 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -2521,6 +2521,7 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
+             pixel_format::MTL_FORMAT_RG8_UNORM => TexelLayout::Rg8,
+             pixel_format::MTL_FORMAT_R16_UNORM => TexelLayout::R16Unorm,
+             pixel_format::MTL_FORMAT_RG16_UNORM => TexelLayout::Rg16Unorm,
++            pixel_format::MTL_FORMAT_RG16_UINT => TexelLayout::Rg16Uint,
+             pixel_format::MTL_FORMAT_RGB10A2_UNORM => TexelLayout::Rgb10a2Unorm,
+             pixel_format::MTL_FORMAT_BGR10A2_UNORM => TexelLayout::Bgr10a2Unorm,
+             pixel_format::MTL_FORMAT_RG11B10_FLOAT => TexelLayout::Rg11b10Float,
+-- 
+2.43.0
+

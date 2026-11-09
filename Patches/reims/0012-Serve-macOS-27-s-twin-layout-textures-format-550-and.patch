@@ -1,0 +1,313 @@
+From 925125d03abd7fdb5e3510edfca9400fb8fc7bc1 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Sun, 8 Nov 2026 16:38:45 +0800
+Subject: [PATCH 12/13] Serve macOS 27's twin-layout textures, format 550 and
+ heap queries
+
+27's Setup Assistant creates textures tagged 12, whose descriptor carries
+the level-0 layout twice, declares icon, panel and memoryless textures in
+private format 550, and places textures in heaps after asking the device
+for their size and alignment. Reims refused all three, and with no answer
+to the heap query the guest placed every texture of a heap at one offset.
+
+- A type-12 entry is served as type 3 once its descriptor drops the second
+  copy of the layout.
+- Format 550 is four bytes a texel and only ever rendered and sampled on
+  the GPU; every wire decode stores it as BGRA8.
+- On Linux, CmdHeapTextureSizeAndAlign is answered with rows padded to 256
+  bytes, every level page-rounded, every slice, face and sample counted,
+  aligned to 16 KiB: larger than the guest needs, never overlapping.
+
+27.2's country panel loses the black frame and block it drew before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../reims-vgpu/src/contract/pixel_format.rs   | 15 ++++
+ .../src/runtime/decode/resource/mod.rs        | 43 ++++++++--
+ crates/reims-vgpu/src/runtime/heap_query.rs   | 78 +++++++++++++++++--
+ crates/reims-vgpu/src/runtime/objects/mod.rs  |  5 ++
+ 4 files changed, 127 insertions(+), 14 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/contract/pixel_format.rs b/crates/reims-vgpu/src/contract/pixel_format.rs
+index 03dc4c53..e5d7fb3e 100644
+--- a/crates/reims-vgpu/src/contract/pixel_format.rs
++++ b/crates/reims-vgpu/src/contract/pixel_format.rs
+@@ -86,6 +86,21 @@ pub const MTL_FORMAT_RGBA8_UNORM_SRGB: u16 = 0x47;
+ pub const MTL_FORMAT_RGBA8_UINT: u16 = 0x49;
+ pub const MTL_FORMAT_RGBA8_SINT: u16 = 0x4a;
+ pub const MTL_FORMAT_BGRA8_UNORM: u16 = 0x50;
++/// A private format macOS 27 declares its Setup Assistant icon, panel and
++/// memoryless textures in, and asks heap placement for. Four bytes a texel; it
++/// is only ever rendered and sampled on the GPU, so it is stored as BGRA8.
++pub const MTL_FORMAT_PRIVATE_550: u16 = 550;
++
++/// The format a texture declared in `raw` is stored and drawn in. The identity
++/// for every format but [`MTL_FORMAT_PRIVATE_550`]; every wire decode passes
++/// its pixel format through here, so no table below needs to name 550.
++pub fn stored_format(raw: u16) -> u16 {
++    if raw == MTL_FORMAT_PRIVATE_550 {
++        MTL_FORMAT_BGRA8_UNORM
++    } else {
++        raw
++    }
++}
+ pub const MTL_FORMAT_BGRA8_UNORM_SRGB: u16 = 0x51;
+ /// `MTLPixelFormatRGB10A2Unorm`. Ten bits per colour channel and two of alpha,
+ /// packed into one 32-bit word with red in the low bits.
+diff --git a/crates/reims-vgpu/src/runtime/decode/resource/mod.rs b/crates/reims-vgpu/src/runtime/decode/resource/mod.rs
+index 3dcb9aef..f6683953 100644
+--- a/crates/reims-vgpu/src/runtime/decode/resource/mod.rs
++++ b/crates/reims-vgpu/src/runtime/decode/resource/mod.rs
+@@ -3,6 +3,7 @@
+ use crate::contract::endian::{ld16, ld32, ld64}; // ld64: texture-view level base/count
+ #[cfg(test)]
+ use crate::contract::endian::{st16, st32};
++use crate::contract::pixel_format::stored_format;
+ use crate::runtime::heap_query; // ICB layout fixture encoder only
+ 
+ use core::mem::{offset_of, size_of};
+@@ -76,6 +77,13 @@ impl crate::observe::Decline for DecodeStatus {
+ pub const OBJECT_TYPE_BUFFER: u8 = 1;
+ pub const OBJECT_TYPE_TEXTURE: u8 = 2;
+ pub const OBJECT_TYPE_TEXTURE_VARIANT: u8 = 3;
++/// macOS 27's tag for a texture whose descriptor carries its level-0 layout
++/// twice. [`decode_list_object_entry`] reports it as
++/// [`OBJECT_TYPE_TEXTURE_VARIANT`] and [`reshape_twin_layout_descriptor`] gives
++/// its descriptor type 2's shape, so every texture rail serves it unchanged.
++pub const OBJECT_TYPE_TWIN_LAYOUT_TEXTURE: u8 = 12;
++/// Where the second copy of the level-0 layout sits in a type-12 descriptor.
++const TWIN_LAYOUT_COPY: std::ops::Range<usize> = 0x48..0x84;
+ pub const OBJECT_TYPE_FUNCTION: u8 = 6;
+ pub const OBJECT_TYPE_TYPE7: u8 = 7;
+ pub const OBJECT_TYPE_TEXTURE_VIEW: u8 = 8;
+@@ -1723,6 +1731,18 @@ pub struct ListObjectEntry {
+     pub object_type: u8,
+     pub descriptor_length: u32,
+     pub descriptor_gva: u64,
++    /// The guest tagged it [`OBJECT_TYPE_TWIN_LAYOUT_TEXTURE`].
++    pub twin_layout: bool,
++}
++
++/// Give a type-12 descriptor type 2's shape: drop the second copy of its
++/// level-0 layout. The format is read where type 2's is.
++pub fn reshape_twin_layout_descriptor(bytes: &mut Vec<u8>) -> bool {
++    if bytes.len() < TEXTURE_DESC_PIXEL_FORMAT + 2 + TWIN_LAYOUT_COPY.len() {
++        return false;
++    }
++    bytes.drain(TWIN_LAYOUT_COPY);
++    true
+ }
+ 
+ /// Decode one 12-byte object-list entry (live arm Reims VGPU contract).
+@@ -1731,10 +1751,17 @@ pub fn decode_list_object_entry(bytes: &[u8]) -> Result<ListObjectEntry, DecodeS
+         return Err(DecodeStatus::ErrShort("res_list_entry_short"));
+     }
+     let first = ld32(&bytes[OBJECT_LIST_ENTRY_HEADER..]);
++    let object_type = (first & OBJECT_TYPE_MASK) as u8;
++    let twin_layout = object_type == OBJECT_TYPE_TWIN_LAYOUT_TEXTURE;
+     Ok(ListObjectEntry {
+-        object_type: (first & OBJECT_TYPE_MASK) as u8,
++        object_type: if twin_layout {
++            OBJECT_TYPE_TEXTURE_VARIANT
++        } else {
++            object_type
++        },
+         descriptor_length: first >> OBJECT_DESC_LEN_SHIFT,
+         descriptor_gva: ld64(&bytes[OBJECT_LIST_ENTRY_DESC_GVA..]),
++        twin_layout,
+     })
+ }
+ 
+@@ -1788,7 +1815,7 @@ pub fn decode_memoryless_texture_descriptor(
+         return Err(DecodeStatus::ErrShort("res_memoryless_desc_short"));
+     }
+     Ok(MemorylessTextureDescriptor {
+-        pixel_format: ld16(&bytes[MEMORYLESS_DESC_PIXEL_FORMAT..]),
++        pixel_format: stored_format(ld16(&bytes[MEMORYLESS_DESC_PIXEL_FORMAT..])),
+         width: ld32(&bytes[MEMORYLESS_DESC_WIDTH..]),
+         height: ld32(&bytes[MEMORYLESS_DESC_HEIGHT..]),
+         depth: ld32(&bytes[MEMORYLESS_DESC_DEPTH..]).max(1),
+@@ -1929,7 +1956,7 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
+     };
+     let pf_off = TEXTURE_DESC_PIXEL_FORMAT + format_shift;
+     if bytes.len() >= pf_off + 2 {
+-        out.pixel_format = ld16(&bytes[pf_off..]);
++        out.pixel_format = stored_format(ld16(&bytes[pf_off..]));
+     } else if crate::observe::first_sight("texture_desc_format_unreachable", levels as u64) {
+         // No fallback to the unshifted offset. The fallback's own length test
+         // was `TEXTURE_DESC_PIXEL_FORMAT + 2`, so for a single-mip body it
+@@ -3336,7 +3363,7 @@ fn parse_one_color_entry(
+     let pf = entry_tag_u32(bytes, entry, COLOR_ATTACHMENT_TAG_PIXEL_FORMAT, u32::MAX);
+     if pf != u32::MAX {
+         out.has_pixel_format = true;
+-        out.pixel_format = pf;
++        out.pixel_format = u16::try_from(pf).map_or(pf, |pf| u32::from(stored_format(pf)));
+     }
+     out.blending_enabled = entry_tag_u32(bytes, entry, COLOR_ATTACHMENT_TAG_BLEND_ENABLE, 0) != 0;
+     out.src_rgb = entry_tag_u32(bytes, entry, COLOR_ATTACHMENT_TAG_SRC_RGB, BLEND_FACTOR_ONE);
+@@ -3659,7 +3686,7 @@ pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescrip
+         TEXTURE_VIEW_OPCODE_SIMPLE => {
+             let b = w_view::texture_view(&op)
+                 .map_err(|_| DecodeStatus::ErrShort("res_texture_view_short"))?;
+-            let pixel_format = b.pixel_format.get();
++            let pixel_format = stored_format(b.pixel_format.get());
+             Ok(TextureViewDescriptor {
+                 view_opcode,
+                 view_texture_ref: b.object_ref.get(),
+@@ -3671,7 +3698,7 @@ pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescrip
+         TEXTURE_VIEW_OPCODE_RANGED => {
+             let b = w_view::texture_view_ranged(&op)
+                 .map_err(|_| DecodeStatus::ErrShort("res_texture_view_short"))?;
+-            let pixel_format = b.pixel_format.get();
++            let pixel_format = stored_format(b.pixel_format.get());
+             Ok(TextureViewDescriptor {
+                 view_opcode,
+                 view_texture_ref: b.object_ref.get(),
+@@ -3689,7 +3716,7 @@ pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescrip
+             let b = w_view::texture_view_swizzle(&op)
+                 .map_err(|_| DecodeStatus::ErrShort("res_texture_view_short"))?;
+             let r = &b.ranged;
+-            let pixel_format = r.pixel_format.get();
++            let pixel_format = stored_format(r.pixel_format.get());
+             Ok(TextureViewDescriptor {
+                 view_opcode,
+                 view_texture_ref: r.object_ref.get(),
+@@ -3884,7 +3911,7 @@ pub fn decode_iosurface_texture_descriptor(bytes: &[u8]) -> Result<Descriptor, D
+     Ok(Descriptor::IOSurfaceTexture {
+         mapping_id: ld32(&bytes[IOSURFACE_TEX_MAPPING_ID..]),
+         object_ref: ld32(&bytes[IOSURFACE_TEX_OBJECT_REF..]),
+-        pixel_format: ld16(&bytes[IOSURFACE_TEX_PIXEL_FORMAT..]),
++        pixel_format: stored_format(ld16(&bytes[IOSURFACE_TEX_PIXEL_FORMAT..])),
+         width: ld32(&bytes[IOSURFACE_TEX_WIDTH..]),
+         height: ld32(&bytes[IOSURFACE_TEX_HEIGHT..]),
+     })
+diff --git a/crates/reims-vgpu/src/runtime/heap_query.rs b/crates/reims-vgpu/src/runtime/heap_query.rs
+index 859dd993..dc3c5d80 100644
+--- a/crates/reims-vgpu/src/runtime/heap_query.rs
++++ b/crates/reims-vgpu/src/runtime/heap_query.rs
+@@ -191,7 +191,7 @@ pub fn decode_serialized_texture_descriptor(body: &[u8]) -> Result<TextureDescri
+         is_drawable: packed & (1 << 5) != 0,
+         allow_gpu_optimized_contents: d.allow_gpu_optimized_contents(),
+         usage: d.usage() as u32,
+-        pixel_format: d.pixel_format(),
++        pixel_format: crate::contract::pixel_format::stored_format(d.pixel_format()),
+         width: d.width.get(),
+         height: d.height.get(),
+         depth: d.depth.get(),
+@@ -235,7 +235,7 @@ pub fn decode_wide_serialized_texture_descriptor(
+         is_drawable: d.type_and_flags & (1 << 5) != 0,
+         allow_gpu_optimized_contents: d.allow_gpu_optimized_contents(),
+         usage: d.usage.get(),
+-        pixel_format: d.pixel_format.get(),
++        pixel_format: crate::contract::pixel_format::stored_format(d.pixel_format.get()),
+         width: d.width.get(),
+         height: d.height.get(),
+         depth: d.depth.get(),
+@@ -318,11 +318,50 @@ pub fn query_size_and_align(desc: &TextureDescriptor) -> Result<SizeAndAlign, Qu
+     })
+ }
+ 
++/// Without a Metal device there is no requirement to ask for, and a guest left
++/// without an answer places every texture of a heap at the same offset. So this
++/// answers with a layout no smaller than any the guest then describes: rows
++/// padded to 256 bytes, every level page-rounded, every slice, face and sample
++/// counted, and the whole aligned to a 16 KiB page. That wastes heap space and
++/// never overlaps two textures.
+ #[cfg(not(target_os = "macos"))]
+-pub fn query_size_and_align(_desc: &TextureDescriptor) -> Result<SizeAndAlign, QueryError> {
+-    // The Linux Vulkan pathway does not yet have a verified equivalence between
+-    // VkImage memory requirements and Apple's guest heap placement contract.
+-    Err(QueryError::NoMetalDevice)
++pub fn query_size_and_align(desc: &TextureDescriptor) -> Result<SizeAndAlign, QueryError> {
++    const ROW_ALIGN: u64 = 256;
++    const PAGE: u64 = 16 * 1024;
++    let faces: u64 = match desc.texture_type {
++        0..=4 | 7 | 8 => 1,
++        5 | 6 => 6,
++        _ => return Err(QueryError::UnknownTextureType),
++    };
++    if desc.protection_options != 0 {
++        return Err(QueryError::UnsupportedProtectionOptions);
++    }
++    let bpp = crate::contract::pixel_format::bytes_per_pixel(desc.pixel_format)
++        .ok_or(QueryError::UnknownPixelFormat)?;
++    let layers = u64::from(desc.array_length.max(1)) * faces * u64::from(desc.sample_count.max(1));
++    let mut size = 0u64;
++    for level in 0..u32::from(desc.mipmap_level_count.max(1)).min(32) {
++        let extent = |n: u32| u64::from((n >> level).max(1));
++        let depth = if desc.texture_type == 7 {
++            extent(desc.depth)
++        } else {
++            1
++        };
++        let row = (extent(desc.width) * u64::from(bpp)).div_ceil(ROW_ALIGN) * ROW_ALIGN;
++        let level_size = row
++            .checked_mul(extent(desc.height))
++            .and_then(|n| n.checked_mul(depth))
++            .and_then(|n| n.checked_mul(layers))
++            .map(|n| n.div_ceil(PAGE) * PAGE)
++            .ok_or(QueryError::ZeroRequirement)?;
++        size = size
++            .checked_add(level_size)
++            .ok_or(QueryError::ZeroRequirement)?;
++    }
++    if size == 0 {
++        return Err(QueryError::ZeroRequirement);
++    }
++    Ok(SizeAndAlign { size, align: PAGE })
+ }
+ 
+ #[cfg(target_os = "macos")]
+@@ -455,6 +494,33 @@ mod tests {
+         assert_eq!(ld64(&reply[8..]), 0x80);
+     }
+ 
++    #[cfg(not(target_os = "macos"))]
++    #[test]
++    fn linux_query_covers_every_padded_level() {
++        let mut desc = decode_request(&live_request_fixture()).unwrap().descriptor;
++        desc.pixel_format = crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM;
++        desc.texture_type = 2;
++        desc.width = 100;
++        desc.height = 10;
++        desc.depth = 1;
++        desc.mipmap_level_count = 2;
++        desc.sample_count = 1;
++        desc.array_length = 1;
++        desc.protection_options = 0;
++        let result = query_size_and_align(&desc).unwrap();
++        // 512-byte rows at level 0 and 256 at level 1, each level a page.
++        assert_eq!(
++            result,
++            SizeAndAlign {
++                size: 2 * 16384,
++                align: 16384
++            }
++        );
++        // Six faces: 30 720 bytes at level 0 and 7 680 at level 1.
++        desc.texture_type = 5;
++        assert_eq!(query_size_and_align(&desc).unwrap().size, 3 * 16384);
++    }
++
+     #[cfg(target_os = "macos")]
+     #[test]
+     fn native_query_returns_nonzero_requirement() {
+diff --git a/crates/reims-vgpu/src/runtime/objects/mod.rs b/crates/reims-vgpu/src/runtime/objects/mod.rs
+index e9a247d9..73c80b5b 100644
+--- a/crates/reims-vgpu/src/runtime/objects/mod.rs
++++ b/crates/reims-vgpu/src/runtime/objects/mod.rs
+@@ -1515,6 +1515,11 @@ pub fn read_descriptor<M: HostMemory>(
+         state.page_shift,
+     )
+     .ok()?;
++    if entry.twin_layout
++        && !crate::runtime::decode::resource::reshape_twin_layout_descriptor(&mut buf)
++    {
++        return None;
++    }
+     Some(buf)
+ }
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,884 @@
+From 65a9e797b3e11a41c6b8ee5de75bbc9d449ab4be Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Sun, 8 Nov 2026 22:30:30 +0800
+Subject: [PATCH] Write fragment storage images, draw without a fragment
+ function, read x420 as Cr Y Cb
+
+14 and 15 snapshot the framebuffer after the language panel with
+inplace_copy_lph: a fragment shader with no colour output that writes a
+storage image. Reims refused the draw, so the country panel never drew.
+The draw now gets a storage image of its own and leaves the attachments
+untouched. A level-0 linear texture of the shader texel width seeds the
+image and takes its texels back after the draw.
+
+A render pipeline with no fragment function now draws with an empty
+fragment shader and colour writes off, instead of being refused.
+
+Format 543 (ten-bit x420) samples as Cr, Y and Cb like 540 to 542. Both
+VideoToolbox kernels that read it, on 15 and 27, swizzle .gbr; the
+ten-bit one does it when it stores the sample in a local array, which
+was misread as the kernel taking Y, Cb and Cr. On 15 the frames now come
+out warm gold instead of teal. 27 hello does not sample 543 in current
+boots, and its Golden Gate still is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/backend/vulkan/engine/exec.rs         | 190 +++++++++++++++++-
+ .../src/backend/vulkan/engine/mod.rs          |   3 +-
+ .../src/backend/vulkan/engine/types.rs        |  20 ++
+ .../src/runtime/compute_exec/mod.rs           |   2 +-
+ crates/reims-vgpu/src/runtime/draw/mod.rs     |  12 +-
+ crates/reims-vgpu/src/runtime/draw/vulkan.rs  | 159 +++++++++++++++
+ .../src/runtime/pipeline_resolve.rs           | 124 +++++++++---
+ crates/reims-vgpu/src/runtime/ycbcr.rs        |  34 ++--
+ 8 files changed, 482 insertions(+), 62 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs b/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
+index 791dfdbb..5bdf5d74 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
+@@ -2789,7 +2789,8 @@ pub(crate) unsafe fn execute_draw_inner(
+         batch_full: matches!(fit, BatchFit::Full),
+         target_switch: matches!(fit, BatchFit::OtherTarget),
+     };
+-    let batch_eligible = terms.batch_eligible();
++    let batch_eligible = terms.batch_eligible()
++        && !req.scratch_storage_images.iter().any(|image| image.read_back);
+     let no_join = terms.refusal();
+     // The join arm splits by self-alias, and the two must sum to the joins.
+     // `nojoin_samples_own_target` was 29.7 % of all draws and is the population
+@@ -2876,6 +2877,14 @@ pub(crate) unsafe fn execute_draw_inner(
+             count: 1,
+         });
+     }
++    for image in &req.scratch_storage_images {
++        layout_bindings.push(BindingSig {
++            binding: image.binding,
++            ty: vk::DescriptorType::STORAGE_IMAGE.as_raw() as u32,
++            stages: vk::ShaderStageFlags::FRAGMENT.as_raw(),
++            count: 1,
++        });
++    }
+     for index in (0..8u32).filter(|index| req.color_inputs & (1 << index) != 0) {
+         layout_bindings.push(BindingSig {
+             binding: super::types::COLOR_INPUT_BINDING + index,
+@@ -4127,6 +4136,24 @@ pub(crate) unsafe fn execute_draw_inner(
+         .iter()
+         .map(|(_, s)| vk::DescriptorImageInfo::default().sampler(*s))
+         .collect();
++    let mut scratch_images = Vec::with_capacity(req.scratch_storage_images.len());
++    for image in &req.scratch_storage_images {
++        let key = super::pools::StorageImageKey {
++            width: image.width,
++            height: image.height,
++            format: image.format,
++            sampled_only: false,
++        };
++        scratch_images.push((image.binding, pools.acquire_storage_image(ctx, key, counters)?));
++    }
++    let scratch_infos: Vec<_> = scratch_images
++        .iter()
++        .map(|(_, slot)| {
++            vk::DescriptorImageInfo::default()
++                .image_view(slot.view)
++                .image_layout(vk::ImageLayout::GENERAL)
++        })
++        .collect();
+     // Framebuffer fetch: the input attachment IS the color target's view;
+     // derive the same layout as the subpass reference. A draw that also
+     // samples the target upgrades both from GENERAL to the feedback layout.
+@@ -4177,6 +4204,15 @@ pub(crate) unsafe fn execute_draw_inner(
+                 .image_info(std::slice::from_ref(&sampler_infos[i])),
+         );
+     }
++    for (i, (binding, _)) in scratch_images.iter().enumerate() {
++        descriptor_writes.push(
++            vk::WriteDescriptorSet::default()
++                .dst_set(dst_set)
++                .dst_binding(*binding)
++                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
++                .image_info(std::slice::from_ref(&scratch_infos[i])),
++        );
++    }
+     for (binding, info) in &color_input_infos {
+         descriptor_writes.push(
+             vk::WriteDescriptorSet::default()
+@@ -4984,8 +5020,9 @@ pub(crate) unsafe fn execute_draw_inner(
+     // query reset Vulkan forbids inside it; this ladder therefore remains an
+     // instrument for the continuation opportunities those commands consume.
+     let continues = joins && pools.pass_echoes(&echo);
+-    let continues_open =
+-        continues_open_render_pass(req.continues_render_pass, pools.open_pass_echoes(&echo));
++    // A scratch storage image needs its layout set outside the pass.
++    let continues_open = req.scratch_storage_images.is_empty()
++        && continues_open_render_pass(req.continues_render_pass, pools.open_pass_echoes(&echo));
+     // `passmerge_pass_differs` is one bucket over four independent causes with
+     // four different repairs, and on a driven Maps leg it is the bucket that
+     // holds 82 % of the draws. Split it where it is charged, so the two stay a
+@@ -5029,6 +5066,78 @@ pub(crate) unsafe fn execute_draw_inner(
+         // An encoder boundary, a different pass instance, or an intervening
+         // outside-pass command closes whatever the predecessor left open.
+         unsafe { pools.close_open_pass(&ctx.device, cb) };
++        for ((_, slot), image) in scratch_images.iter().zip(&req.scratch_storage_images) {
++            let seeded = match image.seed.as_ref() {
++                Some(seed) => {
++                    let staging = pools.acquire_staging(
++                        ctx,
++                        seed.len() as u64,
++                        vk::BufferUsageFlags::TRANSFER_SRC,
++                        counters,
++                    )?;
++                    pools.write_staging(ctx, &staging, seed)?;
++                    let to_dst = [vk::ImageMemoryBarrier::default()
++                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
++                        .old_layout(vk::ImageLayout::UNDEFINED)
++                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
++                        .image(slot.image)
++                        .subresource_range(super::color_subresource_range())];
++                    ctx.device.cmd_pipeline_barrier(
++                        cb,
++                        vk::PipelineStageFlags::TOP_OF_PIPE,
++                        vk::PipelineStageFlags::TRANSFER,
++                        vk::DependencyFlags::empty(),
++                        &[],
++                        &[],
++                        &to_dst,
++                    );
++                    let region = [vk::BufferImageCopy::default()
++                        .image_subresource(super::color_subresource_layers())
++                        .image_extent(vk::Extent3D {
++                            width: image.width,
++                            height: image.height,
++                            depth: 1,
++                        })];
++                    ctx.device.cmd_copy_buffer_to_image(
++                        cb,
++                        staging.buffer,
++                        slot.image,
++                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
++                        &region,
++                    );
++                    true
++                }
++                None => false,
++            };
++            let to_general = [vk::ImageMemoryBarrier::default()
++                .src_access_mask(if seeded {
++                    vk::AccessFlags::TRANSFER_WRITE
++                } else {
++                    vk::AccessFlags::empty()
++                })
++                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
++                .old_layout(if seeded {
++                    vk::ImageLayout::TRANSFER_DST_OPTIMAL
++                } else {
++                    vk::ImageLayout::UNDEFINED
++                })
++                .new_layout(vk::ImageLayout::GENERAL)
++                .image(slot.image)
++                .subresource_range(super::color_subresource_range())];
++            ctx.device.cmd_pipeline_barrier(
++                cb,
++                if seeded {
++                    vk::PipelineStageFlags::TRANSFER
++                } else {
++                    vk::PipelineStageFlags::TOP_OF_PIPE
++                },
++                vk::PipelineStageFlags::FRAGMENT_SHADER,
++                vk::DependencyFlags::empty(),
++                &[],
++                &[],
++                &to_general,
++            );
++        }
+         crate::runtime::drain::note_store_route(pass_begin_area_band(req.width, req.height));
+         crate::runtime::drain::note_store_route(if pass_key.load_seed {
+             "passbegin_load"
+@@ -5266,6 +5375,7 @@ pub(crate) unsafe fn execute_draw_inner(
+         ctx.device.cmd_end_query(cb, pool, 0);
+     }
+     let keep_pass_open = req.render_pass_continues
++        && req.scratch_storage_images.is_empty()
+         && batch_eligible
+         && !pass_churn_probe_enabled()
+         && !layout_churn_probe_enabled();
+@@ -5274,6 +5384,49 @@ pub(crate) unsafe fn execute_draw_inner(
+     } else {
+         unsafe { pools.close_open_pass(&ctx.device, cb) };
+     }
++    // Copy each scratch storage image the caller wants back into a readback
++    // buffer, behind the pass that wrote it.
++    let mut storage_readbacks = Vec::new();
++    for ((_, slot), image) in scratch_images.iter().zip(&req.scratch_storage_images) {
++        if !image.read_back {
++            continue;
++        }
++        let size = u64::from(image.width)
++            * u64::from(image.height)
++            * image.format.bytes_per_texel() as u64;
++        let buffer = pools.acquire_readback(ctx, size, counters)?;
++        let to_src = [vk::ImageMemoryBarrier::default()
++            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
++            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
++            .old_layout(vk::ImageLayout::GENERAL)
++            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
++            .image(slot.image)
++            .subresource_range(super::color_subresource_range())];
++        ctx.device.cmd_pipeline_barrier(
++            cb,
++            vk::PipelineStageFlags::FRAGMENT_SHADER,
++            vk::PipelineStageFlags::TRANSFER,
++            vk::DependencyFlags::empty(),
++            &[],
++            &[],
++            &to_src,
++        );
++        let region = [vk::BufferImageCopy::default()
++            .image_subresource(super::color_subresource_layers())
++            .image_extent(vk::Extent3D {
++                width: image.width,
++                height: image.height,
++                depth: 1,
++            })];
++        ctx.device.cmd_copy_image_to_buffer(
++            cb,
++            slot.image,
++            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
++            buffer.buffer,
++            &region,
++        );
++        storage_readbacks.push((buffer, size));
++    }
+     if pass_churn_probe_enabled() && load_uses_gpu_content && !target_feedback {
+         // PROBE — `REIMS_VGPU_PASS_CHURN=on`. One extra render pass instance on
+         // the target this draw just finished with, loading and storing it and
+@@ -5687,6 +5840,7 @@ pub(crate) unsafe fn execute_draw_inner(
+             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+         return Ok(DrawOutput {
+             pixels: Vec::new(),
++            storage_pixels: Vec::new(),
+             target_guest_backed,
+             guest_store_recorded,
+             guest_store_footprint: guest_store_footprint.clone(),
+@@ -5747,6 +5901,33 @@ pub(crate) unsafe fn execute_draw_inner(
+     // `gva_store_defer_eligible` and keeps its readback. Delete this and that
+     // Store loses its frame silently, which is the one outcome the ground rules
+     // forbid outright. What the equality licenses is not re-measuring it.
++    let read_storage = |ctx: &super::context::DeviceContext| -> Result<Vec<Vec<u8>>, DrawError> {
++        storage_readbacks
++            .iter()
++            .map(|(buffer, size)| {
++                super::pools::read_back_slot(
++                    ctx,
++                    buffer,
++                    *size,
++                    VkOp::ExecMapReadback,
++                    VkOp::ExecInvalidateReadback,
++                )
++            })
++            .collect()
++    };
++    if readback.is_none() && !storage_readbacks.is_empty() {
++        phase.enter(super::draw_phase::Phase::Wait);
++        pools.wait_entry_fence(ctx, counters, fence)?;
++        return Ok(DrawOutput {
++            pixels: Vec::new(),
++            storage_pixels: read_storage(ctx)?,
++            target_guest_backed,
++            guest_store_recorded,
++            guest_store_footprint: guest_store_footprint.clone(),
++            pixels_bgra: output_bgra,
++            occlusion_samples: read_occlusion_samples(ctx, occlusion)?,
++        });
++    }
+     let Some(ref rb) = readback else {
+         // A queried draw has no pixels to read back and still cannot take this
+         // return: the sample count *is* its result, and it is not readable
+@@ -5759,6 +5940,7 @@ pub(crate) unsafe fn execute_draw_inner(
+             pools.wait_entry_fence(ctx, counters, fence)?;
+             return Ok(DrawOutput {
+                 pixels: Vec::new(),
++                storage_pixels: Vec::new(),
+                 target_guest_backed,
+                 guest_store_recorded,
+                 guest_store_footprint: guest_store_footprint.clone(),
+@@ -5771,6 +5953,7 @@ pub(crate) unsafe fn execute_draw_inner(
+             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+         return Ok(DrawOutput {
+             pixels: Vec::new(),
++            storage_pixels: Vec::new(),
+             target_guest_backed,
+             guest_store_recorded,
+             guest_store_footprint: guest_store_footprint.clone(),
+@@ -5819,6 +6002,7 @@ pub(crate) unsafe fn execute_draw_inner(
+ 
+     Ok(DrawOutput {
+         pixels,
++        storage_pixels: read_storage(ctx)?,
+         target_guest_backed,
+         guest_store_recorded,
+         guest_store_footprint,
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs b/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
+index 55e67294..8b29dd22 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
+@@ -64,7 +64,8 @@ pub use types::{
+     BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask, ComputeBufferResource,
+     ComputeOutput, ComputeRequest, ComputeResidentSampleBind, ComputeSampledImageResource,
+     ComputeStorageImageResource, ComputeStorageResidency, CullMode, DepthClipMode, DepthState,
+-    DrawError, DrawOutput, DrawRequest, FillMode, GuestRun, GuestRunSource, GuestSampledBacking,
++    DrawError, DrawOutput, DrawRequest, DrawScratchStorageImage, FillMode, GuestRun,
++    GuestRunSource, GuestSampledBacking,
+     GuestTargetBacking, GuestTargetMemory, GuestTargetSeed, IndexType, IndexedDrawResource,
+     PipelineObjectIdentity, PrimitiveTopology, SampledByteOrigin, SampledContentIdentity,
+     SampledImageResource, SampledSource, SamplerAddressMode, SamplerBorderColor,
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/types.rs b/crates/reims-vgpu/src/backend/vulkan/engine/types.rs
+index c675b4fa..58022878 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/types.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/types.rs
+@@ -371,9 +371,26 @@ impl PipelineObjectIdentity {
+     }
+ }
+ 
++/// A storage image a fragment shader writes, for a draw whose shader has no
++/// colour output. The draw binds an image of this shape, seeded with `seed`
++/// (tight rows) when given, and hands its texels back in
++/// [`DrawOutput::storage_pixels`] when `read_back` is set; the colour
++/// attachments are left as they were.
++#[derive(Clone, Debug)]
++pub struct DrawScratchStorageImage {
++    pub binding: u32,
++    pub width: u32,
++    pub height: u32,
++    pub format: StorageImageFormat,
++    pub seed: Option<std::sync::Arc<Vec<u8>>>,
++    pub read_back: bool,
++}
++
+ /// Inputs for one offscreen draw. Engine receives resolved bytes + post-reloc SPIR-V only.
+ #[derive(Debug, Default)]
+ pub struct DrawRequest {
++    /// See [`DrawScratchStorageImage`].
++    pub scratch_storage_images: Vec<DrawScratchStorageImage>,
+     /// The retained guest pipeline object this draw resolved, when the retained
+     /// lifecycle is enabled. Vulkan still compares the complete variant key;
+     /// this identity only chooses the object's exact front entry.
+@@ -735,6 +752,9 @@ pub struct SecondaryColorTarget {
+ #[derive(Debug, Default)]
+ pub struct DrawOutput {
+     pub pixels: Vec<u8>,
++    /// The texels of each scratch storage image with `read_back`, in request
++    /// order, tight rows.
++    pub storage_pixels: Vec<Vec<u8>>,
+     /// Whether color attachment zero was rendered through the retained guest
+     /// allocation supplied on this request.
+     ///
+diff --git a/crates/reims-vgpu/src/runtime/compute_exec/mod.rs b/crates/reims-vgpu/src/runtime/compute_exec/mod.rs
+index aef24e6b..c57da420 100644
+--- a/crates/reims-vgpu/src/runtime/compute_exec/mod.rs
++++ b/crates/reims-vgpu/src/runtime/compute_exec/mod.rs
+@@ -4464,7 +4464,7 @@ fn mtl_to_engine_sampled(
+ }
+ 
+ #[cfg(feature = "backend-vulkan")]
+-fn spirv_image_format_to_engine_storage(
++pub(crate) fn spirv_image_format_to_engine_storage(
+     format: crate::runtime::spirv_bind::ImageFormat,
+ ) -> Option<crate::backend::vulkan::engine::StorageImageFormat> {
+     use crate::backend::vulkan::engine::StorageImageFormat as V;
+diff --git a/crates/reims-vgpu/src/runtime/draw/mod.rs b/crates/reims-vgpu/src/runtime/draw/mod.rs
+index 0b3e499c..2d2dff57 100644
+--- a/crates/reims-vgpu/src/runtime/draw/mod.rs
++++ b/crates/reims-vgpu/src/runtime/draw/mod.rs
+@@ -1374,17 +1374,13 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
+         );
+         return None;
+     };
+-    // Both stages are required to build a pipeline, and the two are reported
+-    // apart because they are different guest mistakes — the compute sibling
+-    // names its one stage the same way, as `kernel_func_zero`.
++    // A vertex function is required. A fragment function is not: Metal runs a
++    // pipeline without one for its depth and stencil, and
++    // `pipeline_resolve` gives it a fragment stage that writes nothing.
+     if p.vertex_func_ref == 0 {
+         report.reason(task_id, pipeline_ref, "vertex_func_zero", "");
+         return None;
+     }
+-    if p.fragment_func_ref == 0 {
+-        report.reason(task_id, pipeline_ref, "fragment_func_zero", "");
+-        return None;
+-    }
+     Some(p)
+ }
+ 
+@@ -1681,7 +1677,6 @@ pub(crate) struct HeapTexture {
+     pub format: u16,
+     pub sample_count: u32,
+     pub texture_type: u8,
+-    pub mipmap_level_count: u16,
+ }
+ 
+ /// The heap texture a type-8 descriptor creates, or `None` for any other record.
+@@ -1703,7 +1698,6 @@ pub(crate) fn heap_texture_of(desc: &[u8]) -> Option<HeapTexture> {
+         format: body.pixel_format,
+         sample_count: u32::from(body.sample_count.max(1)),
+         texture_type: body.texture_type,
+-        mipmap_level_count: body.mipmap_level_count,
+     })
+ }
+ 
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index 3a512f09..99e7136d 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -6671,6 +6671,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+             crate::runtime::spirv_bind::first_non_sampled_texture_descriptor(&shader.reflection)
+         {
+             let access = match descriptor.access {
++                crate::runtime::spirv_bind::ReflectedTextureAccess::Storage
++                    if stage == "fragment" && shader.reflection.render_targets.is_empty() =>
++                {
++                    continue
++                }
+                 crate::runtime::spirv_bind::ReflectedTextureAccess::Storage => "storage",
+                 crate::runtime::spirv_bind::ReflectedTextureAccess::Unknown => "unknown",
+                 crate::runtime::spirv_bind::ReflectedTextureAccess::Sampled => continue,
+@@ -7197,6 +7202,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+         // is something the guest asked for. See
+         // [`crate::runtime::gpu_hang_trail::SamplerNote`].
+         let mut sampler_origin: std::collections::BTreeMap<u32, u8> = Default::default();
++        let mut scratch_storage: Vec<crate::backend::vulkan::engine::DrawScratchStorageImage> =
++            Vec::new();
++        let mut storage_writebacks: Vec<StorageWriteback> = Vec::new();
+         {
+             let mut push_tex = |index: u32,
+                                 texture_ref: u32,
+@@ -7224,6 +7232,53 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+                     + base_off;
+                 if let Some(descriptor) = reflected_descriptor {
+                     use crate::runtime::spirv_bind::ReflectedTextureAccess;
++                    // A fragment shader with no colour output that writes a
++                    // storage image (14 and 15's `inplace_copy_lph` snapshots
++                    // the framebuffer this way) gets an image of its own; the
++                    // pass's colour stays as it was. A level-0 linear texture
++                    // of the shader's texel width seeds that image and takes
++                    // its texels back after the draw. Anything else is scratch.
++                    if descriptor.access == ReflectedTextureAccess::Storage
++                        && frag_stage
++                        && reflection.render_targets.is_empty()
++                    {
++                        let format = crate::runtime::spirv_bind::reflected_storage_image_format(
++                            reflection,
++                            descriptor.binding,
++                        )
++                        .and_then(
++                            crate::runtime::compute_exec::spirv_image_format_to_engine_storage,
++                        );
++                        if let (Some(format), Some(c0)) = (format, req.colors.first()) {
++                            let linear = linear_storage_target(
++                                state,
++                                host,
++                                req.task_id,
++                                texture_ref,
++                                format.bytes_per_texel(),
++                            );
++                            crate::runtime::drain::note_store_route("frag_storage_scratch");
++                            let (width, height, seed) = match linear {
++                                Some((target, seed)) => {
++                                    let shape = (target.width, target.height);
++                                    storage_writebacks.push(target);
++                                    (shape.0, shape.1, Some(std::sync::Arc::new(seed)))
++                                }
++                                None => (c0.width, c0.height, None),
++                            };
++                            scratch_storage.push(
++                                crate::backend::vulkan::engine::DrawScratchStorageImage {
++                                    binding: img_bind,
++                                    width,
++                                    height,
++                                    format,
++                                    read_back: seed.is_some(),
++                                    seed,
++                                },
++                            );
++                            return Ok(());
++                        }
++                    }
+                     let unsupported = match descriptor.access {
+                         ReflectedTextureAccess::Sampled => None,
+                         ReflectedTextureAccess::Storage => Some("storage"),
+@@ -8051,6 +8106,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+         }
+         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
+         let mut resources = crate::backend::vulkan::engine::DrawRequest {
++            scratch_storage_images: std::mem::take(&mut scratch_storage),
+             pipeline_object: resolved.pipeline_object.clone(),
+             // Honor the guest's face-culling state, its winding, and its
+             // primitive type. All three come from `translate::raster`, and all
+@@ -8418,6 +8474,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+         // guest is replacing rather than compositing.
+         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
+         resources.color_write_mask = pd.color0.write_mask;
++        if f_shader.reflection.render_targets.is_empty() {
++            // The fragment stage writes no colour (a scratch storage write, or a
++            // pipeline with no fragment function), so no attachment may change.
++            let none = crate::runtime::decode::resource::ColorWriteMask::new(0)
++                .expect("an empty mask is in range");
++            resources.color_write_mask = none;
++            for target in &mut resources.secondary_targets {
++                target.color_write_mask = none;
++            }
++        }
+         if pd.color0.blending_enabled {
+             let constants = req.blend_color.unwrap_or([0.0; 4]);
+             match translate::blend::state(&pd.color0, constants) {
+@@ -8974,6 +9040,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+         // queries; the sum belongs to whoever knows the offset, which is not
+         // this arm.
+         req.visibility_samples = out.occlusion_samples;
++        for (target, pixels) in storage_writebacks.iter().zip(&out.storage_pixels) {
++            land_storage_writeback(state, host, req.task_id, target, pixels);
++        }
+         // Everything from here to the end of the chain is Store routing, and the
+         // `?` above deliberately leaves a declined draw charged to `engine`:
+         // where it declined is the engine's own typed reason to report, not this
+@@ -9125,6 +9194,96 @@ pub(super) fn depth_chain_identity(
+     })
+ }
+ 
++/// Where a fragment shader's storage writes to a linear (type-2/3) texture land:
++/// that texture's level-0 rows in guest memory.
++pub(super) struct StorageWriteback {
++    texture_ref: u32,
++    gva: u64,
++    row_stride: u64,
++    width: u32,
++    height: u32,
++    tight: usize,
++}
++
++/// The linear texture a fragment storage write targets, and its current texels
++/// as tight rows to seed the image with, so texels the pass does not write keep
++/// their content. `None` for anything that is not a level-0 linear texture of
++/// the shader's texel width.
++fn linear_storage_target<M: HostMemory + HostOps>(
++    state: &DeviceState,
++    host: &M,
++    task_id: u32,
++    texture_ref: u32,
++    bytes_per_texel: usize,
++) -> Option<(StorageWriteback, Vec<u8>)> {
++    let resource = objects::resolve_resource(state, host, task_id, texture_ref).ok()?;
++    let Ok(crate::runtime::decode::resource::Descriptor::Texture(tex)) = resource.decoded() else {
++        return None;
++    };
++    if pixel_format::bytes_per_pixel(tex.pixel_format)? as usize != bytes_per_texel {
++        return None;
++    }
++    let (gva, layout) = tex.level_gva(0, state.page_shift)?;
++    let tight = (layout.width as usize).checked_mul(bytes_per_texel)?;
++    if layout.row_stride < tight as u64 {
++        return None;
++    }
++    let mut seed = vec![0u8; tight.checked_mul(layout.height as usize)?];
++    for (y, row) in seed.chunks_exact_mut(tight).enumerate() {
++        crate::runtime::gva_mem::read_task_gva_by_id(
++            host,
++            &state.tasks,
++            task_id,
++            gva + y as u64 * layout.row_stride,
++            row,
++            state.page_shift,
++        )
++        .ok()?;
++    }
++    Some((
++        StorageWriteback {
++            texture_ref,
++            gva,
++            row_stride: layout.row_stride,
++            width: layout.width,
++            height: layout.height,
++            tight,
++        },
++        seed,
++    ))
++}
++
++/// Write a fragment storage image's texels back to the linear texture it
++/// stands for, and drop host copies of that texture.
++fn land_storage_writeback<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    task_id: u32,
++    target: &StorageWriteback,
++    pixels: &[u8],
++) {
++    let rows = pixels.chunks_exact(target.tight).take(target.height as usize);
++    let mut landed = true;
++    for (y, row) in rows.enumerate() {
++        landed &= crate::runtime::gva_mem::write_task_gva_product_within(
++            state,
++            host,
++            task_id,
++            target.gva + y as u64 * target.row_stride,
++            row,
++            None,
++        )
++        .is_ok();
++    }
++    crate::runtime::surface_cache::evict_texture(state, task_id, target.texture_ref);
++    crate::runtime::surface_cache::evict_gva(state, target.gva);
++    crate::runtime::drain::note_store_route(if landed {
++        "frag_storage_landed"
++    } else {
++        "frag_storage_land_partial"
++    });
++}
++
+ /// Generation of every heap texture's resident. Memoryless attachments take 0
+ /// at the same reference namespace, and the two must never share a resident.
+ pub(crate) const HEAP_TARGET_GENERATION: u64 = 1;
+diff --git a/crates/reims-vgpu/src/runtime/pipeline_resolve.rs b/crates/reims-vgpu/src/runtime/pipeline_resolve.rs
+index 7d83024c..cdc63184 100644
+--- a/crates/reims-vgpu/src/runtime/pipeline_resolve.rs
++++ b/crates/reims-vgpu/src/runtime/pipeline_resolve.rs
+@@ -373,17 +373,23 @@ fn resolve_uncached<M: HostMemory + HostOps>(
+         task_id,
+         function_ref: desc.vertex_func_ref,
+     })?;
+-    let f_mtlb = load_mtlb(
+-        state,
+-        host,
+-        task_id,
+-        desc.fragment_func_ref,
+-        AirLoadRail::Draw,
+-    )
+-    .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
+-        task_id,
+-        function_ref: desc.fragment_func_ref,
+-    })?;
++    let f_mtlb = if desc.fragment_func_ref == 0 {
++        None
++    } else {
++        Some(
++            load_mtlb(
++                state,
++                host,
++                task_id,
++                desc.fragment_func_ref,
++                AirLoadRail::Draw,
++            )
++            .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
++                task_id,
++                function_ref: desc.fragment_func_ref,
++            })?,
++        )
++    };
+     enter(Phase::PipelineAir);
+     let v_air = crate::runtime::mtlb::extract_air(&v_mtlb).map_err(|reason| {
+         DrawPreparationDecline::VertexAirExtract {
+@@ -391,12 +397,17 @@ fn resolve_uncached<M: HostMemory + HostOps>(
+             reason,
+         }
+     })?;
+-    let f_air = crate::runtime::mtlb::extract_air(&f_mtlb).map_err(|reason| {
+-        DrawPreparationDecline::FragmentAirExtract {
+-            function_ref: desc.fragment_func_ref,
+-            reason,
+-        }
+-    })?;
++    let f_air = f_mtlb
++        .as_deref()
++        .map(|f_mtlb| {
++            crate::runtime::mtlb::extract_air(f_mtlb).map_err(|reason| {
++                DrawPreparationDecline::FragmentAirExtract {
++                    function_ref: desc.fragment_func_ref,
++                    reason,
++                }
++            })
++        })
++        .transpose()?;
+     enter(Phase::PipelineXlate);
+     let vertex = crate::runtime::m2v_cache::translate_cached_reflected(
+         v_air,
+@@ -407,15 +418,18 @@ fn resolve_uncached<M: HostMemory + HostOps>(
+         pipeline_ref,
+         reason,
+     })?;
+-    let fragment = crate::runtime::m2v_cache::translate_cached_reflected(
+-        f_air,
+-        metal2vulkan::passes::Stage::Fragment,
+-        pipeline_ref,
+-    )
+-    .map_err(|reason| DrawPreparationDecline::FragmentTranslate {
+-        pipeline_ref,
+-        reason,
+-    })?;
++    let fragment = match f_air {
++        None => colourless_fragment(),
++        Some(f_air) => crate::runtime::m2v_cache::translate_cached_reflected(
++            f_air,
++            metal2vulkan::passes::Stage::Fragment,
++            pipeline_ref,
++        )
++        .map_err(|reason| DrawPreparationDecline::FragmentTranslate {
++            pipeline_ref,
++            reason,
++        })?,
++    };
+     let bind_plan = Arc::new(VertexBindPlan::build(&desc));
+     Ok(ResolvedRenderPipeline {
+         pipeline_object: None,
+@@ -426,6 +440,64 @@ fn resolve_uncached<M: HostMemory + HostOps>(
+     })
+ }
+ 
++/// The fragment stage of a pipeline the guest built with no fragment function:
++/// an empty `main` with no inputs, outputs or resources. The draw masks every
++/// colour write for a fragment stage with no outputs, so only depth and
++/// stencil change, as Metal does.
++fn colourless_fragment() -> Arc<CachedShader> {
++    use metal2vulkan::reflect::{ShaderReflection, ShaderStage, REFLECTION_VERSION};
++    static SHADER: OnceLock<Arc<CachedShader>> = OnceLock::new();
++    SHADER
++        .get_or_init(|| {
++            // OpCapability Shader; OpMemoryModel Logical GLSL450;
++            // OpEntryPoint Fragment %1 "main"; OpExecutionMode %1 OriginUpperLeft;
++            // %2 = OpTypeVoid; %3 = OpTypeFunction %2;
++            // %1 = OpFunction %2 None %3; %4 = OpLabel; OpReturn; OpFunctionEnd.
++            const WORDS: [u32; 32] = [
++                0x0723_0203, 0x0001_0000, 0, 5, 0, //
++                0x0002_0011, 1, //
++                0x0003_000e, 0, 1, //
++                0x0005_000f, 4, 1, 0x6e69_616d, 0, //
++                0x0003_0010, 1, 7, //
++                0x0002_0013, 2, //
++                0x0003_0021, 3, 2, //
++                0x0005_0036, 2, 1, 0, 3, //
++                0x0002_00f8, 4, //
++                0x0001_00fd, //
++                0x0001_0038,
++            ];
++            let spirv = WORDS
++                .iter()
++                .flat_map(|word| word.to_le_bytes())
++                .collect();
++            Arc::new(CachedShader::new(
++                spirv,
++                Arc::new(ShaderReflection {
++                    reflection_version: REFLECTION_VERSION,
++                    stage: ShaderStage::Fragment,
++                    entry_point: Some("main".to_owned()),
++                    bindings: vec![],
++                    argument_buffer_fields: vec![],
++                    vertex_attributes: vec![],
++                    varyings: vec![],
++                    render_targets: vec![],
++                    depth_members: vec![],
++                    depth_qualifier: None,
++                    stencil_members: vec![],
++                    local_size: None,
++                    vertex_builtins: None,
++                    tessellation: None,
++                    imageblock_layouts: vec![],
++                    implicit_imageblock_attachments: vec![],
++                    fragment_imageblock: None,
++                    datalayout: None,
++                    function_constants: vec![],
++                }),
++            ))
++        })
++        .clone()
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/crates/reims-vgpu/src/runtime/ycbcr.rs b/crates/reims-vgpu/src/runtime/ycbcr.rs
+index 9bb4821c..cf90228b 100644
+--- a/crates/reims-vgpu/src/runtime/ycbcr.rs
++++ b/crates/reims-vgpu/src/runtime/ycbcr.rs
+@@ -2,20 +2,17 @@
+ //!
+ //! From macOS 14 on, Setup Assistant plays its background video into IOSurfaces
+ //! with a luma plane and an interleaved CbCr plane (`'420f'` on 14, `'422f'` on
+-//! 15, `'444f'` and ten-bit `'x420'` on 27) and binds the whole surface as one
+-//! texture in one of Metal's private biplanar formats. They sample in three
++//! 15, `'444f'` and ten-bit `'x420'` on 15 and 27) and binds the whole surface
++//! as one texture in one of Metal's private biplanar formats. They sample in two
+ //! ways, each read off the shader that consumes it:
+ //!
+ //! - **500 to 510** convert in the sampler. 14's compositor reads `.rgb` and
+ //!   goes straight on to its transfer function, so it is handed R'G'B'.
+-//! - **540 to 542** (8-bit 4:2:0, 4:2:2 and 4:4:4) return Cr, Y and Cb in red,
+-//!   green and blue: VideoToolbox's transfer kernel on 15 and 27 swizzles
+-//!   `.gbr` and applies its own matrix.
+-//! - **543** (ten-bit 4:2:0) is 27's 4K hello video. Its kernel reads `.rgb` as
+-//!   Y, Cb and Cr, but handed that, the Golden Gate Bridge comes out blue and
+-//!   the sunset sky blue on the wrong side, against Apple's own still of the
+-//!   scene. Handed Y, Cr and Cb it matches the still. Why the kernel's reading
+-//!   and the screen disagree is not found yet.
++//! - **540 to 543** (8-bit 4:2:0, 4:2:2 and 4:4:4, and ten-bit 4:2:0) return
++//!   Cr, Y and Cb in red, green and blue: VideoToolbox's transfer kernels on 15
++//!   and 27 swizzle `.gbr` and apply their own matrix. The ten-bit kernel
++//!   swizzles when it stores the sample in a local array and reads `.rgb` back
++//!   later, which was once misread as the kernel taking Y, Cb and Cr.
+ //!
+ //! The rest of the private range has not been met, and is refused rather than
+ //! guessed.
+@@ -25,9 +22,9 @@
+ //! kernel applies BT.601 to its 512 by 512 frames. The range comes from the
+ //! surface's FourCC: a trailing `f` is full range, anything else video range.
+ //!
+-//! Ten-bit surfaces (`'x420'`, 27's background after its language panel) hold
+-//! each sample in the high bits of 16; the high byte is taken, which is what
+-//! an RGBA8 result can hold anyway.
++//! Ten-bit surfaces (`'x420'`, the background video after the language panel)
++//! hold each sample in the high bits of 16; the high byte is taken, which is
++//! what an RGBA8 result can hold anyway.
+ 
+ /// How a texture in one of these formats samples.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -36,8 +33,6 @@ pub enum Sampling {
+     Converted,
+     /// The sampler returns Cr, Y and Cb in red, green and blue.
+     CrYCb,
+-    /// Y, Cr and Cb in red, green and blue: 543, see the module doc.
+-    YCrCb,
+ }
+ 
+ impl Sampling {
+@@ -46,8 +41,7 @@ impl Sampling {
+     pub fn of(format: u16) -> Option<Self> {
+         match format {
+             500..=510 => Some(Self::Converted),
+-            540..=542 => Some(Self::CrYCb),
+-            543 => Some(Self::YCrCb),
++            540..=543 => Some(Self::CrYCb),
+             _ => None,
+         }
+     }
+@@ -191,10 +185,6 @@ pub fn to_rgba8(
+                     texel.copy_from_slice(&[cr, luma_texel, cb, 255]);
+                     continue;
+                 }
+-                Sampling::YCrCb => {
+-                    texel.copy_from_slice(&[luma_texel, cr, cb, 255]);
+-                    continue;
+-                }
+                 Sampling::Converted => {}
+             }
+             let (cb, cr) = (i32::from(cb) - 128, i32::from(cr) - 128);
+@@ -221,7 +211,7 @@ mod tests {
+         assert_eq!(Sampling::of(500), Some(Sampling::Converted));
+         assert_eq!(Sampling::of(541), Some(Sampling::CrYCb));
+         assert_eq!(Sampling::of(542), Some(Sampling::CrYCb));
+-        assert_eq!(Sampling::of(543), Some(Sampling::YCrCb));
++        assert_eq!(Sampling::of(543), Some(Sampling::CrYCb));
+         assert_eq!(Sampling::of(520), None);
+         assert_eq!(Sampling::of(544), None);
+         assert_eq!(Sampling::of(80), None);
+-- 
+2.43.0
+

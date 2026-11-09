@@ -1,0 +1,45 @@
+From 7b8c134ed5fab83e323df16f5a78815b6a424e60 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 14:52:38 +0800
+Subject: [PATCH 3/4] Spike: REIMS_VGPU_SPIKE_VERSION_CAP holds a guest binary
+ version request to a lower rung
+
+---
+ .../reims-vgpu-core/src/guest/abi/features.rs   | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/crates/reims-vgpu-core/src/guest/abi/features.rs b/crates/reims-vgpu-core/src/guest/abi/features.rs
+index 1b61535db..1a2c5b243 100644
+--- a/crates/reims-vgpu-core/src/guest/abi/features.rs
++++ b/crates/reims-vgpu-core/src/guest/abi/features.rs
+@@ -261,6 +261,7 @@ pub fn set_binary_version(
+     feature_level: u64,
+     store_binary_version: impl FnOnce(i32),
+ ) -> Option<i32> {
++    let requested = spike_version_cap(requested);
+     let Some(stepped) = step_binary_version(requested) else {
+         log::warn!("binary version request {requested:#x} refused: bit 31 is set");
+         return None;
+@@ -736,3 +737,19 @@ mod tests {
+         }
+     }
+ }
++
++/// Spike (DGX): `REIMS_VGPU_SPIKE_VERSION_CAP=<n>` lowers a guest request above `n` to `n`
++/// before the negotiation, so a guest that asks past the host can be held to an older rung (the
++/// stable stack answered 62). Unset, every request passes through as upstream negotiates it.
++fn spike_version_cap(requested: u32) -> u32 {
++    static CAP: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
++    let cap = *CAP.get_or_init(|| {
++        let cap = std::env::var("REIMS_VGPU_SPIKE_VERSION_CAP").ok()?.parse::<u32>().ok()?;
++        log::warn!("REIMS_VGPU_SPIKE_VERSION_CAP: binary version requests above {cap} become {cap}");
++        Some(cap)
++    });
++    match cap {
++        Some(cap) if requested > cap && requested.cast_signed() >= 0 => cap,
++        _ => requested,
++    }
++}
+-- 
+2.43.0
+

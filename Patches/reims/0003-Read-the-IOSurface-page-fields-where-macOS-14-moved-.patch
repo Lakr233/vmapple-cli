@@ -1,0 +1,150 @@
+From 06319108e880296ce13dbcf58854b921a5c5aa2c Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Sun, 8 Nov 2026 10:42:19 +0800
+Subject: [PATCH] Read the IOSurface page fields where macOS 14 moved them
+
+macOS 14 and later keep the mapping header but put 16 more bytes in front
+of the page fields: +0x48 and +0x50 read zero, the fields sit at +0x58 and
++0x60 and the page count at +0x80. The tables they point to keep their
+offsets. Without this every type-11 mapping on 14.6.1, 15.6.1 and 26.6.2
+failed iosurface_page_table_fields_invalid and nothing reached the screen.
+
+The hole test now expects the plan a85d6998 makes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/contract/iosurface_pages.rs           | 93 +++++++++++++++----
+ 1 file changed, 74 insertions(+), 19 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/contract/iosurface_pages.rs b/crates/reims-vgpu/src/contract/iosurface_pages.rs
+index 488d95c2..e7dd4a7f 100644
+--- a/crates/reims-vgpu/src/contract/iosurface_pages.rs
++++ b/crates/reims-vgpu/src/contract/iosurface_pages.rs
+@@ -112,6 +112,11 @@ pub const MAPPING_INTERNAL_EXPECTED_SIZE: u32 = 0x200;
+ pub const MAPPING_INTERNAL_PAGE_FIELD_48: u64 = 0x48;
+ pub const MAPPING_INTERNAL_PAGE_FIELD_50: u64 = 0x50;
+ pub const MAPPING_INTERNAL_PAGE_COUNT: u64 = 0x70;
++/// How far macOS 14 and later moved the page fields and the page count. The
++/// tables they point to keep their own offsets: measured on 15.6.1, `+0x58`
++/// then `+0xb8` and `+0x60` then `+0x28` reach the same valid entries, and
++/// `+0x80` holds the page count.
++pub const MAPPING_INTERNAL_SONOMA_SHIFT: u64 = 0x10;
+ pub const MAPPING_PAGE_TABLE_FROM_F48: u64 = 0xb8;
+ pub const MAPPING_PAGE_TABLE_FROM_F50: u64 = 0x28;
+ 
+@@ -736,13 +741,31 @@ pub fn read_mapper_internal(
+     mapper_device_kva: u64,
+ ) -> Result<MapperInternalFields, Status> {
+     let mut fields = read_mapper_identity(mem, internal_kva, has_mapper_device, mapper_device_kva)?;
+-    fields.page_field_48 = read_u64_at(mem, internal_kva, MAPPING_INTERNAL_PAGE_FIELD_48).ok_or(
+-        Status::ErrInternalRead("iosurface_mapper_page_field_48_read"),
+-    )?;
+-    fields.page_field_50 = read_u64_at(mem, internal_kva, MAPPING_INTERNAL_PAGE_FIELD_50).ok_or(
+-        Status::ErrInternalRead("iosurface_mapper_page_field_50_read"),
+-    )?;
+-    fields.raw_page_count = read_u64_at(mem, internal_kva, MAPPING_INTERNAL_PAGE_COUNT)
++    let page_fields = |shift: u64| -> Result<(u64, u64), Status> {
++        Ok((
++            read_u64_at(mem, internal_kva, MAPPING_INTERNAL_PAGE_FIELD_48 + shift).ok_or(
++                Status::ErrInternalRead("iosurface_mapper_page_field_48_read"),
++            )?,
++            read_u64_at(mem, internal_kva, MAPPING_INTERNAL_PAGE_FIELD_50 + shift).ok_or(
++                Status::ErrInternalRead("iosurface_mapper_page_field_50_read"),
++            )?,
++        ))
++    };
++    // The header up to the size word is the same on every release. macOS 14
++    // and later put 16 more bytes in front of the page fields and leave
++    // `+0x48` and `+0x50` zero, which is what tells the two layouts apart.
++    let mut shift = 0;
++    let (mut field_48, mut field_50) = page_fields(0)?;
++    if !mem.is_kernel_va(field_48) && !mem.is_kernel_va(field_50) {
++        let (moved_48, moved_50) = page_fields(MAPPING_INTERNAL_SONOMA_SHIFT)?;
++        if mem.is_kernel_va(moved_48) || mem.is_kernel_va(moved_50) {
++            shift = MAPPING_INTERNAL_SONOMA_SHIFT;
++            (field_48, field_50) = (moved_48, moved_50);
++        }
++    }
++    fields.page_field_48 = field_48;
++    fields.page_field_50 = field_50;
++    fields.raw_page_count = read_u64_at(mem, internal_kva, MAPPING_INTERNAL_PAGE_COUNT + shift)
+         .ok_or(Status::ErrInternalRead("iosurface_mapper_page_count_read"))?;
+     Ok(fields)
+ }
+@@ -1075,29 +1098,61 @@ mod tests {
+         .expect_err("the deleted chase does not answer this");
+         assert_eq!(error.refusal(), Some("iosurface_page_table_only_field_50"));
+ 
+-        // Both populated, `+0x48`'s table unparseable. This is the one shape
+-        // the fallback was ever load-bearing for, and `earlier_failed` read
+-        // zero over both driven boots — so it is now a refusal carrying the
+-        // reason the table failed, rather than a silent rescue.
++        // Both populated, and `+0x48`'s table names a page the guest has not
++        // touched yet. The plan still comes through `+0x48` and keeps the hole,
++        // so readers see it and a later resolve picks the frame up; `table_b`
++        // does not rescue it.
+         let mut mem = MapMem::new();
+         mem.put_u64(field_48 + MAPPING_PAGE_TABLE_FROM_F48, table_a);
+         mem.put_u64(field_50 + MAPPING_PAGE_TABLE_FROM_F50, table_b);
+-        mem.put_u32(table_a, 0); // a zero entry is refused
++        mem.put_u32(table_a, 0);
+         mem.put_u32(table_b, good_entry);
+-        let error = build_table_plan(
++        let plan = build_table_plan(
+             &mem,
+             3,
+             &base(field_48, field_50),
+             PAGE_SIZE_ARM64E,
+             PAGE_SHIFT_ARM64E,
+         )
+-        .expect_err("no second candidate rescues this any more");
+-        assert_eq!(
+-            error.refusal(),
+-            Some("iosurface_page_table_entry_invalid"),
+-            "the refusal names why the chased table failed, not that a \
+-             fallback was missing"
++        .expect("a hole is a plan");
++        assert_eq!(plan.page_table_kva, table_a);
++        assert_eq!(plan.entries, vec![0]);
++    }
++
++    /// macOS 14 and later leave `+0x48` and `+0x50` zero and keep the page
++    /// fields and the page count 16 bytes further on.
++    #[test]
++    fn the_sonoma_layout_reads_the_page_fields_sixteen_bytes_on() {
++        let internal = 0xffff_fe00_0001_0000u64;
++        let field_58 = 0xffff_fe00_0002_0000u64;
++        let table = 0xffff_fe00_0003_0000u64;
++        let mut mem = MapMem::new();
++        mem.put_u64(internal + MAPPING_INTERNAL_BACKPTR, 0xffff_fe00_0004_0000);
++        mem.put_u32(internal + MAPPING_INTERNAL_ID, 3);
++        mem.put_u32(internal + MAPPING_INTERNAL_SIZE, MAPPING_INTERNAL_EXPECTED_SIZE);
++        mem.put_u64(internal + MAPPING_INTERNAL_PAGE_FIELD_48, 0);
++        mem.put_u64(internal + MAPPING_INTERNAL_PAGE_FIELD_50, 0);
++        mem.put_u64(internal + MAPPING_INTERNAL_PAGE_COUNT, 0);
++        mem.put_u64(
++            internal + MAPPING_INTERNAL_PAGE_FIELD_48 + MAPPING_INTERNAL_SONOMA_SHIFT,
++            field_58,
++        );
++        mem.put_u64(
++            internal + MAPPING_INTERNAL_PAGE_FIELD_50 + MAPPING_INTERNAL_SONOMA_SHIFT,
++            0,
++        );
++        mem.put_u64(
++            internal + MAPPING_INTERNAL_PAGE_COUNT + MAPPING_INTERNAL_SONOMA_SHIFT,
++            1,
+         );
++        let fields = read_mapper_internal(&mem, internal, false, 0).expect("fields read");
++        assert_eq!(fields.page_field_48, field_58);
++        assert_eq!(fields.raw_page_count, 1);
++        mem.put_u64(field_58 + MAPPING_PAGE_TABLE_FROM_F48, table);
++        mem.put_u32(table, (0x1234 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID);
++        let plan = build_table_plan(&mem, 3, &fields, PAGE_SIZE_ARM64E, PAGE_SHIFT_ARM64E)
++            .expect("the moved fields are a plan");
++        assert_eq!(plan.page_table_kva, table);
+     }
+ 
+     #[test]
+-- 
+2.43.0
+

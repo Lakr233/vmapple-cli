@@ -1,0 +1,257 @@
+From c025dd1ea2e0f26f72094ebee64bd9ef9dfe8f99 Mon Sep 17 00:00:00 2001
+From: Icegrave0391 <chuqiz@comp.nus.edu.sg>
+Date: Thu, 10 Sep 2026 15:22:05 +0800
+Subject: [PATCH 03/14] Move the VMApple firmware handoff into QEMU
+
+At the firmware entry point, arm a hardware breakpoint and, once the pass with
+the boot-info pointer arrives, write the verbose boot arguments and rewrite the
+device-tree timebase frequency, replacing the external GDB session. The first
+boot-info-less pass is single-stepped over and the breakpoint re-armed, matching
+the GDB handoff's ignore_count=1 within KVM.
+---
+ target/arm/kvm.c | 201 +++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 201 insertions(+)
+
+diff --git a/target/arm/kvm.c b/target/arm/kvm.c
+index afb6636888..0b58bd3bc0 100644
+--- a/target/arm/kvm.c
++++ b/target/arm/kvm.c
+@@ -35,6 +35,7 @@
+ #include "system/address-spaces.h"
+ #include "system/memory.h"
+ #include "hw/core/cpu.h"
++#include "qemu/bswap.h"
+ #include "gdbstub/enums.h"
+ #include "hw/core/boards.h"
+ #include "hw/core/irq.h"
+@@ -1491,6 +1492,164 @@ static void kvm_arm_vm_state_change(void *opaque, bool running, RunState state)
+     }
+ }
+ 
++/*
++ * VMApple firmware handoff.
++ *
++ * Apple's firmware builds its boot-info structure and device tree in guest RAM
++ * after QEMU hands control over. macOS needs the verbose boot arguments written
++ * into the boot-info and the CPU timebase-frequency set to the host counter
++ * frequency. QEMU performs both at the firmware entry point instead of through
++ * an external GDB session; opt in with QEMU_VMAPPLE_HANDOFF=1.
++ */
++#define VMAPPLE_HANDOFF_PC           UINT64_C(0xaca00000)
++#define VMAPPLE_HANDOFF_BOOTARGS_OFF 108
++#define VMAPPLE_HANDOFF_BOOTARGS_LEN 608
++
++static bool vmapple_handoff_armed;
++static bool vmapple_handoff_stepped;
++static bool vmapple_handoff_stepping;
++
++/* Declared in accel/kvm/kvm-cpus.h, which the arm target does not include. */
++int kvm_insert_breakpoint(CPUState *cpu, int type, vaddr addr, vaddr len);
++int kvm_remove_breakpoint(CPUState *cpu, int type, vaddr addr, vaddr len);
++
++static uint32_t vmapple_align4(uint32_t value)
++{
++    return (value + 3u) & ~3u;
++}
++
++/* Patch every CPU timebase-frequency in the flattened Apple device tree. */
++static bool vmapple_patch_node(uint8_t *tree, uint32_t size, uint32_t offset,
++                               int depth, bool parent_is_cpus, uint32_t freq,
++                               int *patched, uint32_t *next)
++{
++    uint32_t properties, children, cursor, i;
++    bool is_cpus = false;
++
++    if (offset + 8 > size || depth > 128) {
++        return false;
++    }
++    properties = ldl_le_p(tree + offset);
++    children = ldl_le_p(tree + offset + 4);
++    cursor = offset + 8;
++
++    for (i = 0; i < properties; i++) {
++        const char *name;
++        uint32_t length, start;
++
++        if (cursor + 36 > size) {
++            return false;
++        }
++        name = (const char *)(tree + cursor);
++        length = ldl_le_p(tree + cursor + 32) & 0x00ffffffu;
++        start = cursor + 36;
++        if (start + length > size) {
++            return false;
++        }
++        if (parent_is_cpus && !strcmp(name, "timebase-frequency") &&
++            (length == 4 || length == 8) && ldl_le_p(tree + start) == 24000000) {
++            stl_le_p(tree + start, freq);
++            if (length == 8) {
++                stl_le_p(tree + start + 4, 0);
++            }
++            (*patched)++;
++        }
++        if (!strcmp(name, "name") && start + 4 <= size &&
++            !memcmp(tree + start, "cpus", 4)) {
++            is_cpus = depth == 1;
++        }
++        cursor = start + vmapple_align4(length);
++    }
++    for (i = 0; i < children; i++) {
++        uint32_t child_next;
++
++        if (!vmapple_patch_node(tree, size, cursor, depth + 1, is_cpus, freq,
++                                patched, &child_next)) {
++            return false;
++        }
++        cursor = child_next;
++    }
++    *next = cursor;
++    return true;
++}
++
++static void vmapple_handoff_apply(CPUState *cs)
++{
++    ARMCPU *cpu = ARM_CPU(cs);
++    CPUARMState *env = &cpu->env;
++    const char *args = g_getenv("QEMU_VMAPPLE_BOOT_ARGS");
++    const char *freq_env = g_getenv("QEMU_VMAPPLE_TIMEBASE_HZ");
++    uint32_t freq = freq_env ? strtoul(freq_env, NULL, 0) : 1000000000u;
++    uint64_t boot = env->xregs[1];
++    uint64_t vbase, pbase, tree_va, tree_pa;
++    uint32_t tree_len;
++    uint8_t boot_info[112];
++    char payload[VMAPPLE_HANDOFF_BOOTARGS_LEN];
++    uint8_t *tree;
++    int patched = 0;
++    uint32_t next;
++
++    if (!args) {
++        args = "-v serial=11 debug=0x14c";
++    }
++    if (cpu_memory_rw_debug(cs, boot, boot_info, sizeof(boot_info), 0)) {
++        return;
++    }
++    if (lduw_le_p(boot_info) != 2 || lduw_le_p(boot_info + 2) != 2) {
++        return;
++    }
++    vbase = ldq_le_p(boot_info + 8);
++    pbase = ldq_le_p(boot_info + 16);
++    tree_va = ldq_le_p(boot_info + 96);
++    tree_len = ldl_le_p(boot_info + 104);
++    if (tree_va < vbase || tree_len == 0 || tree_len > 4 * 1024 * 1024) {
++        return;
++    }
++
++    memset(payload, 0, sizeof(payload));
++    g_strlcpy(payload, args, sizeof(payload));
++    cpu_memory_rw_debug(cs, boot + VMAPPLE_HANDOFF_BOOTARGS_OFF, payload,
++                        sizeof(payload), 1);
++
++    tree_pa = tree_va - vbase + pbase;
++    tree = g_malloc(tree_len);
++    if (address_space_read(&address_space_memory, tree_pa,
++                           MEMTXATTRS_UNSPECIFIED, tree, tree_len) == MEMTX_OK) {
++        uint8_t *copy = g_memdup2(tree, tree_len);
++
++        if (vmapple_patch_node(copy, tree_len, 0, 0, false, freq, &patched,
++                               &next) && patched > 0) {
++            address_space_write(&address_space_memory, tree_pa,
++                                MEMTXATTRS_UNSPECIFIED, copy, tree_len);
++        }
++        g_free(copy);
++    }
++    g_free(tree);
++    info_report("vmapple handoff: %d timebase properties set to %u Hz",
++                patched, freq);
++}
++
++static void vmapple_handoff_arm(CPUState *cs)
++{
++    int err;
++
++    if (vmapple_handoff_armed || !g_getenv("QEMU_VMAPPLE_HANDOFF") ||
++        cs->cpu_index != 0) {
++        return;
++    }
++    vmapple_handoff_armed = true;
++    err = kvm_insert_breakpoint(cs, GDB_BREAKPOINT_HW, VMAPPLE_HANDOFF_PC, 4);
++    info_report("vmapple handoff: arm cpu=%d err=%d max_hw_bps=%d",
++                cs->cpu_index, err, max_hw_bps);
++    kvm_update_guest_debug(cs, 0);
++}
++
++static void vmapple_handoff_disarm(CPUState *cs)
++{
++    kvm_remove_breakpoint(cs, GDB_BREAKPOINT_HW, VMAPPLE_HANDOFF_PC, 4);
++    kvm_update_guest_debug(cs, 0);
++}
++
+ /*
+  * Apple's firmware stores to a GIC register with a pre-indexed addressing form
+  * that Linux KVM on arm64 cannot describe when the stage-2 abort carries no
+@@ -1621,6 +1780,17 @@ static bool kvm_arm_handle_debug(ARMCPU *cpu,
+ 
+     switch (hsr_ec) {
+     case EC_SOFTWARESTEP:
++        if (vmapple_handoff_stepping) {
++            /*
++             * Finished stepping over the first, boot-info-less pass at the
++             * handoff entry; re-arm so the real pass (x1 != 0) is caught.
++             */
++            vmapple_handoff_stepping = false;
++            cpu_single_step(cs, 0);
++            kvm_insert_breakpoint(cs, GDB_BREAKPOINT_HW, VMAPPLE_HANDOFF_PC, 4);
++            kvm_update_guest_debug(cs, 0);
++            return false;
++        }
+         if (cpu_single_stepping(cs)) {
+             return true;
+         } else {
+@@ -1640,6 +1810,28 @@ static bool kvm_arm_handle_debug(ARMCPU *cpu,
+         }
+         break;
+     case EC_BREAKPOINT:
++        if (g_getenv("QEMU_VMAPPLE_HANDOFF") &&
++            env->pc == VMAPPLE_HANDOFF_PC) {
++            if (env->xregs[1] != 0) {
++                vmapple_handoff_apply(cs);
++                vmapple_handoff_disarm(cs);
++                return false;
++            }
++            if (!vmapple_handoff_stepped) {
++                /*
++                 * The firmware reaches the handoff entry once with x1 == 0
++                 * before the real pass. Step over it and re-arm, matching the
++                 * GDB handoff's ignore_count=1 without retrapping the same PC
++                 * in KVM.
++                 */
++                vmapple_handoff_stepped = true;
++                vmapple_handoff_stepping = true;
++                kvm_remove_breakpoint(cs, GDB_BREAKPOINT_HW,
++                                      VMAPPLE_HANDOFF_PC, 4);
++                cpu_single_step(cs, SSTEP_ENABLE);
++            }
++            return false;
++        }
+         if (find_hw_breakpoint(cs, env->pc)) {
+             return true;
+         }
+@@ -2329,6 +2521,15 @@ int kvm_arch_put_registers(CPUState *cs, KvmPutState level, Error **errp)
+     ARMCPU *cpu = ARM_CPU(cs);
+     CPUARMState *env = &cpu->env;
+ 
++    /*
++     * Arm the handoff at the first full put, which runs on the vCPU thread
++     * before the first KVM_RUN. The runtime put is skipped while vcpu_dirty
++     * stays clear, so arming there would be too late.
++     */
++    if (level != KVM_PUT_RESET_STATE) {
++        vmapple_handoff_arm(cs);
++    }
++
+     /* If we are in AArch32 mode then we need to copy the AArch32 regs to the
+      * AArch64 registers before pushing them out to 64-bit KVM.
+      */
+-- 
+2.43.0
+

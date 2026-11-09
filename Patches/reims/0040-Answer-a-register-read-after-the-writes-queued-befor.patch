@@ -1,0 +1,281 @@
+From c963eab43b5bc81c2cc8101fed1cddd5fc82b8c8 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 12:24:01 +0800
+Subject: [PATCH 24/24] Answer a register read after the writes queued before
+ it
+
+The 14.6.1 warm boot of 2026-11-09 (~/codex-work/runs/reg2-14-warm)
+logged the protocol handshake at 2.4 s and nothing after it for twelve
+minutes: no root FIFO packet, no display, no IOMobileFramebuffer start
+in the guest, WindowServer crashing for want of a display. No thread was
+stuck: the vCPUs were halted in KVM, the main loop was in ppoll, and the
+drain worker (the thread left named qemu-system-aar, since QEMU's
+"reims-vgpu-drain" is one character past the kernel's limit) was in its
+condition wait with nothing to do. The guest had simply stopped asking.
+
+The guest driver writes the protocol version it speaks and reads the
+register straight back; what it reads selects its feature set. A gfx
+write that finds the device lock taken, here by a 4 ms poll for a few
+microseconds, goes into the ingress queue for the drain to apply, and a
+read did not look at that queue: one that found the lock free again
+read the state as it was before the write. The warm boot's log shows the
+write applied by the drain (protocol_version and the tranche's level
+lines in one millisecond, where the cold boot's direct write was 8 ms
+ahead of its first tranche), and no device_lock_busy line, so the read
+took the lock and answered 0. The guest gave the device up there. The
+queue predates this branch; the caches the warm boot kept are first
+read 10 s later and played no part.
+
+- The negotiated version is published, lock-free, by the vCPU that
+  writes it, before the write can queue, and its read is served from
+  there (GfxRegs::version_live, kept across reset and cleared by it).
+- Any other read that can take the lock applies the queued writes
+  first, in order, as the drain would have; the lock order stays ingress
+  then inner. A read that cannot take the lock still answers from the
+  cache, and its device_lock_busy line now says how many writes were
+  queued.
+
+Tests (lib, --test-threads=1): 2311 passed, 0 failed. New: a
+version written while the lock is held reads back negotiated both while
+it is held and once it is free, before any drain, and 0 after a reset; a
+read applies two queued writes to one register in order and leaves the
+queue empty. Without the change both read 0 (checked). No guest was
+booted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/reims-vgpu/src/device/mod.rs   | 32 ++++++++++++++-
+ crates/reims-vgpu/src/device/tests.rs | 58 +++++++++++++++++++++++++++
+ crates/reims-vgpu/src/model/state.rs  | 19 +++++++++
+ crates/reims-vgpu/src/runtime/mmio.rs |  6 +++
+ 4 files changed, 114 insertions(+), 1 deletion(-)
+
+diff --git a/crates/reims-vgpu/src/device/mod.rs b/crates/reims-vgpu/src/device/mod.rs
+index 758e1b5c..f1a2b871 100644
+--- a/crates/reims-vgpu/src/device/mod.rs
++++ b/crates/reims-vgpu/src/device/mod.rs
+@@ -107,6 +107,9 @@ struct BoundDevice {
+     /// `writeFifo` producer spin must observe drain progress live, not a
+     /// cached snapshot from before the tranche.
+     fifo_read_live: Arc<AtomicU32>,
++    /// Lock-free clone of the negotiated protocol version (0x1034); see
++    /// [`crate::model::GfxRegs::version_live`].
++    version_live: Arc<AtomicU32>,
+     /// The IOSurface mapper registers, read by a vCPU with no lock; published
+     /// by whoever changes them under the device lock.
+     iosfc_live: Arc<crate::model::IosfcLive>,
+@@ -251,6 +254,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
+     let child_doorbell_rung = Arc::clone(&dev.state.gfx.child_doorbell_rung);
+     let intr_fault = Arc::clone(&dev.state.gfx.interrupt_fault);
+     let fifo_read_live = Arc::clone(&dev.state.gfx.fifo_read);
++    let version_live = Arc::clone(&dev.state.gfx.version_live);
+     let iosfc_live = Arc::clone(&dev.state.iosfc.live);
+     DEVICES.lock().insert(
+         id,
+@@ -268,6 +272,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
+             child_doorbell_rung,
+             intr_fault,
+             fifo_read_live,
++            version_live,
+             iosfc_live,
+             present_action_pending: AtomicBool::new(false),
+             present_boundary_seen: AtomicBool::new(false),
+@@ -396,13 +401,29 @@ pub fn device_gfx_read(id: u64, offset: u64, size: u32) -> Option<u64> {
+         if offset == GFX_REG_INTR_FAULT {
+             return Some(slot.intr_fault.load(Ordering::Acquire) as u64);
+         }
++        // The guest reads it straight after writing it, while that write may
++        // still be queued; see `crate::model::GfxRegs::version_live`.
++        if offset == crate::model::GFX_REG_VERSION {
++            return Some(slot.version_live.load(Ordering::Acquire) as u64);
++        }
+     }
++    // A read must not overtake a write the guest made before it. Writes that
++    // could not take the lock wait in the ingress queue for the drain, so a
++    // read that can take the lock applies them first, in order, as the drain
++    // would have. Lock order is ingress then inner, as everywhere.
++    let mut ingress = slot.gfx_ingress.lock();
+     if let Some(mut d) = try_hold(&slot.inner, Holder::VcpuGfxRead) {
++        while let Some(write) = ingress.pop_front() {
++            apply_gfx_write(&mut d, &slot, write);
++        }
++        drop(ingress);
+         let value = d.device.gfx_read(offset, size);
+         slot.gfx_read_cache.lock().insert((offset, size), value);
+         slot.gfx_read_busy_logged.store(false, Ordering::Relaxed);
+         return Some(value);
+     }
++    let queued = ingress.len();
++    drop(ingress);
+     let value = slot
+         .gfx_read_cache
+         .lock()
+@@ -411,7 +432,8 @@ pub fn device_gfx_read(id: u64, offset: u64, size: u32) -> Option<u64> {
+         .unwrap_or(0);
+     if !slot.gfx_read_busy_logged.swap(true, Ordering::Relaxed) {
+         crate::observe::fail(format!(
+-            "device_lock_busy reason=gfx_read_deferred offset={offset:#x} size={size} cached={value:#x}"
++            "device_lock_busy reason=gfx_read_deferred offset={offset:#x} size={size} \
++             cached={value:#x} queued_writes={queued}"
+         ));
+     }
+     Some(value)
+@@ -464,6 +486,14 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
+             return true;
+         }
+     }
++    // Before the write can wait: the guest reads the negotiated version back at
++    // once. The write itself still runs below, queued or not.
++    if offset == crate::model::GFX_REG_VERSION && (size == 4 || size == 8) {
++        slot.version_live.store(
++            crate::model::negotiate_protocol_version(data as u32),
++            Ordering::Release,
++        );
++    }
+     let mut write = QueuedGfxWrite {
+         offset,
+         data,
+diff --git a/crates/reims-vgpu/src/device/tests.rs b/crates/reims-vgpu/src/device/tests.rs
+index d592b6cb..9680ed0d 100644
+--- a/crates/reims-vgpu/src/device/tests.rs
++++ b/crates/reims-vgpu/src/device/tests.rs
+@@ -179,6 +179,64 @@ fn fifo_read_counter_is_live_while_device_lock_held() {
+     assert!(device_destroy(id));
+ }
+ 
++/// The guest reads the protocol version straight back after writing it. A
++/// write that had to queue, the lock busy for a moment, must not leave that
++/// read answering 0: the 14.6.1 warm boot of 2026-11-09 read 0 there, and its
++/// GPU driver never started.
++#[test]
++fn a_version_read_back_sees_a_queued_write() {
++    use crate::model::{negotiate_protocol_version, GFX_REG_VERSION};
++    let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
++    let slot = device_slot(id).expect("slot");
++    let negotiated = u64::from(negotiate_protocol_version(113));
++    assert_ne!(negotiated, 0);
++    let busy = slot.inner.lock();
++    assert!(device_gfx_write(id, GFX_REG_VERSION, 113, 4));
++    assert_eq!(
++        slot.gfx_ingress.lock().len(),
++        1,
++        "the write waits for the lock"
++    );
++    assert_eq!(
++        device_gfx_read(id, GFX_REG_VERSION, 4),
++        Some(negotiated),
++        "read back while the lock is still held"
++    );
++    drop(busy);
++    assert_eq!(
++        device_gfx_read(id, GFX_REG_VERSION, 4),
++        Some(negotiated),
++        "read back once the lock is free, before any drain"
++    );
++    assert!(device_reset(id));
++    assert_eq!(
++        device_gfx_read(id, GFX_REG_VERSION, 4),
++        Some(0),
++        "a reset forgets the negotiation"
++    );
++    assert!(device_destroy(id));
++}
++
++/// No register read overtakes a write the guest made before it: a read that
++/// finds the lock free applies the queued writes first, in order.
++#[test]
++fn a_read_applies_the_writes_queued_before_it() {
++    use crate::model::GFX_REG_ROOT_PAGE;
++    let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
++    let slot = device_slot(id).expect("slot");
++    let busy = slot.inner.lock();
++    assert!(device_gfx_write(id, GFX_REG_ROOT_PAGE, 0x1234, 4));
++    assert!(device_gfx_write(id, GFX_REG_ROOT_PAGE, 0x5678, 4));
++    drop(busy);
++    assert_eq!(device_gfx_read(id, GFX_REG_ROOT_PAGE, 4), Some(0x5678));
++    assert!(
++        slot.gfx_ingress.lock().is_empty(),
++        "applied by the read, once"
++    );
++    assert_eq!(slot.inner.lock().device.state.gfx.root_page, 0x5678);
++    assert!(device_destroy(id));
++}
++
+ /// Interrupt-status mask-clear writes apply lock-free too.
+ #[test]
+ fn intr_status_write_clears_mask_while_device_lock_held() {
+diff --git a/crates/reims-vgpu/src/model/state.rs b/crates/reims-vgpu/src/model/state.rs
+index a974e0b8..bdb48214 100644
+--- a/crates/reims-vgpu/src/model/state.rs
++++ b/crates/reims-vgpu/src/model/state.rs
+@@ -394,6 +394,20 @@ pub struct GfxRegs {
+     /// The `Arc` is shared with the device registry slot and survives reset,
+     /// like the three above.
+     pub child_doorbell_rung: Arc<AtomicU32>,
++    /// The negotiated protocol version (0x1034), as the guest reads it back.
++    ///
++    /// The guest driver writes the version it speaks and reads the register
++    /// straight back; what it reads selects its whole feature set, and 0 makes
++    /// it give the device up. `device_gfx_write` queues a write it cannot
++    /// apply at once, so a read could find the lock free and the write still
++    /// waiting, and answer 0: the 14.6.1 warm boot of 2026-11-09 stopped there,
++    /// with the GPU never started. So the vCPU that writes the register
++    /// publishes the negotiated value here before its write can wait, and the
++    /// read takes it from here with no lock.
++    ///
++    /// The `Arc` is shared with the device registry slot and survives reset,
++    /// like the four above.
++    pub version_live: Arc<AtomicU32>,
+     pub efi_display: u32,
+     pub efi_mode_select: u32,
+     pub efi_fb_start: u64,
+@@ -420,6 +434,7 @@ impl Default for GfxRegs {
+             interrupt_status_gpu: Arc::new(AtomicU32::new(0)),
+             interrupt_fault: Arc::new(AtomicU32::new(0)),
+             child_doorbell_rung: Arc::new(AtomicU32::new(0)),
++            version_live: Arc::new(AtomicU32::new(0)),
+             efi_display: 0,
+             efi_mode_select: 0,
+             efi_fb_start: 0,
+@@ -3215,10 +3230,13 @@ impl DeviceState {
+         let intr_fault = Arc::clone(&self.gfx.interrupt_fault);
+         let fifo_read = Arc::clone(&self.gfx.fifo_read);
+         let child_rung = Arc::clone(&self.gfx.child_doorbell_rung);
++        let version_live = Arc::clone(&self.gfx.version_live);
+         intr_disp.store(0, Ordering::Release);
+         intr_gpu.store(0, Ordering::Release);
+         intr_fault.store(0, Ordering::Release);
+         fifo_read.store(0, Ordering::Release);
++        // A reset forgets the negotiation; the guest negotiates again.
++        version_live.store(0, Ordering::Release);
+         // Cleared as well as kept: a reset drops every channel, so a bit rung
+         // before it names a channel that no longer exists.
+         child_rung.store(0, Ordering::Release);
+@@ -3240,6 +3258,7 @@ impl DeviceState {
+         self.gfx.interrupt_fault = intr_fault;
+         self.gfx.fifo_read = fifo_read;
+         self.gfx.child_doorbell_rung = child_rung;
++        self.gfx.version_live = version_live;
+     }
+ 
+     /// Queue the engine-unpin for a dying linear cache entry that still owns a
+diff --git a/crates/reims-vgpu/src/runtime/mmio.rs b/crates/reims-vgpu/src/runtime/mmio.rs
+index b21c5b83..387cdba9 100644
+--- a/crates/reims-vgpu/src/runtime/mmio.rs
++++ b/crates/reims-vgpu/src/runtime/mmio.rs
+@@ -174,6 +174,12 @@ pub fn gfx_write<H: HostMemory + HostOps>(
+                 ));
+             }
+             state.gfx.version = negotiated;
++            // `device_gfx_write` has already published it for a write from a
++            // vCPU; this covers every other writer.
++            state
++                .gfx
++                .version_live
++                .store(negotiated, std::sync::atomic::Ordering::Release);
+             // Take the guest-RAM import here rather than letting the first
+             // gather take it. This handshake is the guest driver's first act
+             // and its display pipe does not exist yet, so the seconds the
+-- 
+2.43.0
+

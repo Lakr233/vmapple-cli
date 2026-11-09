@@ -1,0 +1,62 @@
+From bd25aa912d400860e57a7a3727fadab7c6cbe3a3 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 06:29:34 +0800
+Subject: [PATCH 06/24] State that the guest-memory callbacks reach RAM only
+
+read_gpa, write_gpa and read_kva are called with the device lock held,
+by the drain worker and now by vCPUs running the iosfc window without
+the BQL. An access in them that reached a device would take the BQL
+there, the reverse of the main loop's BQL-then-device-lock order. The
+QEMU shim now refuses one before any byte moves, for every page-table
+read of a kva walk as well as the final read.
+
+Write that contract down where both sides read it: every byte of the
+range must be RAM the CPU could access directly, writable RAM for a
+write; nothing is dispatched to a device; the whole range is checked
+first; 0 is success, -1 a byte that is not (writable) RAM, -2 no current
+vCPU, -3 a range that wraps or has no buffer, and an error copies
+nothing. The layout and the ABI version are unchanged, and the Rust
+side already reports any non-zero code by value.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit ccc7b992da08ea2c57d32a0b3557b9af9da98a92)
+---
+ crates/reims-vgpu/include/reims_vgpu_qemu_abi.h | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/crates/reims-vgpu/include/reims_vgpu_qemu_abi.h b/crates/reims-vgpu/include/reims_vgpu_qemu_abi.h
+index 320b80b0..ef8db8d6 100644
+--- a/crates/reims-vgpu/include/reims_vgpu_qemu_abi.h
++++ b/crates/reims-vgpu/include/reims_vgpu_qemu_abi.h
+@@ -238,13 +238,26 @@ typedef struct ReimsVgpuHostOps {
+     uint32_t abi_version;
+     uint32_t struct_size;
+     void *ctx;
+-    /* 0 = success. */
++    /*
++     * Guest physical memory, ordinary RAM only and never through the BQL:
++     * Rust calls these holding its device lock, which the BQL's holder may
++     * wait for. Every byte of the range must be RAM the CPU could access
++     * directly, writable RAM for a write; nothing is dispatched to a device,
++     * and the whole range is checked before any byte moves.
++     * 0 = success; -1 = some byte is not (writable) RAM; -3 = the range wraps
++     * the address space, or no buffer. On an error nothing was copied.
++     */
+     int (*read_gpa)(void *ctx, uint64_t gpa, uint8_t *buf, size_t len);
+     int (*write_gpa)(void *ctx, uint64_t gpa, const uint8_t *buf, size_t len);
+     uint64_t (*mono_ns)(void *ctx);
+     /* Safe from any thread; schedules a oneshot main-loop BH. */
+     void (*schedule_bh)(void *ctx);
+-    /* Guest kernel VA read (cpu_memory_rw_debug). 0 = success. */
++    /*
++     * Guest kernel VA read through the calling vCPU's MMU, under the same
++     * rules as read_gpa: the leaf and every page-table read of the walk must
++     * be RAM. 0 = success; -1 = no translation, or not RAM; -2 = no current
++     * vCPU; -3 as for read_gpa.
++     */
+     int (*read_kva)(void *ctx, uint64_t kva, uint8_t *buf, size_t len);
+     /* Guest CPU X-register read (iosfc mapper directed handoff). 0 = success. */
+     int (*read_xreg)(void *ctx, uint32_t index, uint64_t *out);
+-- 
+2.43.0
+

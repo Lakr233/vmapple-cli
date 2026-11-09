@@ -1,0 +1,62 @@
+From 8fafcaf8eb6100c16ea0d4784196f1ecc1fb4518 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 04:13:33 +0800
+Subject: [PATCH 2/7] hw/vmapple: answer VBAR_EL1 to the Reims shim
+
+Reims validates its software walk of guest kernel addresses against the
+CPU, and the mapper's own reads on a vCPU were too few on macOS 27 to
+finish that validation. Answer VBAR_EL1 at read_xreg index 0x1004 so
+Reims can also probe kernel text entered there. A shim without this
+answers -1, and Reims only loses those probes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit f31b0b379d986475aa72729b5bf26f4776a6e98d)
+---
+ hw/display/reims-vgpu-mmio.c | 3 ++-
+ hw/vmapple/vmapple.c         | 3 +++
+ include/hw/vmapple/vmapple.h | 1 +
+ 3 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/hw/display/reims-vgpu-mmio.c b/hw/display/reims-vgpu-mmio.c
+index 4965598da8..11dc917668 100644
+--- a/hw/display/reims-vgpu-mmio.c
++++ b/hw/display/reims-vgpu-mmio.c
+@@ -189,7 +189,8 @@ static int reims_vgpu_mmio_window_main_loop(void)
+  * Indices from 0x1000 name EL1 translation state rather than an X register:
+  * Reims captures TTBR1_EL1, TCR_EL1 and SCTLR_EL1 here, on the vCPU, so its
+  * drain thread can walk guest kernel addresses from guest physical memory
+- * without a CPU. Before this, these indices answered -1, which Reims reads as
++ * without a CPU, and VBAR_EL1 as an entry into kernel text for validating
++ * that walk against the CPU. Before this, these indices answered -1, which Reims reads as
+  * "no translation root".
+  */
+ #define REIMS_VGPU_SYSREG_BASE 0x1000u
+diff --git a/hw/vmapple/vmapple.c b/hw/vmapple/vmapple.c
+index c4dac94872..fb3f2afa11 100644
+--- a/hw/vmapple/vmapple.c
++++ b/hw/vmapple/vmapple.c
+@@ -123,6 +123,9 @@ bool vmapple_read_current_sysreg(VMAppleSysreg reg, uint64_t *value)
+     case VMAPPLE_SYSREG_CPU_INDEX:
+         *value = cs->cpu_index;
+         return true;
++    case VMAPPLE_SYSREG_VBAR_EL1:
++        *value = env->cp15.vbar_el[1];
++        return true;
+     }
+     return false;
+ }
+diff --git a/include/hw/vmapple/vmapple.h b/include/hw/vmapple/vmapple.h
+index 105bb893c2..7cf10561ba 100644
+--- a/include/hw/vmapple/vmapple.h
++++ b/include/hw/vmapple/vmapple.h
+@@ -27,6 +27,7 @@ typedef enum VMAppleSysreg {
+     VMAPPLE_SYSREG_TCR_EL1,
+     VMAPPLE_SYSREG_SCTLR_EL1,
+     VMAPPLE_SYSREG_CPU_INDEX,
++    VMAPPLE_SYSREG_VBAR_EL1,
+ } VMAppleSysreg;
+ 
+ bool vmapple_read_current_sysreg(VMAppleSysreg reg, uint64_t *value);
+-- 
+2.43.0
+

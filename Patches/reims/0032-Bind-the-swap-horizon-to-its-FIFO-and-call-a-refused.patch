@@ -1,0 +1,684 @@
+From 9f1ac1991e2de92c3c75bcd121ac544921066fdf Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 08:16:04 +0800
+Subject: [PATCH 16/24] Bind the swap horizon to its FIFO, and call a refused
+ swap refused
+
+The horizon a condemnation takes was a bare (channel, tail). A guest that
+frees and redefines a FIFO after a GPU restart starts its heads again from
+zero, so a swap published on the new incarnation, naming the same mapping
+id and MappingInternal, still satisfied `tail - head > 0` against the old
+tail and was consumed as if it had been cancelled.
+
+A horizon is now each child FIFO's define generation, ring base page,
+head and tail when the unwire was seen, and a present is judged by it only
+if it is on the same incarnation and lies in [head, tail). DefineFifo and
+FreeFifo bump the channel's generation and retire its horizons
+(wire_guard_horizon_retired reason=define_fifo|free_fifo); a ring base
+that no longer matches retires it too (reason=ring_changed).
+
+A horizon taken when the drop is observed proves only that a present was
+published before we looked, not that the guest cancelled that request. So
+the branch no longer says it completes a cancelled swap: it refuses one
+(wire_guard_swap_refused, how=refused). Refusing consumes the packet and
+writes its completion stamp, because the stamp is the FIFO's command fence
+and other packets wait on its slot; it does not retain the surface, does
+not present it and raises no present event, so the guest sees the command
+complete and no present happen. The doc on refuse_swap says which of those
+is which.
+
+process_root_packet is pub(crate) so the regression can free and define a
+FIFO through the real handler: old tail 0x100, channel rebuilt, the new
+swap at head 0 runs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit acc0cac87916053e71ad4a41cbd17bb3020ccc0f)
+---
+ crates/reims-vgpu/src/runtime/drain/mod.rs    |  57 ++++--
+ .../src/runtime/mapper/wire_watch.rs          | 179 +++++++++++++-----
+ .../src/runtime/mapper/wire_watch_tests.rs    | 150 +++++++++++++--
+ 3 files changed, 307 insertions(+), 79 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/drain/mod.rs b/crates/reims-vgpu/src/runtime/drain/mod.rs
+index 4fea0201..59e5fda8 100644
+--- a/crates/reims-vgpu/src/runtime/drain/mod.rs
++++ b/crates/reims-vgpu/src/runtime/drain/mod.rs
+@@ -664,27 +664,41 @@ fn is_display_present(opcode: u16) -> bool {
+     )
+ }
+ 
+-/// The published tail of each child FIFO in `mask`, read from its registers.
++/// Where one child FIFO stands, read from its registers.
++pub(crate) struct FifoPosition {
++    pub channel: u32,
++    pub base_pfn: u32,
++    pub head: u32,
++    pub tail: u32,
++}
++
++/// The position of each child FIFO in `mask`.
+ ///
+-/// Free-running like the heads `drain_child_fifo` advances, so a packet at
+-/// `head` was published before a tail read here iff `tail - head` is positive.
+-/// For [`crate::runtime::mapper::wire_watch`], which needs to tell the display
+-/// presents submitted before an unwire from those submitted after.
+-pub(crate) fn child_tails<M: HostMemory>(
++/// Heads and tails are free-running like the heads `drain_child_fifo` advances,
++/// and mean something only together with the ring they index, which is why the
++/// base page list comes with them. For [`crate::runtime::mapper::wire_watch`],
++/// which needs to tell the display presents already published when an unwire
++/// was seen from those published after.
++pub(crate) fn child_positions<M: HostMemory>(
+     state: &DeviceState,
+     mem: &M,
+     mask: u32,
+-) -> Vec<(u32, u32)> {
++) -> Vec<FifoPosition> {
+     if state.gfx.root_page == 0 {
+         return Vec::new();
+     }
+     let root = state.pfn_gpa(state.gfx.root_page);
+     (1..MAX_CHANNELS as u32)
+         .filter(|ch| mask & (1 << ch) != 0)
+-        .filter_map(|ch| {
+-            let regs = root + child_reg_block_offset(ch)?;
+-            let tail = crate::runtime::host::read_u32(mem, regs + CHILD_REG_TAIL).ok()?;
+-            Some((ch, tail))
++        .filter_map(|channel| {
++            let regs = root + child_reg_block_offset(channel)?;
++            let read = |off: u64| crate::runtime::host::read_u32(mem, regs + off).ok();
++            Some(FifoPosition {
++                channel,
++                base_pfn: read(CHILD_REG_BASE_PFN)?,
++                head: read(CHILD_REG_HEAD)?,
++                tail: read(CHILD_REG_TAIL)?,
++            })
+         })
+         .collect()
+ }
+@@ -2548,7 +2562,7 @@ fn reply_heap_texture_size_and_align<H: HostMemory + HostOps>(
+     true
+ }
+ 
+-fn process_root_packet<H: HostMemory + HostOps>(
++pub(crate) fn process_root_packet<H: HostMemory + HostOps>(
+     state: &mut DeviceState,
+     host: &mut H,
+     packet: &Packet,
+@@ -2609,6 +2623,7 @@ fn process_root_packet<H: HostMemory + HostOps>(
+                     state.present_translation_hold_mask &= !bit;
+                     // Invalidate ring cache for this channel.
+                     state.child_rings[ch as usize] = Default::default();
++                    crate::runtime::mapper::wire_watch::on_fifo_lifecycle(state, ch, "define_fifo");
+                 }
+             }
+         }
+@@ -2624,6 +2639,7 @@ fn process_root_packet<H: HostMemory + HostOps>(
+                     state.translation_order_hold_mask &= !bit;
+                     state.present_translation_hold_mask &= !bit;
+                     state.child_rings[ch as usize] = Default::default();
++                    crate::runtime::mapper::wire_watch::on_fifo_lifecycle(state, ch, "free_fifo");
+                 }
+             }
+         }
+@@ -5151,18 +5167,19 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
+                 } else {
+                     0
+                 };
+-                // A present the wire guard condemned is completed without running: the
+-                // guest cancelled it when it gave its surface up. See
+-                // `wire_watch::condemned_swap`.
+-                let dropped = watched_present
+-                    && crate::runtime::mapper::wire_watch::condemned_swap(
++                // A present the wire guard refuses is consumed and stamped but not run:
++                // it names a backing the guest let go of. See
++                // `wire_watch::refuse_swap` for what that does and does not signal.
++                let refused = watched_present
++                    && crate::runtime::mapper::wire_watch::refuse_swap(
+                         state,
+                         channel_id,
++                        base_pfn,
+                         head,
+                         present_surface_id(packet.opcode, &packet.payload),
+                     );
+                 let proc_started = std::time::Instant::now();
+-                let disposition = if dropped {
++                let disposition = if refused {
+                     ChildPacketDisposition::Complete
+                 } else {
+                     process_child_packet(state, host, channel_id, &packet)
+@@ -5170,8 +5187,8 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
+                 census::note_drain_proc(packet.opcode, proc_started.elapsed().as_nanos() as u64);
+                 if watched_present {
+                     use crate::runtime::mapper::wire_watch::SwapHow;
+-                    let how = match (dropped, disposition) {
+-                        (true, _) => SwapHow::Dropped,
++                    let how = match (refused, disposition) {
++                        (true, _) => SwapHow::Refused,
+                         (false, ChildPacketDisposition::Deferred) => SwapHow::Deferred,
+                         (false, _) => SwapHow::Exec,
+                     };
+diff --git a/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs b/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
+index 103bdfb7..511bcad2 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
+@@ -67,9 +67,11 @@
+ //! waited on this device past its five-second limit. From then on, for as long
+ //! as the `MappingInternal` is the same, every host write into it, CPU or GPU,
+ //! is refused (`wire_guard_refused`), its owed frame is dropped rather than
+-//! landed, and a display present naming it that was submitted before the drop
+-//! was seen is completed without being shown (`wire_guard_swap_dropped`). None
+-//! of that is undone if a count turns positive again
++//! landed, and a display present naming it that was already published in its
++//! FIFO when the drop was seen is refused (`wire_guard_swap_refused`): its stamp
++//! is written so the FIFO moves, but it is not shown and raises no present
++//! event. That refusal does not claim the guest cancelled that request; see
++//! [`refuse_swap`]. None of that is undone if a count turns positive again
+ //! (`wire_guard_still_condemned`). The resident stays, so a later present of the
+ //! surface shows it without writing guest memory.
+ //!
+@@ -530,9 +532,34 @@ struct Condemned {
+     seq: u64,
+     t_us: u64,
+     field: &'static str,
+-    /// Each child FIFO's published tail when the unwire was seen: a display
+-    /// present before it was submitted before the guest cancelled.
+-    horizon: Vec<(u32, u32)>,
++    /// Where each child FIFO stood when the unwire was seen.
++    horizon: Vec<Horizon>,
++}
++
++/// One child FIFO's consumer and producer positions when an unwire was seen,
++/// and which incarnation of that FIFO they belong to.
++///
++/// Heads and tails are free-running offsets of one ring. A guest that frees
++/// and redefines the FIFO, or points it at another ring, starts a new sequence
++/// from wherever it likes, usually zero, so a position is compared only with
++/// positions of the same incarnation: the same define generation (bumped by
++/// `DefineFifo` and `FreeFifo`, see [`on_fifo_lifecycle`]) and the same ring
++/// base. Anything else and the horizon says nothing.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++struct Horizon {
++    channel: u32,
++    generation: u64,
++    base_pfn: u32,
++    head: u32,
++    tail: u32,
++}
++
++impl Horizon {
++    /// Whether the packet at `head` of this FIFO incarnation was published
++    /// when the horizon was taken and not yet consumed.
++    fn holds(&self, head: u32) -> bool {
++        head.wrapping_sub(self.head) as i32 >= 0 && self.tail.wrapping_sub(head) as i32 > 0
++    }
+ }
+ 
+ #[derive(Clone, Copy, Debug, Default)]
+@@ -548,7 +575,7 @@ struct Cost {
+     peeks: u64,
+     condemned: u64,
+     debts_dropped: u64,
+-    swaps_dropped: u64,
++    swaps_refused: u64,
+ }
+ 
+ /// The watch's state for one boot. Lives in [`DeviceState`] and is replaced
+@@ -579,6 +606,8 @@ pub struct WireWatch {
+     /// Mappings the guard condemned whose debts and horizon are still to be
+     /// taken, which needs the whole device state.
+     condemn_pending: Vec<u32>,
++    /// How often each child FIFO was defined or freed; see [`Horizon`].
++    fifo_generations: BTreeMap<u32, u64>,
+     cost: Cost,
+ }
+ 
+@@ -613,6 +642,10 @@ impl WireWatch {
+         )
+     }
+ 
++    fn fifo_generation(&self, channel: u32) -> u64 {
++        self.fifo_generations.get(&channel).copied().unwrap_or(0)
++    }
++
+     fn off(&self) -> bool {
+         self.kernel == KernelCheck::Unverified
+     }
+@@ -622,7 +655,7 @@ impl WireWatch {
+         format!(
+             "wire_watch_cost boot={boot} watched={} samples={} reads={} unreadable={} us={} \
+              transitions={} anomalies={} guard_refused={} condemned={} debts_dropped={} \
+-             swaps_dropped={} peeks={} unstamped_dropped={} kernel={}",
++             swaps_refused={} peeks={} unstamped_dropped={} kernel={}",
+             self.watched.len(),
+             c.samples,
+             c.reads,
+@@ -633,7 +666,7 @@ impl WireWatch {
+             c.guard_refused,
+             c.condemned,
+             c.debts_dropped,
+-            c.swaps_dropped,
++            c.swaps_refused,
+             c.peeks,
+             c.unstamped_dropped,
+             match self.kernel {
+@@ -1439,20 +1472,30 @@ fn with_watch<H: HostMemory + HostOps, R>(
+     out
+ }
+ 
+-/// What a condemnation does that needs the whole device: the horizon of every
+-/// child FIFO, so the display presents already submitted can be told from
++/// What a condemnation does that needs the whole device: where every child
++/// FIFO stands, so the display presents already published can be told from
+ /// later ones, and the frame owed to the mapping, which is dropped rather than
+ /// landed in pages the guest has let go of. The resident stays: a later present
+ /// of the surface shows it without writing guest memory.
+ fn apply_condemnations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H) {
+     for mapping_id in std::mem::take(&mut state.wire_watch.condemn_pending) {
+-        let horizon = crate::runtime::drain::child_tails(
++        let positions = crate::runtime::drain::child_positions(
+             state,
+             host,
+             state.active_child_mask | state.pending.child_mask,
+         );
+         let debt = state.pending_writebacks.take(mapping_id).is_some();
+         let ww = &mut state.wire_watch;
++        let horizon: Vec<Horizon> = positions
++            .iter()
++            .map(|p| Horizon {
++                channel: p.channel,
++                generation: ww.fifo_generation(p.channel),
++                base_pfn: p.base_pfn,
++                head: p.head,
++                tail: p.tail,
++            })
++            .collect();
+         ww.cost.condemned += 1;
+         if debt {
+             ww.cost.debts_dropped += 1;
+@@ -1466,25 +1509,52 @@ fn apply_condemnations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
+             continue;
+         };
+         c.horizon = horizon;
+-        let tails: Vec<String> = c
++        let horizon: Vec<String> = c
+             .horizon
+             .iter()
+-            .map(|(ch, tail)| format!("{ch}:{tail:#x}"))
++            .map(|h| {
++                format!(
++                    "{}:gen{}:pfn{:#x}:{:#x}..{:#x}",
++                    h.channel, h.generation, h.base_pfn, h.head, h.tail
++                )
++            })
+             .collect();
+         crate::observe::fail(format!(
+             "wire_guard_condemned mapping={mapping_id} field={} seq={} t_us={} horizon=[{}] \
+              debt={} (the guest unwired a surface it still has mapped: writes into this \
+-             incarnation are refused, its owed frame is dropped, and the display presents \
+-             submitted before now that name it are completed without being shown)",
++             incarnation are refused, its owed frame is dropped, and display presents naming \
++             it that were already published are refused rather than shown)",
+             c.field,
+             c.seq,
+             c.t_us,
+-            tails.join(","),
++            horizon.join(","),
+             if debt { "dropped" } else { "none" }
+         ));
+     }
+ }
+ 
++/// A child FIFO was defined or freed: its positions start over, so no horizon
++/// taken on its previous incarnation may judge a packet on it again.
++pub fn on_fifo_lifecycle(state: &mut DeviceState, channel: u32, what: &'static str) {
++    if !enabled() {
++        return;
++    }
++    let ww = &mut state.wire_watch;
++    *ww.fifo_generations.entry(channel).or_default() += 1;
++    for (mapping_id, w) in ww.watched.iter_mut() {
++        let Some(c) = w.condemned.as_mut() else {
++            continue;
++        };
++        let before = c.horizon.len();
++        c.horizon.retain(|h| h.channel != channel);
++        if c.horizon.len() != before {
++            crate::observe::off(format!(
++                "wire_guard_horizon_retired mapping={mapping_id} ch={channel} reason={what}"
++            ));
++        }
++    }
++}
++
+ // MARK: - Hooks: mapper ring
+ 
+ /// After a `MAP` was applied and resolved, on the publishing vCPU.
+@@ -1660,9 +1730,8 @@ pub enum SwapHow {
+     Exec,
+     /// It stays at its head and runs again later.
+     Deferred,
+-    /// The guard completed it without running it: it names a condemned
+-    /// incarnation and was submitted before the unwire was seen.
+-    Dropped,
++    /// The guard refused to run it; see [`refuse_swap`].
++    Refused,
+ }
+ 
+ impl SwapHow {
+@@ -1670,27 +1739,35 @@ impl SwapHow {
+         match self {
+             Self::Exec => "exec",
+             Self::Deferred => "deferred",
+-            Self::Dropped => "dropped",
++            Self::Refused => "refused",
+         }
+     }
+ }
+ 
+-/// Whether the guard completes this display present without running it.
++/// Whether the guard refuses to run this display present.
++///
++/// It does for a present that names a condemned incarnation and was already
++/// published, in this incarnation of its FIFO, when the unwire was seen. That
++/// is a refusal, not a claim about the guest: the horizon is taken when the
++/// watch sees the drop, up to [`DISPLAY_SAMPLE_US`] after the guest made it, so
++/// it proves only "published before we looked", not that the guest cancelled
++/// this particular request. What it does establish is that the present names
++/// a backing the guest has let go of, which is reason enough not to show it.
+ ///
+-/// It does for a present that names a condemned incarnation and sits before
+-/// its FIFO's horizon, i.e. was submitted before the unwire was seen: the
+-/// guest cancelled that swap when it gave the surface up, and showing it now
+-/// would retain a buffer the guest no longer holds and raise a present event
+-/// for a swap it already cleared. Its stamp is still written by the drain, as
+-/// for any completed packet. A present submitted after the horizon runs: it
+-/// shows the resident and writes no guest memory.
++/// What refusing does and does not tell the guest. The drain still consumes
++/// the packet and writes its completion stamp: the stamp is the FIFO's command
++/// fence, and other packets wait on its slot, so withholding it would wedge the
++/// FIFO. What it skips is everything that says a frame was presented: the
++/// retain of the surface as the displayed one and the display pipe's present
++/// event, which is the guest's frame-done edge. The guest therefore sees the
++/// command complete and no present happen for it.
+ ///
+-/// The horizon is taken when the watch sees the drop, up to
+-/// [`DISPLAY_SAMPLE_US`] after the guest made it, so a present the guest
+-/// submitted inside that window is counted as older.
+-pub fn condemned_swap(
++/// A present published after the horizon, or on another incarnation of the
++/// FIFO, runs: it shows the resident and writes no guest memory.
++pub fn refuse_swap(
+     state: &mut DeviceState,
+     channel: u32,
++    base_pfn: u32,
+     head: u32,
+     mapping: Option<u32>,
+ ) -> bool {
+@@ -1702,27 +1779,41 @@ pub fn condemned_swap(
+     };
+     let internal = state.mappings.get(&mapping).map(|m| m.mapping_internal);
+     let ww = &mut state.wire_watch;
+-    let Some(w) = ww.watched.get(&mapping) else {
+-        return false;
+-    };
+-    let Some(c) = w.condemned.as_ref() else {
++    let generation = ww.fifo_generation(channel);
++    let Some(w) = ww.watched.get_mut(&mapping) else {
+         return false;
+     };
+     if internal != Some(w.internal) {
+         return false;
+     }
+-    let Some(&(_, tail)) = c.horizon.iter().find(|(ch, _)| *ch == channel) else {
++    let Some(c) = w.condemned.as_mut() else {
++        return false;
++    };
++    let Some(at) = c.horizon.iter().position(|h| h.channel == channel) else {
+         return false;
+     };
+-    if tail.wrapping_sub(head) as i32 <= 0 {
++    let h = c.horizon[at];
++    if h.generation != generation || h.base_pfn != base_pfn {
++        c.horizon.remove(at);
++        crate::observe::off(format!(
++            "wire_guard_horizon_retired mapping={mapping} ch={channel} reason=ring_changed \
++             gen={}->{generation} pfn={:#x}->{base_pfn:#x}",
++            h.generation, h.base_pfn
++        ));
++        return false;
++    }
++    if !h.holds(head) {
+         return false;
+     }
+-    ww.cost.swaps_dropped += 1;
++    let seq = c.seq;
++    ww.cost.swaps_refused += 1;
+     crate::observe::fail(format!(
+-        "wire_guard_swap_dropped mapping={mapping} ch={channel} head={head:#x} \
+-         horizon_tail={tail:#x} condemned_seq={} t_us={} (submitted before the guest \
+-         unwired the surface; completed without being shown)",
+-        c.seq,
++        "wire_guard_swap_refused mapping={mapping} ch={channel} head={head:#x} \
++         horizon={:#x}..{:#x} gen={generation} condemned_seq={seq} t_us={} (published before \
++         the unwire was seen; not shown and no present event, its stamp is written as the \
++         command fence)",
++        h.head,
++        h.tail,
+         now_us()
+     ));
+     true
+diff --git a/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs b/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs
+index 69f98807..7dce0902 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs
+@@ -615,6 +615,9 @@ fn a_stamp_completes_only_the_swaps_it_reaches() {
+ 
+ const CHANNEL: u32 = 4;
+ const SWAP_STAMP: u32 = 0x55;
++/// The display FIFO's page list and the ring page it names.
++const LIST_PFN: u32 = 0x20;
++const RING_PFN: u32 = 0x30;
+ 
+ /// The display channel's FIFO holding one `CmdDisplaySwapMapping` for mapping
+ /// 2, as the guest publishes it.
+@@ -624,7 +627,7 @@ fn put_display_fifo(state: &mut DeviceState, host: &mut FakeHost) -> (u64, Vec<u
+         CHILD_REG_STAMP_INDEX, CHILD_REG_TAIL,
+     };
+     let page = state.page_size() as usize;
+-    let (root_pfn, list_pfn, ring_pfn, stamp_pfn) = (0x10u32, 0x20u32, 0x30u32, 0x40u32);
++    let (root_pfn, list_pfn, ring_pfn, stamp_pfn) = (0x10u32, LIST_PFN, RING_PFN, 0x40u32);
+     for pfn in [root_pfn, list_pfn, ring_pfn, stamp_pfn] {
+         host.map_range(state.pfn_gpa(pfn), page, 0);
+     }
+@@ -766,11 +769,12 @@ fn a_condemned_mapping_drops_its_owed_frame() {
+     });
+ }
+ 
+-/// A display present that names a condemned incarnation and was submitted
+-/// before the drop is completed without being shown; one submitted after it
+-/// runs. Both stamps reach the guest.
++/// A display present that names a condemned incarnation and was already
++/// published when the drop was seen is refused: consumed and stamped, never
++/// shown, no present event. One published after it runs. Both stamps reach the
++/// guest.
+ #[test]
+-fn a_swap_submitted_before_the_drop_is_completed_without_being_shown() {
++fn a_swap_published_before_the_drop_is_refused_and_still_stamped() {
+     use crate::model::{CHILD_REG_HEAD, CHILD_REG_TAIL};
+     with_switches(true, true, || {
+         let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
+@@ -778,13 +782,16 @@ fn a_swap_submitted_before_the_drop_is_completed_without_being_shown() {
+         on_map(&mut state, &host, MID);
+         state.kernel_walk.root = None;
+         state.active_child_mask = 1 << CHANNEL;
+-        // The guest cancels: the drop is seen while the swap is still queued.
++        // The drop is seen while the swap is still queued.
+         set_surface_wire(&mut host, 0);
+         let cap = crate::observe::FailCapture::start();
+         tick(&mut state, &host);
+         let condemned = cap.one("wire_guard_condemned");
+         assert!(
+-            condemned.contains(&format!("horizon=[{CHANNEL}:{:#x}]", first.len())),
++            condemned.contains(&format!(
++                "horizon=[{CHANNEL}:gen0:pfn{LIST_PFN:#x}:0x0..{:#x}]",
++                first.len()
++            )),
+             "{condemned}"
+         );
+         // A later swap of the same surface, published after the drop.
+@@ -803,22 +810,24 @@ fn a_swap_submitted_before_the_drop_is_completed_without_being_shown() {
+             "{:?}",
+             cap.lines()
+         );
+-        let dropped = cap.one("wire_guard_swap_dropped");
++        let refused = cap.one("wire_guard_swap_refused");
+         assert!(
+-            dropped.contains(&format!(
+-                "mapping=2 ch={CHANNEL} head=0x0 horizon_tail={:#x}",
++            refused.contains(&format!(
++                "mapping=2 ch={CHANNEL} head=0x0 horizon=0x0..{:#x} gen=0",
+                 first.len()
+             )),
+-            "{dropped}"
++            "{refused}"
+         );
+         let swaps = ev_lines(&cap, "swap");
+         assert_eq!(swaps.len(), 2, "{:?}", cap.lines());
+         assert!(
+-            swaps[0].contains("head=0x0") && swaps[0].contains("how=dropped"),
+-            "{}",
++            swaps[0].contains("head=0x0")
++                && swaps[0].contains("how=refused")
++                && swaps[0].contains("present=-"),
++            "a refused present raises no present event: {}",
+             swaps[0]
+         );
+-        assert!(swaps[1].contains("how=exec"), "{}", swaps[1]);
++        assert!(swaps[1].contains("how=exec") && swaps[1].contains("present=no_gpa"));
+         assert!(
+             ev_lines(&cap, "stamp")
+                 .last()
+@@ -827,7 +836,118 @@ fn a_swap_submitted_before_the_drop_is_completed_without_being_shown() {
+             "{:?}",
+             cap.lines()
+         );
+-        assert_eq!(state.wire_watch.cost.swaps_dropped, 1);
++        assert_eq!(state.wire_watch.cost.swaps_refused, 1);
++    });
++}
++
++/// A FIFO that was freed and defined again starts its positions over. A
++/// horizon taken on the old one (tail 0x100) must not refuse the new
++/// incarnation's swap at head 0.
++#[test]
++fn a_rebuilt_fifo_is_not_judged_by_the_old_horizon() {
++    use crate::model::{
++        CHILD_REG_HEAD, CHILD_REG_TAIL, PACKET_HEADER_LEN, ROOT_OP_DEFINE_FIFO, ROOT_OP_FREE_FIFO,
++    };
++    with_switches(true, true, || {
++        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (regs, packet) = put_display_fifo(&mut state, &mut host);
++        on_map(&mut state, &host, MID);
++        state.kernel_walk.root = None;
++        state.active_child_mask = 1 << CHANNEL;
++        host.put_u32(regs + CHILD_REG_TAIL, 0x100);
++        set_surface_wire(&mut host, 0);
++        let cap = crate::observe::FailCapture::start();
++        tick(&mut state, &host);
++        assert!(cap
++            .one("wire_guard_condemned")
++            .contains(&format!("{CHANNEL}:gen0:pfn{LIST_PFN:#x}:0x0..0x100")));
++        // The guest restarts: the channel is freed and defined again, and the
++        // new incarnation publishes a swap of the same surface from offset 0.
++        for opcode in [ROOT_OP_FREE_FIFO, ROOT_OP_DEFINE_FIFO] {
++            crate::runtime::drain::process_root_packet(
++                &mut state,
++                &mut host,
++                &crate::runtime::drain::Packet {
++                    opcode,
++                    stamp_waits: Vec::new(),
++                    total_size: PACKET_HEADER_LEN + 4,
++                    completion_stamp: 0,
++                    payload: CHANNEL.to_le_bytes().to_vec(),
++                    next_head: 0,
++                },
++            );
++        }
++        assert_eq!(
++            lines_with(
++                &cap,
++                "wire_guard_horizon_retired mapping=2 ch=4 reason=free_fifo"
++            )
++            .len(),
++            1,
++            "{:?}",
++            cap.lines()
++        );
++        host.put_u32(regs + CHILD_REG_HEAD, 0);
++        host.put_u32(regs + CHILD_REG_TAIL, packet.len() as u32);
++        state.pending.child_mask = 1 << CHANNEL;
++        state.wire_watch.all_sampled_us = Some(u64::MAX);
++        state.wire_watch.display_sampled_us = Some(u64::MAX);
++        crate::runtime::drain::drain_pending(&mut state, &mut host);
++        assert_eq!(host.get_u32(regs + CHILD_REG_HEAD), packet.len() as u32);
++        assert!(
++            lines_with(&cap, "wire_guard_swap_refused").is_empty(),
++            "{:?}",
++            cap.lines()
++        );
++        let swaps = ev_lines(&cap, "swap");
++        assert_eq!(swaps.len(), 1, "{:?}", cap.lines());
++        assert!(
++            swaps[0].contains("head=0x0") && swaps[0].contains("how=exec"),
++            "{}",
++            swaps[0]
++        );
++    });
++}
++
++/// The same, when the guest points the FIFO at another ring without a
++/// define: the ring is a different identity and the old horizon is retired.
++#[test]
++fn a_fifo_moved_to_another_ring_is_not_judged_by_the_old_horizon() {
++    use crate::model::{CHILD_REG_BASE_PFN, CHILD_REG_HEAD, CHILD_REG_TAIL};
++    with_switches(true, true, || {
++        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (regs, packet) = put_display_fifo(&mut state, &mut host);
++        on_map(&mut state, &host, MID);
++        state.kernel_walk.root = None;
++        state.active_child_mask = 1 << CHANNEL;
++        host.put_u32(regs + CHILD_REG_TAIL, 0x100);
++        set_surface_wire(&mut host, 0);
++        let cap = crate::observe::FailCapture::start();
++        tick(&mut state, &host);
++        // A second page list naming the same ring page.
++        let list2 = state.pfn_gpa(LIST_PFN + 1);
++        host.map_range(list2, state.page_size() as usize, 0);
++        host.put_u32(list2, RING_PFN);
++        host.put_u32(regs + CHILD_REG_BASE_PFN, LIST_PFN + 1);
++        host.put_u32(regs + CHILD_REG_HEAD, 0);
++        host.put_u32(regs + CHILD_REG_TAIL, packet.len() as u32);
++        state.pending.child_mask = 1 << CHANNEL;
++        state.wire_watch.all_sampled_us = Some(u64::MAX);
++        state.wire_watch.display_sampled_us = Some(u64::MAX);
++        crate::runtime::drain::drain_pending(&mut state, &mut host);
++        assert_eq!(host.get_u32(regs + CHILD_REG_HEAD), packet.len() as u32);
++        assert_eq!(
++            lines_with(
++                &cap,
++                "wire_guard_horizon_retired mapping=2 ch=4 reason=ring_changed"
++            )
++            .len(),
++            1,
++            "{:?}",
++            cap.lines()
++        );
++        assert!(lines_with(&cap, "wire_guard_swap_refused").is_empty());
++        assert!(ev_lines(&cap, "swap")[0].contains("how=exec"));
+     });
+ }
+ 
+-- 
+2.43.0
+

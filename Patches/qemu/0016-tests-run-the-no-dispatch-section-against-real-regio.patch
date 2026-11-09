@@ -1,0 +1,651 @@
+From 6fbedda80c80279878b51f6dfb58b0dc45fa66d2 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 06:44:42 +0800
+Subject: [PATCH 7/7] tests: run the no-dispatch section against real regions
+ and an ARM walk
+
+test-reims-vgpu-ram covers the RAM-only copy with a fake memory map.
+This covers what it cannot: memory_no_dispatch_begin() and the
+reims-vgpu callbacks against real MemoryRegions, a real ARM CPU's
+page-table walk, and the real BQL.
+
+The test is an emulator built from the same objects as
+qemu-system-aarch64 with its own main(). It boots an idle virt machine
+(-S, TCG), adds a counting MMIO region, a ROM, and a RAM region with a
+second MMIO region right after it, and drives them from worker threads
+while the main thread holds the BQL; a worker that tried to take the
+BQL would hang, and the test fails if one does not finish. It checks:
+
+- address_space_read/write and the ld/st helpers on MMIO inside a
+  section fail with MEMTX_ACCESS_ERROR, and RAM still works;
+- sections nest, and after the outermost ends an access dispatches
+  again, with the BQL;
+- another thread outside a section dispatches as usual;
+- a walk whose level 0 or level 1 table is in the MMIO region fails
+  inside a section without reading it, and reads it outside one; a walk
+  through RAM completes inside one;
+- read_gpa/write_gpa refuse MMIO, a range running from RAM into MMIO
+  (with the RAM half left unwritten) and a write to ROM, and refuse a
+  range that wraps or has no buffer;
+- read_kva across a RAM page into a page that maps MMIO is refused with
+  the caller's buffer untouched, and wrapping or missing buffers are -3.
+
+In each case the MMIO region's callbacks ran zero times. The test is not
+built by default; it is in the unit suite.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 1c68d09c7050d2c052da75403ca2147ddcdf0e92)
+---
+ meson.build                              |  18 +
+ tests/unit/test-reims-vgpu-no-dispatch.c | 570 +++++++++++++++++++++++
+ 2 files changed, 588 insertions(+)
+ create mode 100644 tests/unit/test-reims-vgpu-no-dispatch.c
+
+diff --git a/meson.build b/meson.build
+index e026851309..f7e4f2b807 100644
+--- a/meson.build
++++ b/meson.build
+@@ -4470,6 +4470,24 @@ foreach target : target_dirs
+     }]
+ 
+   endforeach
++
++  # The memory API's no-dispatch section and the reims-vgpu guest-memory
++  # callbacks need real MemoryRegions, a real CPU's page-table walk and the
++  # BQL, so this test is an emulator built from these same objects, with the
++  # test's main() in place of system/main.c.
++  if target == 'aarch64-softmmu' and config_all_devices.has_key('CONFIG_REIMS_VGPU')
++    test_reims_vgpu_no_dispatch = executable('test-reims-vgpu-no-dispatch',
++      files('tests/unit/test-reims-vgpu-no-dispatch.c'),
++      c_args: c_args,
++      include_directories: target_inc,
++      dependencies: arch_deps + [target_stubs],
++      objects: lib.extract_all_objects(recursive: true),
++      link_depends: [block_syms, qemu_syms],
++      link_args: link_args,
++      build_by_default: false)
++    test('test-reims-vgpu-no-dispatch', test_reims_vgpu_no_dispatch,
++         suite: ['unit'], timeout: 120)
++  endif
+ endforeach
+ 
+ # Other build targets
+diff --git a/tests/unit/test-reims-vgpu-no-dispatch.c b/tests/unit/test-reims-vgpu-no-dispatch.c
+new file mode 100644
+index 0000000000..eabef36907
+--- /dev/null
++++ b/tests/unit/test-reims-vgpu-no-dispatch.c
+@@ -0,0 +1,570 @@
++/*
++ * The memory API's no-dispatch section and the reims-vgpu guest-memory
++ * callbacks, against real regions, a real ARM CPU and the real BQL.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * This runs as an emulator built from the same objects as
++ * qemu-system-aarch64, with this main() in place of system/main.c. It boots
++ * an idle virt machine (-S, TCG), adds a counting MMIO region, a ROM and a
++ * small RAM next to a second MMIO region, and drives them from worker
++ * threads. While a worker runs, the main thread holds the BQL: a worker that
++ * tried to take it would block, so finishing at all shows that it never did,
++ * and the regions' callback counts show that nothing was dispatched.
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qemu/main-loop.h"
++#include "qemu/rcu.h"
++#include "system/address-spaces.h"
++#include "system/memory.h"
++#include "system/replay.h"
++#include "system/system.h"
++#include "hw/core/cpu.h"
++#include "cpu.h"
++#include "internals.h"
++
++/* system/main.c defines this, and this file replaces system/main.c. */
++int (*qemu_main)(void);
++
++/* hw/display/reims-vgpu-shim.c; its header needs the Reims ABI header. */
++int reims_vgpu_shim_read_gpa(void *ctx, uint64_t gpa, uint8_t *buf, size_t len);
++int reims_vgpu_shim_write_gpa(void *ctx, uint64_t gpa, const uint8_t *buf,
++                              size_t len);
++int reims_vgpu_shim_read_kva(void *ctx, uint64_t kva, uint8_t *buf, size_t len);
++
++/* Unused by the virt machine. */
++#define MMIO_BASE   0x0f000000ULL
++#define ROM_BASE    0x0f100000ULL
++#define RAM2_BASE   0x0f200000ULL
++#define MMIO2_BASE  0x0f210000ULL
++#define REGION_SIZE 0x10000ULL
++
++/* The virt machine's RAM. */
++#define RAM_BASE    0x40000000ULL
++#define TABLES      (RAM_BASE + 0x100000)
++#define PAGE_A      (RAM_BASE + 0x200000)
++
++/* 0xffff000000000000: L0, L1 and L2 index 0, so only L3 varies. */
++#define KVA_BASE    0xffff000000000000ULL
++
++static MemoryRegion mmio, rom, ram2, mmio2;
++static unsigned mmio_calls;
++static bool mmio_call_without_bql;
++
++static uint64_t counting_read(void *opaque, hwaddr addr, unsigned size)
++{
++    qatomic_inc(&mmio_calls);
++    if (!bql_locked()) {
++        qatomic_set(&mmio_call_without_bql, true);
++    }
++    return 0;
++}
++
++static void counting_write(void *opaque, hwaddr addr, uint64_t val,
++                           unsigned size)
++{
++    qatomic_inc(&mmio_calls);
++    if (!bql_locked()) {
++        qatomic_set(&mmio_call_without_bql, true);
++    }
++}
++
++static const MemoryRegionOps counting_ops = {
++    .read = counting_read,
++    .write = counting_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 1, .max_access_size = 8 },
++    .impl = { .min_access_size = 1, .max_access_size = 8 },
++};
++
++static void reset_counts(void)
++{
++    qatomic_set(&mmio_calls, 0);
++    qatomic_set(&mmio_call_without_bql, false);
++}
++
++static bool all_bytes(const uint8_t *p, size_t len, uint8_t value)
++{
++    for (size_t i = 0; i < len; i++) {
++        if (p[i] != value) {
++            return false;
++        }
++    }
++    return true;
++}
++
++/* MARK: - Threads */
++
++typedef struct Worker {
++    void (*fn)(void *);
++    void *arg;
++    GMutex lock;
++    GCond cond;
++    bool done;
++} Worker;
++
++static gpointer worker_main(gpointer opaque)
++{
++    Worker *w = opaque;
++
++    rcu_register_thread();
++    w->fn(w->arg);
++    rcu_unregister_thread();
++    g_mutex_lock(&w->lock);
++    w->done = true;
++    g_cond_broadcast(&w->cond);
++    g_mutex_unlock(&w->lock);
++    return NULL;
++}
++
++/*
++ * Run @fn on a new thread, with the BQL held by this one when @hold_bql, and
++ * fail if it does not finish within ten seconds: holding the BQL here, it
++ * could only hang by waiting for the BQL.
++ */
++static void run_worker(void (*fn)(void *), void *arg, bool hold_bql)
++{
++    Worker w = { .fn = fn, .arg = arg };
++    gint64 deadline = g_get_monotonic_time() + 10 * G_TIME_SPAN_SECOND;
++    GThread *thread;
++
++    g_mutex_init(&w.lock);
++    g_cond_init(&w.cond);
++    if (hold_bql) {
++        bql_lock();
++    }
++    thread = g_thread_new("worker", worker_main, &w);
++    g_mutex_lock(&w.lock);
++    while (!w.done) {
++        if (!g_cond_wait_until(&w.cond, &w.lock, deadline)) {
++            g_error("the worker did not finish: it is waiting for the BQL");
++        }
++    }
++    g_mutex_unlock(&w.lock);
++    if (hold_bql) {
++        bql_unlock();
++    }
++    g_thread_join(thread);
++    g_cond_clear(&w.cond);
++    g_mutex_clear(&w.lock);
++}
++
++/* MARK: - The section, through the memory API */
++
++static void accesses_in_section(void *opaque)
++{
++    MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
++    uint8_t buf[8] = { 0 };
++    MemTxResult r = MEMTX_OK;
++    uint64_t value;
++
++    g_assert_false(bql_locked());
++    memory_no_dispatch_begin();
++    g_assert_true(memory_dispatch_forbidden());
++
++    g_assert_cmpint(address_space_read(&address_space_memory, MMIO_BASE, attrs,
++                                       buf, 4), ==, MEMTX_ACCESS_ERROR);
++    g_assert_cmpint(address_space_write(&address_space_memory, MMIO_BASE,
++                                        attrs, buf, 4), ==, MEMTX_ACCESS_ERROR);
++    value = address_space_ldl_le(&address_space_memory, MMIO_BASE, attrs, &r);
++    g_assert_cmpint(r, ==, MEMTX_ACCESS_ERROR);
++    g_assert_cmpuint(value, ==, 0);
++    address_space_ldq_le(&address_space_memory, MMIO_BASE + 8, attrs, &r);
++    g_assert_cmpint(r, ==, MEMTX_ACCESS_ERROR);
++    address_space_stl_le(&address_space_memory, MMIO_BASE, 1, attrs, &r);
++    g_assert_cmpint(r, ==, MEMTX_ACCESS_ERROR);
++    address_space_stq_le(&address_space_memory, MMIO_BASE, 1, attrs, &r);
++    g_assert_cmpint(r, ==, MEMTX_ACCESS_ERROR);
++
++    /* RAM is read and written as usual. */
++    address_space_stq_le(&address_space_memory, RAM_BASE, 0x1122334455667788,
++                         attrs, &r);
++    g_assert_cmpint(r, ==, MEMTX_OK);
++    g_assert_cmphex(address_space_ldq_le(&address_space_memory, RAM_BASE,
++                                         attrs, &r), ==, 0x1122334455667788);
++    g_assert_cmpint(r, ==, MEMTX_OK);
++    g_assert_cmpint(address_space_read(&address_space_memory, RAM_BASE, attrs,
++                                       buf, sizeof(buf)), ==, MEMTX_OK);
++
++    memory_no_dispatch_end();
++    g_assert_false(memory_dispatch_forbidden());
++}
++
++static void test_mmio_refused_in_section(void)
++{
++    reset_counts();
++    run_worker(accesses_in_section, NULL, true);
++    g_assert_cmpuint(qatomic_read(&mmio_calls), ==, 0);
++}
++
++static void nested_sections(void *opaque)
++{
++    uint8_t buf[4];
++
++    memory_no_dispatch_begin();
++    memory_no_dispatch_begin();
++    memory_no_dispatch_end();
++    g_assert_true(memory_dispatch_forbidden());
++    g_assert_cmpint(address_space_read(&address_space_memory, MMIO_BASE,
++                                       MEMTXATTRS_UNSPECIFIED, buf, 4), ==,
++                    MEMTX_ACCESS_ERROR);
++    memory_no_dispatch_end();
++    g_assert_false(memory_dispatch_forbidden());
++}
++
++static void dispatch_after_sections(void *opaque)
++{
++    uint8_t buf[4];
++
++    memory_no_dispatch_begin();
++    memory_no_dispatch_end();
++    g_assert_cmpint(address_space_read(&address_space_memory, MMIO_BASE,
++                                       MEMTXATTRS_UNSPECIFIED, buf, 4), ==,
++                    MEMTX_OK);
++}
++
++/* Sections nest, and leaving the outermost lets accesses dispatch again. */
++static void test_nested_sections(void)
++{
++    reset_counts();
++    run_worker(nested_sections, NULL, true);
++    g_assert_cmpuint(qatomic_read(&mmio_calls), ==, 0);
++
++    /* Without the BQL held here, so the dispatch can take it. */
++    run_worker(dispatch_after_sections, NULL, false);
++    g_assert_cmpuint(qatomic_read(&mmio_calls), ==, 1);
++    g_assert_false(qatomic_read(&mmio_call_without_bql));
++}
++
++typedef struct TwoThreads {
++    GMutex lock;
++    GCond cond;
++    bool a_in_section;
++    bool b_done;
++    MemTxResult b_result;
++} TwoThreads;
++
++static void thread_a(void *opaque)
++{
++    TwoThreads *t = opaque;
++    uint8_t buf[4];
++
++    memory_no_dispatch_begin();
++    g_mutex_lock(&t->lock);
++    t->a_in_section = true;
++    g_cond_broadcast(&t->cond);
++    while (!t->b_done) {
++        g_cond_wait(&t->cond, &t->lock);
++    }
++    g_mutex_unlock(&t->lock);
++    g_assert_cmpint(address_space_read(&address_space_memory, MMIO_BASE,
++                                       MEMTXATTRS_UNSPECIFIED, buf, 4), ==,
++                    MEMTX_ACCESS_ERROR);
++    memory_no_dispatch_end();
++}
++
++static gpointer thread_b(gpointer opaque)
++{
++    TwoThreads *t = opaque;
++    uint8_t buf[4];
++    MemTxResult r;
++
++    rcu_register_thread();
++    g_mutex_lock(&t->lock);
++    while (!t->a_in_section) {
++        g_cond_wait(&t->cond, &t->lock);
++    }
++    g_mutex_unlock(&t->lock);
++    g_assert_false(memory_dispatch_forbidden());
++    r = address_space_read(&address_space_memory, MMIO_BASE,
++                           MEMTXATTRS_UNSPECIFIED, buf, 4);
++    rcu_unregister_thread();
++    g_mutex_lock(&t->lock);
++    t->b_result = r;
++    t->b_done = true;
++    g_cond_broadcast(&t->cond);
++    g_mutex_unlock(&t->lock);
++    return NULL;
++}
++
++/* A section is the calling thread's: another thread dispatches as usual. */
++static void test_other_thread_unaffected(void)
++{
++    TwoThreads t = { 0 };
++    GThread *b;
++
++    g_mutex_init(&t.lock);
++    g_cond_init(&t.cond);
++    reset_counts();
++    b = g_thread_new("outside", thread_b, &t);
++    run_worker(thread_a, &t, false);
++    g_thread_join(b);
++    g_assert_cmpint(t.b_result, ==, MEMTX_OK);
++    g_assert_cmpuint(qatomic_read(&mmio_calls), ==, 1);
++    g_cond_clear(&t.cond);
++    g_mutex_clear(&t.lock);
++}
++
++/* MARK: - An ARM page-table walk */
++
++#define DESC_TABLE  0x3ULL
++/* A 4 KiB page: valid, page, AF, inner shareable, AttrIndx 0, EL1 RW. */
++#define DESC_PAGE   (0x3ULL | (1ULL << 10) | (3ULL << 8))
++
++static void put_desc(uint64_t pa, uint64_t desc)
++{
++    address_space_stq_le(&address_space_memory, pa, desc,
++                         MEMTXATTRS_UNSPECIFIED, NULL);
++}
++
++/* EL1, MMU on, 4 KiB granule, 48-bit TTBR1 walks from @ttbr1. BQL held. */
++static void point_ttbr1_at(uint64_t ttbr1)
++{
++    ARMCPU *cpu = ARM_CPU(first_cpu);
++    CPUARMState *env = &cpu->env;
++
++    g_assert_cmpint(arm_current_el(env), ==, 1);
++    env->cp15.sctlr_el[1] |= SCTLR_M;
++    env->cp15.tcr_el[1] = (16ULL << 16)     /* T1SZ: 48-bit */
++                        | (2ULL << 30)      /* TG1: 4 KiB */
++                        | (1ULL << 7)       /* EPD0: no TTBR0 walks */
++                        | (2ULL << 32);     /* IPS: 40-bit */
++    env->cp15.ttbr1_el[1] = ttbr1;
++    arm_rebuild_hflags(env);
++}
++
++/*
++ * Tables in RAM for KVA_BASE: L0 at TABLES, L1, L2 and L3 after it; L3[0]
++ * maps PAGE_A, L3[1] maps @second (RAM or a device).
++ */
++static void build_tables(uint64_t second)
++{
++    put_desc(TABLES, (TABLES + 0x1000) | DESC_TABLE);
++    put_desc(TABLES + 0x1000, (TABLES + 0x2000) | DESC_TABLE);
++    put_desc(TABLES + 0x2000, (TABLES + 0x3000) | DESC_TABLE);
++    put_desc(TABLES + 0x3000, PAGE_A | DESC_PAGE);
++    put_desc(TABLES + 0x3008, second | DESC_PAGE);
++}
++
++typedef struct Walk {
++    uint64_t kva;
++    bool in_section;
++    bool ok;
++    hwaddr physaddr;
++} Walk;
++
++static void walk(void *opaque)
++{
++    Walk *w = opaque;
++    TranslateForDebugResult res;
++
++    if (w->in_section) {
++        memory_no_dispatch_begin();
++    }
++    w->ok = cpu_translate_for_debug(first_cpu, w->kva, &res);
++    w->physaddr = w->ok ? res.physaddr : 0;
++    if (w->in_section) {
++        memory_no_dispatch_end();
++    }
++}
++
++/*
++ * A walk whose table is a device: inside a section the walk fails without
++ * the device being read; outside one, the same walk reads the device, which
++ * shows the section is what stopped it.
++ */
++static void check_walk_reaches_device(uint64_t ttbr1)
++{
++    Walk w = { .kva = KVA_BASE, .in_section = true };
++
++    bql_lock();
++    point_ttbr1_at(ttbr1);
++    bql_unlock();
++
++    reset_counts();
++    run_worker(walk, &w, true);
++    g_assert_false(w.ok);
++    g_assert_cmpuint(qatomic_read(&mmio_calls), ==, 0);
++
++    w.in_section = false;
++    run_worker(walk, &w, false);
++    g_assert_false(w.ok);
++    g_assert_cmpuint(qatomic_read(&mmio_calls), >, 0);
++}
++
++static void test_arm_walk_level0_in_device(void)
++{
++    check_walk_reaches_device(MMIO_BASE);
++}
++
++static void test_arm_walk_level1_in_device(void)
++{
++    bql_lock();
++    put_desc(TABLES, MMIO_BASE | DESC_TABLE);
++    bql_unlock();
++    check_walk_reaches_device(TABLES);
++}
++
++/* A walk through RAM completes inside a section. */
++static void test_arm_walk_in_ram(void)
++{
++    Walk w = { .kva = KVA_BASE + 0x123, .in_section = true };
++
++    bql_lock();
++    build_tables(PAGE_A + 0x1000);
++    point_ttbr1_at(TABLES);
++    bql_unlock();
++
++    reset_counts();
++    run_worker(walk, &w, true);
++    g_assert_true(w.ok);
++    g_assert_cmphex(w.physaddr, ==, PAGE_A + 0x123);
++    g_assert_cmpuint(qatomic_read(&mmio_calls), ==, 0);
++}
++
++/* MARK: - The reims-vgpu callbacks */
++
++static void shim_gpa(void *opaque)
++{
++    uint8_t buf[0x200];
++    uint8_t *ram2_host = memory_region_get_ram_ptr(&ram2);
++    uint8_t *rom_host = memory_region_get_ram_ptr(&rom);
++
++    /* A device: refused, the buffer untouched. */
++    memset(buf, 0xaa, sizeof(buf));
++    g_assert_cmpint(reims_vgpu_shim_read_gpa(NULL, MMIO_BASE, buf, 16), ==, -1);
++    g_assert_true(all_bytes(buf, 16, 0xaa));
++
++    /* RAM running into a device: a read is refused with nothing copied... */
++    g_assert_cmpint(reims_vgpu_shim_read_gpa(NULL, MMIO2_BASE - 0x100, buf,
++                                             0x200), ==, -1);
++    g_assert_true(all_bytes(buf, sizeof(buf), 0xaa));
++    /* ...and a write before any byte lands in the RAM half. */
++    memset(buf, 0x55, sizeof(buf));
++    g_assert_cmpint(reims_vgpu_shim_write_gpa(NULL, MMIO2_BASE - 0x100, buf,
++                                              0x200), ==, -1);
++    g_assert_true(all_bytes(ram2_host + REGION_SIZE - 0x100, 0x100, 0));
++
++    /* Read-only RAM reads, and refuses a write whole. */
++    g_assert_cmpint(reims_vgpu_shim_read_gpa(NULL, ROM_BASE, buf, 16), ==, 0);
++    g_assert_true(all_bytes(buf, 16, 0x33));
++    g_assert_cmpint(reims_vgpu_shim_write_gpa(NULL, ROM_BASE, buf, 16), ==, -1);
++    g_assert_true(all_bytes(rom_host, 16, 0x33));
++
++    /* RAM, written and read back. */
++    memset(buf, 0x66, 64);
++    g_assert_cmpint(reims_vgpu_shim_write_gpa(NULL, RAM2_BASE, buf, 64), ==, 0);
++    g_assert_true(all_bytes(ram2_host, 64, 0x66));
++
++    /* Ranges that wrap, and no buffer. */
++    g_assert_cmpint(reims_vgpu_shim_read_gpa(NULL, UINT64_MAX - 3, buf, 8), ==,
++                    -3);
++    g_assert_cmpint(reims_vgpu_shim_read_gpa(NULL, RAM2_BASE, NULL, 8), ==, -3);
++}
++
++static void test_shim_gpa(void)
++{
++    memset(memory_region_get_ram_ptr(&ram2), 0, REGION_SIZE);
++    reset_counts();
++    run_worker(shim_gpa, NULL, true);
++    g_assert_cmpuint(qatomic_read(&mmio_calls), ==, 0);
++}
++
++static void shim_kva(void *opaque)
++{
++    uint8_t buf[0x20];
++
++    current_cpu = first_cpu;
++
++    /* Within the RAM page. */
++    memset(buf, 0, sizeof(buf));
++    g_assert_cmpint(reims_vgpu_shim_read_kva(NULL, KVA_BASE + 0x10, buf, 16),
++                    ==, 0);
++    g_assert_true(all_bytes(buf, 16, 0x44));
++
++    /*
++     * From the RAM page into the next, which maps a device: refused, and
++     * the first page's bytes are not handed over either.
++     */
++    memset(buf, 0xaa, sizeof(buf));
++    g_assert_cmpint(reims_vgpu_shim_read_kva(NULL, KVA_BASE + 0xff0, buf,
++                                             sizeof(buf)), ==, -1);
++    g_assert_true(all_bytes(buf, sizeof(buf), 0xaa));
++
++    /* Ranges that wrap, and no buffer. */
++    g_assert_cmpint(reims_vgpu_shim_read_kva(NULL, UINT64_MAX - 3, buf, 8), ==,
++                    -3);
++    g_assert_cmpint(reims_vgpu_shim_read_kva(NULL, KVA_BASE, NULL, 8), ==, -3);
++
++    current_cpu = NULL;
++}
++
++static void test_shim_kva(void)
++{
++    bql_lock();
++    build_tables(MMIO_BASE);
++    point_ttbr1_at(TABLES);
++    for (int i = 0; i < 0x1000; i += 8) {
++        put_desc(PAGE_A + i, 0x4444444444444444ULL);
++    }
++    bql_unlock();
++
++    reset_counts();
++    run_worker(shim_kva, NULL, true);
++    g_assert_cmpuint(qatomic_read(&mmio_calls), ==, 0);
++}
++
++/* MARK: - Machine */
++
++static void add_regions(void)
++{
++    MemoryRegion *sysmem = get_system_memory();
++
++    memory_region_init_io(&mmio, NULL, &counting_ops, NULL, "nd-mmio",
++                          REGION_SIZE);
++    memory_region_add_subregion_overlap(sysmem, MMIO_BASE, &mmio, 1);
++    memory_region_init_rom(&rom, NULL, "nd-rom", REGION_SIZE, &error_fatal);
++    memset(memory_region_get_ram_ptr(&rom), 0x33, REGION_SIZE);
++    memory_region_add_subregion_overlap(sysmem, ROM_BASE, &rom, 1);
++    memory_region_init_ram(&ram2, NULL, "nd-ram", REGION_SIZE, &error_fatal);
++    memory_region_add_subregion_overlap(sysmem, RAM2_BASE, &ram2, 1);
++    memory_region_init_io(&mmio2, NULL, &counting_ops, NULL, "nd-mmio2",
++                          REGION_SIZE);
++    memory_region_add_subregion_overlap(sysmem, MMIO2_BASE, &mmio2, 1);
++}
++
++int main(int argc, char **argv)
++{
++    char *qemu_argv[] = {
++        argv[0], (char *)"-M", (char *)"virt", (char *)"-cpu", (char *)"max",
++        (char *)"-accel", (char *)"tcg", (char *)"-m", (char *)"64M",
++        (char *)"-smp", (char *)"1", (char *)"-S", (char *)"-nodefaults",
++        (char *)"-display", (char *)"none", (char *)"-monitor", (char *)"none",
++        (char *)"-serial", (char *)"none", NULL,
++    };
++
++    g_test_init(&argc, &argv, NULL);
++    qemu_init(G_N_ELEMENTS(qemu_argv) - 1, qemu_argv);
++    /* qemu_init returns holding both, as system/main.c says. */
++    add_regions();
++    bql_unlock();
++    replay_mutex_unlock();
++
++    g_test_add_func("/reims-vgpu-no-dispatch/mmio-refused-in-section",
++                    test_mmio_refused_in_section);
++    g_test_add_func("/reims-vgpu-no-dispatch/nested-sections",
++                    test_nested_sections);
++    g_test_add_func("/reims-vgpu-no-dispatch/other-thread-unaffected",
++                    test_other_thread_unaffected);
++    g_test_add_func("/reims-vgpu-no-dispatch/arm-walk-level0-in-device",
++                    test_arm_walk_level0_in_device);
++    g_test_add_func("/reims-vgpu-no-dispatch/arm-walk-level1-in-device",
++                    test_arm_walk_level1_in_device);
++    g_test_add_func("/reims-vgpu-no-dispatch/arm-walk-in-ram",
++                    test_arm_walk_in_ram);
++    g_test_add_func("/reims-vgpu-no-dispatch/shim-gpa", test_shim_gpa);
++    g_test_add_func("/reims-vgpu-no-dispatch/shim-kva", test_shim_kva);
++    exit(g_test_run());
++}
+-- 
+2.43.0
+

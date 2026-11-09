@@ -1,0 +1,6 @@
+module CTatsu [system] {
+    header "shim.h"
+    link "tatsu"
+    link "plist-2.0"
+    export *
+}

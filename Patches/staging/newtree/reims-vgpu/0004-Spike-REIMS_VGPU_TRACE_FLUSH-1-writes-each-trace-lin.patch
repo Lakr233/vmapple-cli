@@ -1,0 +1,37 @@
+From 314e248f1f86a64b31596cd3bcde55516f51a9d1 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 15:15:15 +0800
+Subject: [PATCH 4/4] Spike: REIMS_VGPU_TRACE_FLUSH=1 writes each trace line
+ through
+
+---
+ crates/reims-vgpu-core/src/trace.rs | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/crates/reims-vgpu-core/src/trace.rs b/crates/reims-vgpu-core/src/trace.rs
+index 8574a92b8..961aae346 100644
+--- a/crates/reims-vgpu-core/src/trace.rs
++++ b/crates/reims-vgpu-core/src/trace.rs
+@@ -138,7 +138,7 @@ fn write_line(line: &str) {
+     let mut w = writer.lock();
+     let _ = w.out.write_all(line.as_bytes());
+     let t = now();
+-    if t.saturating_sub(w.flushed) >= FLUSH_NS {
++    if t.saturating_sub(w.flushed) >= FLUSH_NS || flush_each() {
+         let _ = w.out.flush();
+         w.flushed = t;
+     }
+@@ -204,3 +204,10 @@ mod tests {
+         );
+     }
+ }
++
++/// Spike (DGX): `REIMS_VGPU_TRACE_FLUSH=1` writes every line through at once, so a run that is
++/// killed (a guest that never powers off) keeps its whole trace.
++fn flush_each() -> bool {
++    static EACH: OnceLock<bool> = OnceLock::new();
++    *EACH.get_or_init(|| std::env::var_os("REIMS_VGPU_TRACE_FLUSH").is_some_and(|v| v == "1"))
++}
+-- 
+2.43.0
+

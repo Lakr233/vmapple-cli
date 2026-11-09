@@ -1,0 +1,56 @@
+From 3b433b6a8d7acaafc2d7a6d2556204789585486e Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Sun, 8 Nov 2026 01:52:26 +0800
+Subject: [PATCH] hw/vmapple: Back 0x410000..0x700000 with RAM
+
+OpenAVB writes its entropy slot at 0x600090 before it hands off, as it does on
+vresearch101, which has scratch RAM here. Without it the store has no region.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/vmapple/vmapple.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/hw/vmapple/vmapple.c b/hw/vmapple/vmapple.c
+index 41c268b99d..53b1d7cc21 100644
+--- a/hw/vmapple/vmapple.c
++++ b/hw/vmapple/vmapple.c
+@@ -72,6 +72,7 @@ struct VMAppleMachineState {
+     Notifier powerdown_notifier;
+     PCIBus *bus;
+     MemoryRegion fw_mr;
++    MemoryRegion scratch_mr;
+     MemoryRegion ecam_alias;
+     uint64_t uuid;
+     char *gfx_device;
+@@ -99,6 +100,7 @@ bool vmapple_read_current_xreg(unsigned int index, uint64_t *value)
+ enum {
+     VMAPPLE_FIRMWARE,
+     VMAPPLE_CONFIG,
++    VMAPPLE_SCRATCH,
+     VMAPPLE_MEM,
+     VMAPPLE_GIC_DIST,
+     VMAPPLE_GIC_REDIST,
+@@ -121,6 +123,7 @@ enum {
+ static const MemMapEntry memmap[] = {
+     [VMAPPLE_FIRMWARE] =           { 0x00100000, 0x00100000 },
+     [VMAPPLE_CONFIG] =             { 0x00400000, 0x00010000 },
++    [VMAPPLE_SCRATCH] =            { 0x00410000, 0x002f0000 },
+ 
+     [VMAPPLE_GIC_DIST] =           { 0x10000000, 0x00010000 },
+     [VMAPPLE_GIC_REDIST] =         { 0x10010000, 0x00400000 },
+@@ -591,6 +594,11 @@ static void mach_vmapple_init(MachineState *machine)
+     memory_region_add_subregion(sysmem, vms->memmap[VMAPPLE_MEM].base,
+                                 machine->ram);
+ 
++    memory_region_init_ram(&vms->scratch_mr, NULL, "avp-scratch",
++                           vms->memmap[VMAPPLE_SCRATCH].size, &error_fatal);
++    memory_region_add_subregion(sysmem, vms->memmap[VMAPPLE_SCRATCH].base,
++                                &vms->scratch_mr);
++
+     create_gic(vms, sysmem);
+     create_gicv2m(vms);
+     create_bdif(vms, sysmem);
+-- 
+2.43.0
+

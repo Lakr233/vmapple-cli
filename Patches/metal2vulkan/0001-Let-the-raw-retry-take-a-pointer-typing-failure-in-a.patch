@@ -1,0 +1,33 @@
+From 6254c1849f4ce5bb31c62135405df5aa10c871e9 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Sun, 8 Nov 2026 10:42:19 +0800
+Subject: [PATCH] Let the raw retry take a pointer-typing failure in an
+ oversized function
+
+The oversized-function branch only tried the CFG prune and the construct
+tree. A pointer-typing rejection there, like macOS 26 Setup Assistant
+hello shader (2309 blocks) loading a float2 field of a struct through a
+buffer the default path typed as a float4 array, never reached the raw
+byte-offset retry that validates it. The retry is adopted only if it
+validates, as everywhere else.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/lib.rs | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/lib.rs b/src/lib.rs
+index 2f39d53..7fd3f2a 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1018,6 +1018,7 @@ fn translate_sanitized_with_meta(
+                 if primary_block_count > native::CFG_EMIT_RELOOPER_MAX_BLOCKS {
+                     primary_cfg_prune_then_relooper_if_needed(&validation_error, &primary, tmp)
+                         .or_else(|| primary_construct_tree_if_needed(&validation_error, &rc))
++                        .or_else(|| primary_pointer_typing_raw_if_needed(&validation_error, &rc))
+                         .ok_or(validation_error)
+                 } else if let Some(primary) = primary_xbind_phi_psb_for_validation_error(
+                     &primary_module,
+-- 
+2.43.0
+

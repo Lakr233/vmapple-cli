@@ -1,0 +1,1699 @@
+From 47c55e03f983e00610ae13890b146e53dfad605f Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 03:34:39 +0800
+Subject: [PATCH 10/24] Re-read IOSurface page lists without a vCPU through a
+ validated walk
+
+Since the drain moved to a worker thread, a type-11 mapping's page list
+is never re-read where the writes happen: read_kva needs a vCPU, answers
+NoCpu there, and resolve keeps whatever page list the last vCPU resolve
+adopted. A surface the guest re-wired keeps being written at its old
+pages, and pages that were unwired at that resolve stay holes for good
+(13.6's black wallpaper: holes=4093 of=9216, every write-back refused).
+
+Capture the EL1 translation state (TTBR1, TCR, SCTLR) on the vCPU when
+the guest publishes on the mapper ring, through read_xreg indices from
+0x1000 that a matching QEMU change answers, and walk kernel addresses in
+software over guest physical memory from the worker with a small ARM64
+stage-1 walker of its own. It refuses what it does not implement: the
+MMU off, big-endian, TTBR1 walks disabled, 64 KiB granules, 52-bit
+addresses, blocks where the granule allows none.
+
+The walk serves a thread without a vCPU only after runtime validation:
+every kernel read on a vCPU is read again through the walk and compared,
+and a root needs eight agreeing non-zero reads over three pages, one of
+them across a page boundary, and no disagreement. A changed root or a
+device reset starts validation again; a disagreement retires the root.
+
+REIMS_VGPU_KVA_WALK picks what happens without a validated root.
+strict, the default, refuses the re-read: the page list is withdrawn and
+the write fails and is reported lost, never written through the cache,
+and each refusal is logged with the mapping and its time. compat keeps
+the cached page list as before, for a QEMU without the shim change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 87aad01f515940d36564dde8c190eb7a25127653)
+---
+ crates/reims-vgpu/src/env.rs                  |  13 +-
+ crates/reims-vgpu/src/model/state.rs          |  10 +
+ crates/reims-vgpu/src/runtime/host.rs         |  31 +-
+ crates/reims-vgpu/src/runtime/kernel_walk.rs  | 970 ++++++++++++++++++
+ crates/reims-vgpu/src/runtime/mapper/mod.rs   | 110 +-
+ crates/reims-vgpu/src/runtime/mapper/tests.rs | 318 +++++-
+ crates/reims-vgpu/src/runtime/mmio.rs         |   3 +
+ crates/reims-vgpu/src/runtime/mod.rs          |   2 +
+ 8 files changed, 1450 insertions(+), 7 deletions(-)
+ create mode 100644 crates/reims-vgpu/src/runtime/kernel_walk.rs
+
+diff --git a/crates/reims-vgpu/src/env.rs b/crates/reims-vgpu/src/env.rs
+index a4c7c1cb..a8ab260c 100644
+--- a/crates/reims-vgpu/src/env.rs
++++ b/crates/reims-vgpu/src/env.rs
+@@ -189,6 +189,16 @@ pub const PAGE_GUARDS: &str = "REIMS_VGPU_PAGE_GUARDS";
+ /// the probe is trying to measure.
+ pub const RANGE_COVERAGE: &str = "REIMS_VGPU_RANGE_COVERAGE";
+ 
++/// What a thread without a vCPU does when a type-11 mapping's page list must be
++/// re-read: `strict` (the default) re-reads it through the runtime-validated
++/// software walk of [`crate::runtime::kernel_walk`] or refuses the write;
++/// `compat` writes through the cached page list as before that module, for a
++/// QEMU without the shim that answers EL1 translation state and for baselines.
++///
++/// Not an on/off switch, so it is read by value. Any value other than `compat`
++/// is `strict`, the side that never writes through an unwitnessed page list.
++pub const KVA_WALK: &str = "REIMS_VGPU_KVA_WALK";
++
+ /// `off` stops narrowing a guest buffer bind to the extent the shader's
+ /// reflection proved it can read, so the bind walks the rest of the allocation
+ /// exactly as it did before that rail existed.
+@@ -1216,7 +1226,7 @@ pub fn switch(name: &str) -> Switch {
+ /// Nothing enforces that a new `pub const` above is added to this list; the rule
+ /// is stated and honestly unenforced. What keeps it small is that the list is
+ /// next to the constants, and [`report_line`] is the only consumer.
+-pub const ALL: [&str; 28] = [
++pub const ALL: [&str; 29] = [
+     COLOR_GENERAL,
+     LAZY_WRITEBACK,
+     SLAB_RETAIN,
+@@ -1235,6 +1245,7 @@ pub const ALL: [&str; 28] = [
+     GPU_STAMP,
+     PAGE_GUARDS,
+     RANGE_COVERAGE,
++    KVA_WALK,
+     BUFFER_EXTENT,
+     BATCH_MIXED_TARGETS,
+     BATCH_DEPTH,
+diff --git a/crates/reims-vgpu/src/model/state.rs b/crates/reims-vgpu/src/model/state.rs
+index e8e58f65..6c38274e 100644
+--- a/crates/reims-vgpu/src/model/state.rs
++++ b/crates/reims-vgpu/src/model/state.rs
+@@ -2462,6 +2462,10 @@ pub struct DeviceState {
+     /// disarms it. For the same reason it is not dropped on task teardown: the
+     /// page stays released whatever happens to the task that let it go.
+     pub released_pages: crate::runtime::released_pages::ReleasedPages,
++    /// The kernel translation root captured on a vCPU, and whether the software
++    /// walk over it has passed runtime validation. See
++    /// [`crate::runtime::kernel_walk`].
++    pub kernel_walk: crate::runtime::kernel_walk::KernelWalkState,
+     /// Live object refs per task, as `(task_id, ref)`.
+     ///
+     /// This is membership for host-copy teardown. [`Self::task_resources`]
+@@ -2837,6 +2841,7 @@ impl DeviceState {
+             map_audit: std::collections::BTreeMap::new(),
+             node_guard: std::collections::BTreeMap::new(),
+             released_pages: crate::runtime::released_pages::ReleasedPages::default(),
++            kernel_walk: crate::runtime::kernel_walk::KernelWalkState::default(),
+             objects: std::collections::BTreeSet::new(),
+             task_resources: TaskResources::default(),
+             task_sampler_states: TaskSamplerStates::default(),
+@@ -3216,9 +3221,14 @@ impl DeviceState {
+         // The mapper registers' read rail, kept the same way and published
+         // as the reset leaves them.
+         let iosfc_live = Arc::clone(&self.iosfc.live);
++        // The kernel root and its validation belong to the boot that is ending;
++        // only the count of boots survives, so a root names its own.
++        let mut kernel_walk = std::mem::take(&mut self.kernel_walk);
++        kernel_walk.reset();
+         *self = Self::new(id, page_shift);
+         self.iosfc.live = iosfc_live;
+         self.iosfc.publish();
++        self.kernel_walk = kernel_walk;
+         self.gfx.interrupt_status_disp = intr_disp;
+         self.gfx.interrupt_status_gpu = intr_gpu;
+         self.gfx.interrupt_fault = intr_fault;
+diff --git a/crates/reims-vgpu/src/runtime/host.rs b/crates/reims-vgpu/src/runtime/host.rs
+index fe2e09a8..08c6d937 100644
+--- a/crates/reims-vgpu/src/runtime/host.rs
++++ b/crates/reims-vgpu/src/runtime/host.rs
+@@ -13,6 +13,9 @@ use std::collections::BTreeMap;
+ pub enum MemError {
+     Unmapped,
+     NoCpu,
++    /// A kernel address read without a vCPU that the software walk would not,
++    /// or may not, answer. See [`crate::runtime::kernel_walk`].
++    KernelWalkRefused,
+     Overflow,
+     BadArgs,
+     /// The QEMU host table omitted a mandatory guest-physical read callback.
+@@ -108,6 +111,7 @@ impl crate::observe::Decline for MemError {
+         match self {
+             Self::Unmapped => "mem_unmapped",
+             Self::NoCpu => "mem_no_cpu",
++            Self::KernelWalkRefused => "mem_kernel_walk_refused",
+             Self::Overflow => "mem_overflow",
+             Self::BadArgs => "mem_bad_args",
+             Self::QemuReadGpaCallbackMissing => "mem_qemu_read_gpa_callback_missing",
+@@ -677,6 +681,12 @@ pub struct FakeHost {
+     bounce: Vec<BounceView>,
+     /// Synthetic guest X-regs for mapper capture tests.
+     pub xregs: BTreeMap<u32, u64>,
++    /// Model a thread with no vCPU: `read_kva` answers `NoCpu`.
++    pub kva_no_cpu: bool,
++    /// The CPU's own translation of kernel addresses, 16 KiB page to page,
++    /// standing in for `cpu_translate_for_debug`. A KVA with no entry reads
++    /// from the same sparse store as GPA, as before.
++    pub kva_cpu_pages: BTreeMap<u64, u64>,
+     pub actions: Vec<HostAction>,
+     pub mono_ns: u64,
+     pub bh_scheduled: bool,
+@@ -1351,8 +1361,25 @@ impl HostOps for FakeHost {
+     }
+ 
+     fn read_kva(&self, kva: u64, buf: &mut [u8]) -> Result<(), MemError> {
+-        // Tests map "KVA" into the same sparse store as GPA.
+-        self.read_gpa(kva, buf)
++        if self.kva_no_cpu {
++            return Err(MemError::NoCpu);
++        }
++        if self.kva_cpu_pages.is_empty() {
++            // Tests map "KVA" into the same sparse store as GPA.
++            return self.read_gpa(kva, buf);
++        }
++        const PAGE: u64 = 1 << 14;
++        let mut done = 0usize;
++        while done < buf.len() {
++            let at = kva + done as u64;
++            let Some(&gpa_page) = self.kva_cpu_pages.get(&(at & !(PAGE - 1))) else {
++                return Err(MemError::Unmapped);
++            };
++            let n = ((PAGE - (at & (PAGE - 1))) as usize).min(buf.len() - done);
++            self.read_gpa(gpa_page | (at & (PAGE - 1)), &mut buf[done..done + n])?;
++            done += n;
++        }
++        Ok(())
+     }
+ 
+     fn read_xreg(&self, index: u32) -> Result<u64, MemError> {
+diff --git a/crates/reims-vgpu/src/runtime/kernel_walk.rs b/crates/reims-vgpu/src/runtime/kernel_walk.rs
+new file mode 100644
+index 00000000..a97b25cd
+--- /dev/null
++++ b/crates/reims-vgpu/src/runtime/kernel_walk.rs
+@@ -0,0 +1,970 @@
++//! Guest kernel virtual addresses translated in software, for the threads that
++//! have no vCPU to ask.
++//!
++//! # Why this exists
++//!
++//! The mapper rail names a surface by its `MappingInternal`, a guest *kernel*
++//! object, and re-reads it to learn whether the surface's page list is still
++//! the one this device holds. `HostOps::read_kva` answers that only on a vCPU
++//! thread: it translates through the live CPU state, and from any other thread
++//! it answers `MemError::NoCpu`. Since the drain moved to a worker thread
++//! (QEMU 0009) every Store and write-back runs there, so the re-read never
++//! happens and the mapping rail writes through whatever page list the last vCPU
++//! resolve adopted — stale if the guest re-wired the surface, and permanently
++//! holed if it was not yet wired then.
++//!
++//! # What this does instead
++//!
++//! On the vCPU, when the guest publishes on the IOSurface mapper ring, the
++//! device reads the EL1 translation state — `TTBR1_EL1`, `TCR_EL1`,
++//! `SCTLR_EL1` — through the shim, which synchronizes it from KVM first
++//! ([`capture`]). The worker then translates a kernel address with a stage-1
++//! walk of its own over guest physical memory ([`translate`]), reading nothing
++//! but that snapshot and guest RAM. It never touches a live CPU.
++//!
++//! The walk refuses whatever it does not implement rather than guessing: the
++//! MMU off, big-endian descriptors, `TTBR1` walks disabled, the 64 KiB granule,
++//! 52-bit addressing, a block where the architecture allows none.
++//!
++//! # Runtime validation, and what happens without it
++//!
++//! Every time a vCPU path reads a kernel address through the CPU, the same bytes
++//! are read through this walk and compared ([`compare`]). A root serves a thread
++//! without a vCPU only after it has collected several agreeing non-zero reads
++//! over several pages, one of them across a page boundary, and no disagreement.
++//! Validation belongs to one root in one boot: a changed root or a reset starts
++//! it again, and one disagreement retires the root until it changes.
++//!
++//! Without a validated root — a QEMU without the matching shim, a root still
++//! validating, a disagreement — [`Mode::Strict`] (the default) refuses the
++//! write and logs it with its time, and [`Mode::Compat`] writes through the
++//! cached page list as before. `REIMS_VGPU_KVA_WALK` selects the mode.
++//!
++//! # What it does not do
++//!
++//! A fresh walk only ends the blindness. It does not hold the guest's pages:
++//! the guest can still re-point a page between this walk and the write that
++//! follows it, and a reused `MappingInternal` is still caught, or not, by the
++//! generation checks that already exist.
++
++use crate::runtime::host::{HostMemory, HostOps};
++
++/// `HostOps::read_xreg` indices from which the vmapple shim answers EL1
++/// translation state instead of an X register. A shim without that answers an
++/// error, which reads as "no root".
++pub const SYSREG_BASE: u32 = 0x1000;
++const SYSREG_TTBR1_EL1: u32 = SYSREG_BASE;
++const SYSREG_TCR_EL1: u32 = SYSREG_BASE + 1;
++const SYSREG_SCTLR_EL1: u32 = SYSREG_BASE + 2;
++const SYSREG_CPU_INDEX: u32 = SYSREG_BASE + 3;
++
++/// One vCPU's EL1 translation state, read in one MMIO exit.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct KernelRoot {
++    pub ttbr1: u64,
++    pub tcr: u64,
++    pub sctlr: u64,
++    /// The vCPU it was read on. Carried for the log, not compared: every vCPU
++    /// runs the kernel on the same `TTBR1`.
++    pub cpu_index: u64,
++    /// [`KernelWalkState::boot`] at the capture.
++    pub boot: u64,
++}
++
++impl KernelRoot {
++    fn same_translation(&self, other: &Self) -> bool {
++        self.ttbr1 == other.ttbr1 && self.tcr == other.tcr && self.sctlr == other.sctlr
++    }
++}
++
++/// Why the walk would not translate an address.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum WalkRefusal {
++    MmuOff,
++    BigEndian,
++    Ttbr1WalksDisabled,
++    Granule64k,
++    GranuleReserved,
++    Lpa2,
++    VaSize(u32),
++    NotTtbr1Address,
++    /// An invalid descriptor: the address is not mapped.
++    Fault {
++        level: u32,
++    },
++    /// A block descriptor at a level the granule allows none at.
++    BlockAtLevel {
++        level: u32,
++    },
++    /// A level-3 descriptor with the reserved encoding.
++    Reserved {
++        level: u32,
++    },
++    OutputBeyondPaSize,
++    /// Guest physical memory could not be read at this address.
++    Read {
++        gpa: u64,
++    },
++}
++
++impl WalkRefusal {
++    pub fn slug(self) -> &'static str {
++        match self {
++            Self::MmuOff => "kva_walk_mmu_off",
++            Self::BigEndian => "kva_walk_big_endian",
++            Self::Ttbr1WalksDisabled => "kva_walk_ttbr1_disabled",
++            Self::Granule64k => "kva_walk_granule_64k",
++            Self::GranuleReserved => "kva_walk_granule_reserved",
++            Self::Lpa2 => "kva_walk_lpa2",
++            Self::VaSize(_) => "kva_walk_va_size",
++            Self::NotTtbr1Address => "kva_walk_not_ttbr1_address",
++            Self::Fault { .. } => "kva_walk_fault",
++            Self::BlockAtLevel { .. } => "kva_walk_block_at_level",
++            Self::Reserved { .. } => "kva_walk_reserved",
++            Self::OutputBeyondPaSize => "kva_walk_output_beyond_pa_size",
++            Self::Read { .. } => "kva_walk_read",
++        }
++    }
++}
++
++const SCTLR_M: u64 = 1;
++const SCTLR_EE: u64 = 1 << 25;
++const TCR_EPD1: u64 = 1 << 23;
++const TCR_TBI1: u64 = 1 << 38;
++const TCR_DS: u64 = 1 << 59;
++/// Output address bits a descriptor can carry without 52-bit addressing.
++const OA_BITS: u32 = 48;
++
++/// The translation regime [`KernelRoot`] describes, decoded once per walk.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++struct Regime {
++    granule_shift: u32,
++    /// Index bits per level below the first.
++    stride: u32,
++    va_bits: u32,
++    start_level: u32,
++    pa_bits: u32,
++    top_byte_ignored: bool,
++    base: u64,
++}
++
++impl Regime {
++    fn of(root: &KernelRoot) -> Result<Self, WalkRefusal> {
++        if root.sctlr & SCTLR_M == 0 {
++            return Err(WalkRefusal::MmuOff);
++        }
++        if root.sctlr & SCTLR_EE != 0 {
++            return Err(WalkRefusal::BigEndian);
++        }
++        let tcr = root.tcr;
++        if tcr & TCR_EPD1 != 0 {
++            return Err(WalkRefusal::Ttbr1WalksDisabled);
++        }
++        if tcr & TCR_DS != 0 {
++            return Err(WalkRefusal::Lpa2);
++        }
++        let granule_shift = match (tcr >> 30) & 0b11 {
++            0b01 => 14,
++            0b10 => 12,
++            0b11 => return Err(WalkRefusal::Granule64k),
++            _ => return Err(WalkRefusal::GranuleReserved),
++        };
++        let t1sz = ((tcr >> 16) & 0x3f) as u32;
++        let va_bits = 64 - t1sz;
++        if !(25..=OA_BITS).contains(&va_bits) {
++            return Err(WalkRefusal::VaSize(va_bits));
++        }
++        let stride = granule_shift - 3;
++        let levels = (va_bits - granule_shift).div_ceil(stride);
++        let start_level = 4 - levels;
++        let pa_bits = match (tcr >> 32) & 0b111 {
++            0 => 32,
++            1 => 36,
++            2 => 40,
++            3 => 42,
++            4 => 44,
++            _ => OA_BITS,
++        };
++        let start_bits = va_bits - granule_shift - stride * (levels - 1);
++        let table_bytes = 8u64 << start_bits;
++        let base = root.ttbr1 & ((1u64 << OA_BITS) - 1) & !(table_bytes - 1);
++        Ok(Self {
++            granule_shift,
++            stride,
++            va_bits,
++            start_level,
++            pa_bits,
++            top_byte_ignored: tcr & TCR_TBI1 != 0,
++            base,
++        })
++    }
++
++    fn granule(&self) -> u64 {
++        1 << self.granule_shift
++    }
++}
++
++/// Translate one guest kernel address to the guest physical address it names.
++pub fn translate<M: HostMemory>(mem: &M, root: &KernelRoot, va: u64) -> Result<u64, WalkRefusal> {
++    let regime = Regime::of(root)?;
++    translate_in(mem, &regime, va)
++}
++
++fn translate_in<M: HostMemory>(mem: &M, r: &Regime, va: u64) -> Result<u64, WalkRefusal> {
++    let checked = if r.top_byte_ignored {
++        va | 0xff00_0000_0000_0000
++    } else {
++        va
++    };
++    if checked >> r.va_bits != u64::MAX >> r.va_bits {
++        return Err(WalkRefusal::NotTtbr1Address);
++    }
++    let oa_mask = ((1u64 << OA_BITS) - 1) & !(r.granule() - 1);
++    let mut table = r.base;
++    for level in r.start_level..=3 {
++        let shift = r.granule_shift + r.stride * (3 - level);
++        let bits = if level == r.start_level {
++            r.va_bits - shift
++        } else {
++            r.stride
++        };
++        let index = (va >> shift) & ((1u64 << bits) - 1);
++        let at = table + index * 8;
++        let mut raw = [0u8; 8];
++        mem.read_gpa(at, &mut raw)
++            .map_err(|_| WalkRefusal::Read { gpa: at })?;
++        let desc = u64::from_le_bytes(raw);
++        if desc & 1 == 0 {
++            return Err(WalkRefusal::Fault { level });
++        }
++        let is_table_or_page = desc & 0b10 != 0;
++        let span = 1u64 << shift;
++        let pa = if level == 3 {
++            if !is_table_or_page {
++                return Err(WalkRefusal::Reserved { level });
++            }
++            (desc & oa_mask) | (va & (span - 1))
++        } else if is_table_or_page {
++            table = desc & oa_mask;
++            continue;
++        } else {
++            // Blocks: level 2 for both granules, level 1 for 4 KiB. A 16 KiB
++            // level-1 block exists only with 52-bit addressing, refused above.
++            let allowed = level == 2 || (level == 1 && r.granule_shift == 12);
++            if !allowed {
++                return Err(WalkRefusal::BlockAtLevel { level });
++            }
++            (desc & oa_mask & !(span - 1)) | (va & (span - 1))
++        };
++        if r.pa_bits < 64 && pa >> r.pa_bits != 0 {
++            return Err(WalkRefusal::OutputBeyondPaSize);
++        }
++        return Ok(pa);
++    }
++    unreachable!("level 3 always returns")
++}
++
++/// Read `buf.len()` bytes at guest kernel address `va` through the walk, one
++/// granule at a time.
++pub fn read<M: HostMemory>(
++    mem: &M,
++    root: &KernelRoot,
++    va: u64,
++    buf: &mut [u8],
++) -> Result<(), WalkRefusal> {
++    let regime = Regime::of(root)?;
++    let granule = regime.granule();
++    let mut done = 0usize;
++    while done < buf.len() {
++        let at = va.wrapping_add(done as u64);
++        let pa = translate_in(mem, &regime, at)?;
++        let in_page = (granule - (at & (granule - 1))) as usize;
++        let n = in_page.min(buf.len() - done);
++        mem.read_gpa(pa, &mut buf[done..done + n])
++            .map_err(|_| WalkRefusal::Read { gpa: pa })?;
++        done += n;
++    }
++    Ok(())
++}
++
++// MARK: - Mode
++
++/// What a thread without a vCPU does when a mapping's page list must be
++/// re-read. From `REIMS_VGPU_KVA_WALK`.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Mode {
++    /// The default. Re-read through a validated walk, or refuse the write: the
++    /// cached page list is never written through unwitnessed.
++    Strict,
++    /// `compat`: the cached page list is kept and written through, as before
++    /// this module. For a QEMU without the matching shim, and for baselines.
++    Compat,
++}
++
++pub fn mode() -> Mode {
++    #[cfg(test)]
++    if let Some(mode) = TEST_MODE.with(std::cell::Cell::get) {
++        return mode;
++    }
++    static MODE: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
++    *MODE.get_or_init(|| {
++        let (_, value) = crate::env::read(crate::env::KVA_WALK);
++        let mode = match value.as_deref().map(str::trim) {
++            Some(v) if v.eq_ignore_ascii_case("compat") => Mode::Compat,
++            _ => Mode::Strict,
++        };
++        crate::observe::off(format!(
++            "kva_walk_mode mode={mode:?} value={}",
++            value.unwrap_or_else(|| "<unset>".into())
++        ));
++        mode
++    })
++}
++
++#[cfg(test)]
++thread_local! {
++    static TEST_MODE: std::cell::Cell<Option<Mode>> = const { std::cell::Cell::new(None) };
++}
++
++/// Run `f` with [`mode`] answering `mode` on this thread, for a test of the
++/// arm the environment does not select.
++#[cfg(test)]
++pub(crate) fn with_mode<R>(mode: Mode, f: impl FnOnce() -> R) -> R {
++    TEST_MODE.with(|m| m.set(Some(mode)));
++    let out = f();
++    TEST_MODE.with(|m| m.set(None));
++    out
++}
++
++// MARK: - Runtime validation
++
++/// How much agreement a root must collect before a thread without a vCPU may
++/// translate with it: reads with non-zero bytes, from several pages, and one
++/// that crossed a page boundary. One matching read, all zeros, proves nothing
++/// about the physical address it came from.
++const AGREED_SAMPLES: u64 = 8;
++const AGREED_PAGES: usize = 3;
++/// Distinct pages remembered for [`AGREED_PAGES`]; more add nothing.
++const PAGES_KEPT: usize = 16;
++
++/// The result of reading the same kernel bytes through the CPU and the walk.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum WalkCompare {
++    Agreed {
++        kva: u64,
++        len: usize,
++        nonzero: bool,
++        crossed: bool,
++    },
++    Mismatch {
++        kva: u64,
++        len: usize,
++        why: &'static str,
++    },
++}
++
++/// Runtime validation of one root against the CPU.
++#[derive(Clone, Debug, Default)]
++struct Validation {
++    samples: u64,
++    pages: std::collections::BTreeSet<u64>,
++    crossed: bool,
++    mismatch: bool,
++}
++
++impl Validation {
++    fn validated(&self) -> bool {
++        !self.mismatch
++            && self.samples >= AGREED_SAMPLES
++            && self.pages.len() >= AGREED_PAGES
++            && self.crossed
++    }
++}
++
++/// Why a thread without a vCPU has no walk to use.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum GateRefusal {
++    NoRoot,
++    Unvalidated,
++    Mismatched,
++}
++
++/// Why a page list was not re-read on a thread without a vCPU.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Refused {
++    Gate(GateRefusal),
++    Walk(WalkRefusal),
++}
++
++impl Refused {
++    pub fn slug(self) -> &'static str {
++        match self {
++            Self::Gate(GateRefusal::NoRoot) => "kva_walk_no_root",
++            Self::Gate(GateRefusal::Unvalidated) => "kva_walk_unvalidated",
++            Self::Gate(GateRefusal::Mismatched) => "kva_walk_mismatched",
++            Self::Walk(why) => why.slug(),
++        }
++    }
++}
++
++/// What a reader without a vCPU does with a kernel address.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Serve {
++    /// Answer `NoCpu`, as before: compat mode, or a reader that only runs on a
++    /// vCPU.
++    Off,
++    Walk(KernelRoot),
++    Refuse(GateRefusal),
++}
++
++/// One reader's view of the walk: what to validate against, and what to do
++/// without a vCPU.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct WalkPolicy {
++    pub root: Option<KernelRoot>,
++    pub serve: Serve,
++    /// Whether a boundary-crossing sample is still owed, so a reader on a vCPU
++    /// knows to take one.
++    pub wants_crossing: bool,
++}
++
++impl WalkPolicy {
++    /// A reader that only ever runs on a vCPU and takes no part.
++    pub const OFF: Self = Self {
++        root: None,
++        serve: Serve::Off,
++        wants_crossing: false,
++    };
++}
++
++/// What one reader observed, folded into [`KernelWalkState`] afterwards.
++#[derive(Clone, Debug, Default)]
++pub struct WalkLog {
++    pub compares: Vec<WalkCompare>,
++}
++
++// MARK: - State
++
++/// What the device knows about kernel translation this boot.
++#[derive(Clone, Debug, Default)]
++pub struct KernelWalkState {
++    pub root: Option<KernelRoot>,
++    /// Device resets seen, so a root names the boot it was read in.
++    pub boot: u64,
++    validation: Validation,
++    /// The shim refused the translation-state read; said once a boot.
++    unavailable_reported: bool,
++    validated_reported: bool,
++    /// Refusals logged per mapping, to bound the log.
++    refusals_logged: std::collections::BTreeMap<u32, u32>,
++}
++
++/// How many refusals one mapping may log in a boot. Each carries its time,
++/// which is the point; past this the count in `store_routes` carries on.
++const REFUSALS_LOGGED_PER_MAPPING: u32 = 64;
++
++impl KernelWalkState {
++    /// The root a thread without a vCPU may translate with, if this root has
++    /// passed runtime validation.
++    pub fn gate(&self) -> Result<KernelRoot, GateRefusal> {
++        let root = self.root.ok_or(GateRefusal::NoRoot)?;
++        if self.validation.mismatch {
++            return Err(GateRefusal::Mismatched);
++        }
++        if !self.validation.validated() {
++            return Err(GateRefusal::Unvalidated);
++        }
++        Ok(root)
++    }
++
++    pub fn policy(&self, mode: Mode) -> WalkPolicy {
++        let serve = match mode {
++            Mode::Compat => Serve::Off,
++            Mode::Strict => match self.gate() {
++                Ok(root) => Serve::Walk(root),
++                Err(why) => Serve::Refuse(why),
++            },
++        };
++        WalkPolicy {
++            root: self.root,
++            serve,
++            wants_crossing: self.root.is_some() && !self.validation.crossed,
++        }
++    }
++
++    /// Forget everything at a device reset: the next boot's kernel has its own
++    /// tables, and its own validation to pass.
++    pub fn reset(&mut self) {
++        let boot = self.boot.wrapping_add(1);
++        *self = Self {
++            boot,
++            ..Self::default()
++        };
++    }
++
++    /// Fold what one reader on a vCPU path compared.
++    pub fn fold(&mut self, log: WalkLog) {
++        for compare in log.compares {
++            self.note_compare(compare);
++        }
++    }
++
++    fn note_compare(&mut self, compare: WalkCompare) {
++        let Some(root) = self.root else {
++            return;
++        };
++        let v = &mut self.validation;
++        match compare {
++            WalkCompare::Agreed {
++                kva,
++                len,
++                nonzero,
++                crossed,
++            } => {
++                crate::runtime::drain::note_store_route("kva_walk_agree");
++                if !nonzero || v.mismatch {
++                    return;
++                }
++                v.samples += 1;
++                v.crossed |= crossed;
++                if v.pages.len() < PAGES_KEPT {
++                    let granule = Regime::of(&root).map_or(1 << 14, |r| r.granule());
++                    v.pages.insert(kva & !(granule - 1));
++                    let last = kva.wrapping_add(len.max(1) as u64 - 1);
++                    v.pages.insert(last & !(granule - 1));
++                }
++                if v.validated() && !self.validated_reported {
++                    self.validated_reported = true;
++                    crate::observe::off(format!(
++                        "kva_walk_validated samples={} pages={} ttbr1={:#x} tcr={:#x} \
++                         boot={} (runtime validation: the software walk agreed with the CPU; \
++                         it now serves threads without a vCPU)",
++                        v.samples,
++                        v.pages.len(),
++                        root.ttbr1,
++                        root.tcr,
++                        root.boot
++                    ));
++                }
++            }
++            WalkCompare::Mismatch { kva, len, why } => {
++                crate::runtime::drain::note_store_route("kva_walk_mismatch");
++                if !v.mismatch {
++                    crate::observe::fail(format!(
++                        "kva_walk_mismatch kva={kva:#x} len={len} detail={why} samples={} \
++                         ttbr1={:#x} (runtime validation failed: the software walk read \
++                         differently from the CPU; it serves nothing until the root changes)",
++                        v.samples, root.ttbr1
++                    ));
++                }
++                v.mismatch = true;
++            }
++        }
++    }
++
++    /// Log one refusal to re-read a page list without a vCPU.
++    pub fn note_refusal(&mut self, mapping_id: u32, pages: usize, why: Refused, kva: u64) {
++        crate::runtime::drain::note_store_route(why.slug());
++        crate::runtime::drain::note_store_route("kva_walk_resolve_refused");
++        let logged = self.refusals_logged.entry(mapping_id).or_default();
++        if *logged >= REFUSALS_LOGGED_PER_MAPPING {
++            return;
++        }
++        *logged += 1;
++        crate::observe::fail(format!(
++            "kva_walk_resolve_refused mapping={mapping_id} reason={} detail={why:?} kva={kva:#x} \
++             pages=0..{pages} mode={:?} (the page list could not be re-read without a vCPU, so \
++             the cached one is not written through; the write is refused and reported lost)",
++            why.slug(),
++            mode()
++        ));
++    }
++}
++
++/// Compare one CPU read with the walk, for runtime validation. `cpu` is what
++/// the CPU read at `kva`.
++pub fn compare<M: HostMemory>(mem: &M, root: &KernelRoot, kva: u64, cpu: &[u8]) -> WalkCompare {
++    let mut walked = vec![0u8; cpu.len()];
++    match read(mem, root, kva, &mut walked) {
++        Ok(()) if walked == cpu => {
++            let granule = Regime::of(root).map_or(1 << 14, |r| r.granule());
++            let last = kva.wrapping_add(cpu.len().max(1) as u64 - 1);
++            WalkCompare::Agreed {
++                kva,
++                len: cpu.len(),
++                nonzero: cpu.iter().any(|&b| b != 0),
++                crossed: kva & !(granule - 1) != last & !(granule - 1),
++            }
++        }
++        Ok(()) => WalkCompare::Mismatch {
++            kva,
++            len: cpu.len(),
++            why: "bytes",
++        },
++        Err(why) => WalkCompare::Mismatch {
++            kva,
++            len: cpu.len(),
++            why: why.slug(),
++        },
++    }
++}
++
++/// The span a boundary-crossing sample reads, around the end of the granule
++/// page holding `kva`.
++pub fn crossing_probe(root: &KernelRoot, kva: u64) -> Option<(u64, usize)> {
++    let granule = Regime::of(root).ok()?.granule();
++    let end = (kva | (granule - 1)).checked_add(1)?;
++    Some((end - 8, 16))
++}
++
++/// Read the vCPU's EL1 translation state and keep it as the root.
++///
++/// Called on the vCPU thread, in the MMIO exit of a mapper ring publish, before
++/// anything on that path reads a kernel address. The shim synchronizes the
++/// state from KVM before answering, and the four reads share one exit, so they
++/// describe one moment. A changed root starts validation again.
++pub fn capture<H: HostOps>(state: &mut KernelWalkState, host: &H) {
++    let read = |index| host.read_xreg(index);
++    let regs = (|| {
++        Some((
++            read(SYSREG_TTBR1_EL1).ok()?,
++            read(SYSREG_TCR_EL1).ok()?,
++            read(SYSREG_SCTLR_EL1).ok()?,
++            read(SYSREG_CPU_INDEX).ok()?,
++        ))
++    })();
++    let Some((ttbr1, tcr, sctlr, cpu_index)) = regs else {
++        if !state.unavailable_reported {
++            state.unavailable_reported = true;
++            crate::observe::off(format!(
++                "kva_walk_root_unavailable mode={:?} (the shim does not answer EL1 translation \
++                 state; without a vCPU, strict refuses mapping writes and compat writes through \
++                 the cached page list)",
++                mode()
++            ));
++        }
++        return;
++    };
++    let root = KernelRoot {
++        ttbr1,
++        tcr,
++        sctlr,
++        cpu_index,
++        boot: state.boot,
++    };
++    match state.root {
++        Some(held) if held.same_translation(&root) => return,
++        Some(held) => crate::observe::fail(format!(
++            "kva_walk_root_changed was_ttbr1={:#x} was_tcr={:#x} was_sctlr={:#x} \
++             ttbr1={ttbr1:#x} tcr={tcr:#x} sctlr={sctlr:#x} cpu={cpu_index} boot={} \
++             (validation starts again for the new root)",
++            held.ttbr1, held.tcr, held.sctlr, state.boot
++        )),
++        None => crate::observe::off(format!(
++            "kva_walk_root ttbr1={ttbr1:#x} tcr={tcr:#x} sctlr={sctlr:#x} cpu={cpu_index} \
++             boot={} mode={:?} regime={:?}",
++            state.boot,
++            mode(),
++            Regime::of(&root).map(|r| (r.granule_shift, r.va_bits, r.start_level))
++        )),
++    }
++    state.root = Some(root);
++    state.validation = Validation::default();
++    state.validated_reported = false;
++}
++
++#[cfg(test)]
++pub(crate) mod tests {
++    use super::*;
++    use crate::runtime::host::FakeHost;
++
++    /// A 16 KiB-granule, 47-bit kernel regime: three levels, L1 to L3, wide enough
++    /// for the `0xfffffe...` kernel addresses the mapper fixtures use.
++    pub(crate) const TCR_16K_47: u64 = (17 << 16) | (0b01 << 30) | (0b101 << 32);
++    pub(crate) const SCTLR_ON: u64 = SCTLR_M;
++    pub(crate) const G: u64 = 1 << 14;
++    /// Where the walk's own tables live in the fixture.
++    pub(crate) const L1: u64 = 0x4000_0000;
++    const L2: u64 = L1 + G;
++    const L3: u64 = L1 + 2 * G;
++
++    pub(crate) fn root(ttbr1: u64) -> KernelRoot {
++        KernelRoot {
++            ttbr1,
++            tcr: TCR_16K_47,
++            sctlr: SCTLR_ON,
++            cpu_index: 0,
++            boot: 0,
++        }
++    }
++
++    fn put_desc(host: &mut FakeHost, at: u64, desc: u64) {
++        host.map_range(at & !7, 8, 0);
++        host.write_gpa(at, &desc.to_le_bytes()).unwrap();
++    }
++
++    /// A kernel page table rooted at [`L1`] that maps the 16 KiB page holding
++    /// `va` to `pa` through one L2 table and one L3 table. Called again for
++    /// another `va` in the same 32 MiB, it adds to the same L3 table.
++    pub(crate) fn map_page(host: &mut FakeHost, va: u64, pa: u64) {
++        let l1 = (va >> 36) & 0x7ff;
++        let l2 = (va >> 25) & 0x7ff;
++        let l3 = (va >> 14) & 0x7ff;
++        put_desc(host, L1 + l1 * 8, L2 | 0b11);
++        put_desc(host, L2 + l2 * 8, L3 | 0b11);
++        put_desc(host, L3 + l3 * 8, (pa & !(G - 1)) | 0b11 | (1 << 10));
++    }
++
++    /// What a kernel VA in this regime looks like: the upper 17 bits set.
++    pub(crate) fn kva(offset: u64) -> u64 {
++        0xffff_8000_0000_0000 | offset
++    }
++
++    #[test]
++    fn a_mapped_page_translates_with_its_offset() {
++        let mut host = FakeHost::new();
++        let va = kva(0x12_3456_4000);
++        map_page(&mut host, va, 0x8_0000_0000);
++        let r = root(L1);
++        assert_eq!(translate(&host, &r, va + 0x123), Ok(0x8_0000_0123));
++        assert_eq!(
++            translate(&host, &r, va + G),
++            Err(WalkRefusal::Fault { level: 3 }),
++            "the next page has no descriptor"
++        );
++    }
++
++    /// A 32 MiB level-2 block covers the address with the low 25 bits passed
++    /// through, and a level-1 block does not exist on this granule.
++    #[test]
++    fn blocks_are_taken_where_the_granule_allows_them() {
++        let mut host = FakeHost::new();
++        let va = kva(0x40_0000_0000 + 0x1_2345);
++        let l1 = (va >> 36) & 0x7ff;
++        let l2 = (va >> 25) & 0x7ff;
++        put_desc(&mut host, L1 + l1 * 8, L2 | 0b11);
++        put_desc(&mut host, L2 + l2 * 8, 0x2_0000_0000 | 0b01);
++        assert_eq!(
++            translate(&host, &root(L1), va),
++            Ok(0x2_0000_0000 + 0x1_2345)
++        );
++
++        put_desc(&mut host, L1 + l1 * 8, 0x2_0000_0000 | 0b01);
++        assert_eq!(
++            translate(&host, &root(L1), va),
++            Err(WalkRefusal::BlockAtLevel { level: 1 })
++        );
++    }
++
++    #[test]
++    fn what_the_walk_does_not_implement_is_refused() {
++        let host = FakeHost::new();
++        let refuse = |tcr: u64, sctlr: u64| {
++            translate(
++                &host,
++                &KernelRoot {
++                    tcr,
++                    sctlr,
++                    ..root(L1)
++                },
++                kva(0),
++            )
++        };
++        assert_eq!(refuse(TCR_16K_47, 0), Err(WalkRefusal::MmuOff));
++        assert_eq!(
++            refuse(TCR_16K_47, SCTLR_ON | SCTLR_EE),
++            Err(WalkRefusal::BigEndian)
++        );
++        assert_eq!(
++            refuse(TCR_16K_47 | TCR_EPD1, SCTLR_ON),
++            Err(WalkRefusal::Ttbr1WalksDisabled)
++        );
++        assert_eq!(
++            refuse(TCR_16K_47 | TCR_DS, SCTLR_ON),
++            Err(WalkRefusal::Lpa2)
++        );
++        assert_eq!(
++            refuse((TCR_16K_47 & !(0b11 << 30)) | (0b11 << 30), SCTLR_ON),
++            Err(WalkRefusal::Granule64k)
++        );
++        assert_eq!(
++            translate(&host, &root(L1), 0x0000_0080_0000_0000),
++            Err(WalkRefusal::NotTtbr1Address),
++            "a TTBR0 address is not the kernel's"
++        );
++    }
++
++    /// A read crossing a page boundary takes each page from its own
++    /// translation, including pages that are not physically adjacent.
++    #[test]
++    fn a_read_across_pages_follows_each_translation() {
++        let mut host = FakeHost::new();
++        let va = kva(0x10_0000_0000);
++        map_page(&mut host, va, 0x9_0000_0000);
++        map_page(&mut host, va + G, 0x7_0000_0000);
++        host.map_range(0x9_0000_0000, G as usize, 0);
++        host.map_range(0x7_0000_0000, G as usize, 0);
++        host.write_gpa(0x9_0000_0000 + G - 4, b"tail").unwrap();
++        host.write_gpa(0x7_0000_0000, b"head").unwrap();
++        let mut got = [0u8; 8];
++        read(&host, &root(L1), va + G - 4, &mut got).unwrap();
++        assert_eq!(&got, b"tailhead");
++    }
++
++    fn agreed(kva: u64, len: usize, crossed: bool) -> WalkCompare {
++        WalkCompare::Agreed {
++            kva,
++            len,
++            nonzero: true,
++            crossed,
++        }
++    }
++
++    /// Runtime validation, as many agreeing non-zero reads over several
++    /// pages, one of them across a boundary, as it takes and no fewer.
++    fn validate(state: &mut KernelWalkState) {
++        for i in 0..AGREED_SAMPLES {
++            state.note_compare(agreed(kva(i * G), 8, i == 0));
++        }
++    }
++
++    fn give_root(host: &mut FakeHost, ttbr1: u64) {
++        host.set_xreg(SYSREG_TTBR1_EL1, ttbr1);
++        host.set_xreg(SYSREG_TCR_EL1, TCR_16K_47);
++        host.set_xreg(SYSREG_SCTLR_EL1, SCTLR_ON);
++        host.set_xreg(SYSREG_CPU_INDEX, 2);
++    }
++
++    #[test]
++    fn a_shim_that_does_not_answer_leaves_no_root() {
++        let host = FakeHost::new();
++        let mut state = KernelWalkState::default();
++        capture(&mut state, &host);
++        assert!(state.root.is_none());
++        assert_eq!(state.gate(), Err(GateRefusal::NoRoot));
++        assert_eq!(
++            state.policy(Mode::Strict).serve,
++            Serve::Refuse(GateRefusal::NoRoot)
++        );
++        assert_eq!(state.policy(Mode::Compat).serve, Serve::Off);
++    }
++
++    /// One agreeing read does not validate a root, an all-zero one counts for
++    /// nothing, and one that never crossed a page is not enough either.
++    #[test]
++    fn validation_takes_several_non_zero_reads_over_pages_and_a_crossing() {
++        let mut host = FakeHost::new();
++        give_root(&mut host, L1);
++        let mut state = KernelWalkState::default();
++        capture(&mut state, &host);
++
++        state.note_compare(agreed(kva(0), 8, true));
++        assert_eq!(state.gate(), Err(GateRefusal::Unvalidated), "one read");
++
++        for _ in 0..2 * AGREED_SAMPLES {
++            state.note_compare(WalkCompare::Agreed {
++                kva: kva(G),
++                len: 8,
++                nonzero: false,
++                crossed: false,
++            });
++        }
++        assert_eq!(
++            state.gate(),
++            Err(GateRefusal::Unvalidated),
++            "zeros prove nothing"
++        );
++
++        let mut uncrossed = KernelWalkState::default();
++        capture(&mut uncrossed, &host);
++        for i in 0..AGREED_SAMPLES {
++            uncrossed.note_compare(agreed(kva(i * G), 8, false));
++        }
++        assert_eq!(
++            uncrossed.gate(),
++            Err(GateRefusal::Unvalidated),
++            "no crossing"
++        );
++
++        validate(&mut state);
++        assert_eq!(state.gate().map(|r| r.ttbr1), Ok(L1));
++        assert_eq!(
++            state.policy(Mode::Strict).serve,
++            Serve::Walk(state.root.unwrap())
++        );
++    }
++
++    /// Validation belongs to one root in one boot: a changed root, or a reset,
++    /// starts it again.
++    #[test]
++    fn a_new_root_or_a_reset_starts_validation_again() {
++        let mut host = FakeHost::new();
++        give_root(&mut host, L1);
++        let mut state = KernelWalkState::default();
++        capture(&mut state, &host);
++        validate(&mut state);
++        assert!(state.gate().is_ok());
++
++        capture(&mut state, &host);
++        assert!(state.gate().is_ok(), "the same root keeps its validation");
++
++        give_root(&mut host, L1 + 0x10_0000);
++        capture(&mut state, &host);
++        assert_eq!(state.root.map(|r| r.ttbr1), Some(L1 + 0x10_0000));
++        assert_eq!(state.gate(), Err(GateRefusal::Unvalidated));
++
++        validate(&mut state);
++        state.reset();
++        assert_eq!(state.gate(), Err(GateRefusal::NoRoot));
++        assert_eq!(state.boot, 1);
++    }
++
++    #[test]
++    fn one_disagreement_retires_the_walk_until_the_root_changes() {
++        let mut host = FakeHost::new();
++        give_root(&mut host, L1);
++        let mut state = KernelWalkState::default();
++        capture(&mut state, &host);
++        validate(&mut state);
++        state.note_compare(WalkCompare::Mismatch {
++            kva: kva(0),
++            len: 8,
++            why: "bytes",
++        });
++        validate(&mut state);
++        assert_eq!(state.gate(), Err(GateRefusal::Mismatched));
++    }
++
++    /// The comparison itself: equal bytes agree, a different translation does
++    /// not, and a read the CPU answered but the walk cannot is a disagreement.
++    #[test]
++    fn a_comparison_names_agreement_by_bytes() {
++        let mut host = FakeHost::new();
++        let va = kva(0x20_0000_0000);
++        map_page(&mut host, va, 0x9_0000_0000);
++        host.map_range(0x9_0000_0000, G as usize, 0);
++        host.write_gpa(0x9_0000_0000, b"kernel!!").unwrap();
++        let r = root(L1);
++        assert_eq!(
++            compare(&host, &r, va, b"kernel!!"),
++            WalkCompare::Agreed {
++                kva: va,
++                len: 8,
++                nonzero: true,
++                crossed: false
++            }
++        );
++        assert!(matches!(
++            compare(&host, &r, va, b"elsewhere"[..8].as_ref()),
++            WalkCompare::Mismatch { why: "bytes", .. }
++        ));
++        assert!(matches!(
++            compare(&host, &r, va + G, b"unmapped"),
++            WalkCompare::Mismatch {
++                why: "kva_walk_fault",
++                ..
++            }
++        ));
++        assert_eq!(crossing_probe(&r, va + 0x10), Some((va + G - 8, 16)));
++    }
++}
+diff --git a/crates/reims-vgpu/src/runtime/mapper/mod.rs b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+index c5310e87..bde62db4 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/mod.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+@@ -140,28 +140,102 @@ fn capture_xreg_failed(
+ }
+ 
+ /// Adapter: mapper internals are KVA; page content GPAs use HostMemory.
++///
++/// A kernel address read on a vCPU goes through the CPU and, when a root has
++/// been captured, is also read through the software walk for runtime
++/// validation. Without a vCPU it is served by the walk, refused, or answered
++/// `NoCpu` as before, as [`crate::runtime::kernel_walk::WalkPolicy`] says.
+ struct MapperMem<'a, H: HostMemory + HostOps> {
+     host: &'a H,
+     last_error: std::cell::Cell<Option<MemError>>,
++    walk: crate::runtime::kernel_walk::WalkPolicy,
++    /// The first refusal without a vCPU, and the address it was for.
++    refused: std::cell::Cell<Option<(crate::runtime::kernel_walk::Refused, u64)>>,
++    log: Option<&'a std::cell::RefCell<crate::runtime::kernel_walk::WalkLog>>,
+ }
+ 
+ impl<'a, H: HostMemory + HostOps> MapperMem<'a, H> {
++    /// A reader that only runs on a vCPU and takes no part in the walk.
+     fn new(host: &'a H) -> Self {
++        Self::with_walk(host, crate::runtime::kernel_walk::WalkPolicy::OFF, None)
++    }
++
++    fn with_walk(
++        host: &'a H,
++        walk: crate::runtime::kernel_walk::WalkPolicy,
++        log: Option<&'a std::cell::RefCell<crate::runtime::kernel_walk::WalkLog>>,
++    ) -> Self {
+         Self {
+             host,
+             last_error: std::cell::Cell::new(None),
++            walk,
++            refused: std::cell::Cell::new(None),
++            log,
+         }
+     }
+ 
+     fn last_error(&self) -> Option<MemError> {
+         self.last_error.get()
+     }
++
++    fn refused(&self) -> Option<(crate::runtime::kernel_walk::Refused, u64)> {
++        self.refused.get()
++    }
++
++    fn read_kernel(&self, address: u64, dst: &mut [u8]) -> Result<(), MemError> {
++        use crate::runtime::kernel_walk::{self, Refused, Serve};
++        match self.host.read_kva(address, dst) {
++            Ok(()) => {
++                self.validate(address, dst);
++                Ok(())
++            }
++            Err(MemError::NoCpu) => {
++                let refusal = match self.walk.serve {
++                    Serve::Off => return Err(MemError::NoCpu),
++                    Serve::Walk(root) => match kernel_walk::read(self.host, &root, address, dst) {
++                        Ok(()) => return Ok(()),
++                        Err(why) => Refused::Walk(why),
++                    },
++                    Serve::Refuse(why) => Refused::Gate(why),
++                };
++                if self.refused.get().is_none() {
++                    self.refused.set(Some((refusal, address)));
++                }
++                Err(MemError::KernelWalkRefused)
++            }
++            Err(e) => Err(e),
++        }
++    }
++
++    /// Runtime validation: the bytes the CPU just read, read again through the
++    /// walk, and while no sample has yet crossed a page, a 16-byte read across
++    /// the end of this one through both.
++    fn validate(&self, address: u64, cpu: &[u8]) {
++        use crate::runtime::kernel_walk;
++        let (Some(root), Some(log)) = (self.walk.root, self.log) else {
++            return;
++        };
++        let mut log = log.borrow_mut();
++        log.compares
++            .push(kernel_walk::compare(self.host, &root, address, cpu));
++        if !self.walk.wants_crossing {
++            return;
++        }
++        let Some((at, len)) = kernel_walk::crossing_probe(&root, address) else {
++            return;
++        };
++        let mut probe = vec![0u8; len];
++        if self.host.read_kva(at, &mut probe).is_ok() {
++            log.compares
++                .push(kernel_walk::compare(self.host, &root, at, &probe));
++        }
++    }
+ }
+ 
+ impl<H: HostMemory + HostOps> PagesMemory for MapperMem<'_, H> {
+     fn read(&self, address: u64, dst: &mut [u8]) -> bool {
+         if guest_kernel_va(address) {
+-            match self.host.read_kva(address, dst) {
++            match self.read_kernel(address, dst) {
+                 Ok(()) => true,
+                 Err(e) => {
+                     self.last_error.set(Some(e));
+@@ -386,10 +460,29 @@ pub fn apply_capture(state: &mut DeviceState, cap: &MapperCapture, mapping_id: u
+ /// Resolve page table + device-descriptor geometry for a mapped slot.
+ ///
+ /// Safe to call repeatedly; refreshes pages when `mapping_internal` is set.
++/// Off a vCPU the re-read goes through [`crate::runtime::kernel_walk`] in the
++/// mode it is in, and what a vCPU read compared is folded into its runtime
++/// validation afterwards.
+ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
+     state: &mut DeviceState,
+     host: &H,
+     mapping_id: u32,
++) -> bool {
++    let walk = state
++        .kernel_walk
++        .policy(crate::runtime::kernel_walk::mode());
++    let log = std::cell::RefCell::new(crate::runtime::kernel_walk::WalkLog::default());
++    let resolved = resolve_mapping_backing_walked(state, host, mapping_id, walk, &log);
++    state.kernel_walk.fold(log.into_inner());
++    resolved
++}
++
++fn resolve_mapping_backing_walked<H: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &H,
++    mapping_id: u32,
++    walk: crate::runtime::kernel_walk::WalkPolicy,
++    log: &std::cell::RefCell<crate::runtime::kernel_walk::WalkLog>,
+ ) -> bool {
+     let Some(m) = state.mappings.get(&mapping_id) else {
+         return false;
+@@ -402,13 +495,21 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
+     let cached_pages = m.page_entries.len();
+     let cached_table = m.page_table_kva;
+     let had_cached_pages = cached_pages != 0;
+-    let mem = MapperMem::new(host);
++    let mem = MapperMem::with_walk(host, walk, Some(log));
+ 
+     let fields = match read_mapper_internal(&mem, internal, mapper != 0, mapper) {
+         Ok(f) => f,
+         Err(status) => {
+             let reason = refusal_reason(&status);
+             let host_error = mem.last_error();
++            // Off a vCPU in strict mode, a page list that could not be re-read
++            // is not one to keep writing through: refuse, and say when.
++            if let Some((why, kva)) = mem.refused() {
++                state
++                    .kernel_walk
++                    .note_refusal(mapping_id, cached_pages, why, kva);
++                return false;
++            }
+             let host_reason = host_error
+                 .map(|error| crate::observe::Decline::slug(&error))
+                 .unwrap_or("none");
+@@ -558,6 +659,11 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
+     let plan = match build_table_plan(&mem, mapping_id, &fields, min_size, state.page_shift) {
+         Ok(p) => p,
+         Err(status) => {
++            if let Some((why, kva)) = mem.refused() {
++                state
++                    .kernel_walk
++                    .note_refusal(mapping_id, cached_pages, why, kva);
++            }
+             // Still latch geom / device desc if we decoded them, even without pages yet.
+             if let Some(ref d) = device_desc {
+                 let _ = state.set_mapping_device_desc(mapping_id, d);
+diff --git a/crates/reims-vgpu/src/runtime/mapper/tests.rs b/crates/reims-vgpu/src/runtime/mapper/tests.rs
+index 2990036f..3176ace6 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/tests.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/tests.rs
+@@ -942,9 +942,38 @@ fn assert_revalidate_error_preserves_cached_page_plan(err: MemError) {
+     );
+ }
+ 
++/// The behaviour before `runtime::kernel_walk`, which compat mode keeps.
+ #[test]
+-fn revalidate_no_cpu_preserves_cached_page_plan() {
+-    assert_revalidate_error_preserves_cached_page_plan(MemError::NoCpu);
++fn revalidate_no_cpu_preserves_cached_page_plan_in_compat() {
++    crate::runtime::kernel_walk::with_mode(crate::runtime::kernel_walk::Mode::Compat, || {
++        assert_revalidate_error_preserves_cached_page_plan(MemError::NoCpu)
++    });
++}
++
++/// Strict mode with no root does not keep a page list it cannot re-read: the
++/// revalidation fails and the list is withdrawn, so no write goes through it.
++#[test]
++fn revalidate_no_cpu_without_a_root_withdraws_the_cached_page_plan_in_strict() {
++    crate::runtime::kernel_walk::with_mode(crate::runtime::kernel_walk::Mode::Strict, || {
++        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
++        let entry = (0x444u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
++        assert!(state.attach_mapping_internal(3, KVA));
++        {
++            let m = state.mappings.get_mut(&3).unwrap();
++            m.mapped = true;
++            m.page_entries = vec![entry];
++            m.page_table_kva = KVA + 0x3000;
++        }
++        let host = FailingKvaHost {
++            inner: FakeHost::new(),
++            err: MemError::NoCpu,
++        };
++        assert_eq!(
++            revalidate_mapping_reason(&mut state, &host, 3),
++            Some("revalidate_resolve_fail")
++        );
++        assert!(state.mappings[&3].page_entries.is_empty());
++    });
+ }
+ 
+ #[test]
+@@ -1228,3 +1257,288 @@ fn a_surface_colliding_with_several_control_structures_names_the_first() {
+         Some((0x660_000, "task_directory"))
+     );
+ }
++
++// MARK: - Kernel addresses without a vCPU
++
++mod kernel_walk_resolve {
++    use super::*;
++    use crate::runtime::kernel_walk::tests::{map_page, G, L1, SCTLR_ON, TCR_16K_47};
++    use crate::runtime::kernel_walk::{GateRefusal, SYSREG_BASE};
++
++    /// The mapper's kernel objects over three 16 KiB kernel pages — the
++    /// MappingInternal, its page table and its page object each in their own,
++    /// so runtime validation sees three — backed by guest pages elsewhere.
++    const A: u64 = KVA;
++    const B: u64 = KVA + G;
++    const C: u64 = KVA + 2 * G;
++    const BACKING: u64 = 0x3_0000_0000;
++    const MID: u32 = 5;
++
++    fn backing(kva: u64) -> u64 {
++        BACKING + (kva - A)
++    }
++
++    /// Write through the CPU's translation, one 16 KiB page at a time.
++    fn kput(host: &mut FakeHost, kva: u64, bytes: &[u8]) {
++        let mut done = 0usize;
++        while done < bytes.len() {
++            let at = kva + done as u64;
++            let page = host.kva_cpu_pages[&(at & !(G - 1))];
++            let n = ((G - (at & (G - 1))) as usize).min(bytes.len() - done);
++            host.write_gpa(page | (at & (G - 1)), &bytes[done..done + n])
++                .unwrap();
++            done += n;
++        }
++    }
++
++    /// Map one kernel page for both the CPU and the guest's stage-1 tables.
++    fn kmap(host: &mut FakeHost, kva_page: u64, gpa_page: u64) {
++        host.map_range(gpa_page, G as usize, 0);
++        host.kva_cpu_pages.insert(kva_page, gpa_page);
++        map_page(host, kva_page, gpa_page);
++    }
++
++    fn entry(pfn: u32) -> u32 {
++        (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
++    }
++
++    /// A one-page surface whose MappingInternal sits at `A`, page table at `B`
++    /// and page object at `C`; the CPU's translation and the guest's own
++    /// stage-1 tables agree, and the shim answers the translation root.
++    fn fixture(first_entry: u32) -> (DeviceState, FakeHost) {
++        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
++        let mut host = FakeHost::new();
++        host.map_range(BACKING, 3 * G as usize, 0);
++        for page in [A, B, C] {
++            host.kva_cpu_pages.insert(page, backing(page));
++            map_page(&mut host, page, backing(page));
++        }
++        let mapper = A + 0x1000;
++        kput(
++            &mut host,
++            A + MAPPING_INTERNAL_BACKPTR,
++            &mapper.to_le_bytes(),
++        );
++        kput(&mut host, A + MAPPING_INTERNAL_ID, &MID.to_le_bytes());
++        kput(
++            &mut host,
++            A + MAPPING_INTERNAL_SIZE,
++            &MAPPING_INTERNAL_EXPECTED_SIZE.to_le_bytes(),
++        );
++        kput(
++            &mut host,
++            A + iosurface_pages::MAPPING_INTERNAL_PAGE_FIELD_48,
++            &C.to_le_bytes(),
++        );
++        kput(
++            &mut host,
++            A + iosurface_pages::MAPPING_INTERNAL_PAGE_COUNT,
++            &1u64.to_le_bytes(),
++        );
++        kput(
++            &mut host,
++            C + iosurface_pages::MAPPING_PAGE_TABLE_FROM_F48,
++            &B.to_le_bytes(),
++        );
++        kput(&mut host, B, &first_entry.to_le_bytes());
++        // Kernel memory is rarely zero across a page boundary, and runtime
++        // validation does not count a sample that is.
++        kput(&mut host, A + G - 8, b"boundary");
++        for pfn in [0x2_1000u32, 0x2_2000] {
++            host.map_range(
++                u64::from(pfn) << PAGE_SHIFT_ARM64E,
++                PAGE_SIZE_ARM64E as usize,
++                0,
++            );
++        }
++        host.set_xreg(SYSREG_BASE, L1);
++        host.set_xreg(SYSREG_BASE + 1, TCR_16K_47);
++        host.set_xreg(SYSREG_BASE + 2, SCTLR_ON);
++        host.set_xreg(SYSREG_BASE + 3, 0);
++        state.mapper_device_kva = mapper;
++        assert!(state.attach_mapping_internal(MID, A));
++        crate::runtime::kernel_walk::capture(&mut state.kernel_walk, &host);
++        (state, host)
++    }
++
++    /// Resolve on the vCPU until runtime validation has passed.
++    fn validate_on_the_vcpu(state: &mut DeviceState, host: &FakeHost) {
++        for _ in 0..8 {
++            if state.kernel_walk.gate().is_ok() {
++                return;
++            }
++            let _ = resolve_mapping_backing(state, host, MID);
++        }
++        panic!("validation did not pass: {:?}", state.kernel_walk.gate());
++    }
++
++    #[test]
++    fn without_a_vcpu_the_walk_resolves_the_same_pages_the_cpu_did() {
++        let (mut state, mut host) = fixture(entry(0x2_1000));
++        assert!(resolve_mapping_backing(&mut state, &host, MID));
++        let on_cpu = state.mappings[&MID].page_entries.clone();
++        let generation = state.mappings[&MID].map_generation;
++        assert_eq!(on_cpu, vec![entry(0x2_1000)]);
++        validate_on_the_vcpu(&mut state, &host);
++
++        host.kva_no_cpu = true;
++        assert!(resolve_mapping_backing(&mut state, &host, MID));
++        assert_eq!(state.mappings[&MID].page_entries, on_cpu);
++        assert_eq!(state.mappings[&MID].map_generation, generation);
++    }
++
++    /// The blindness this exists to end: the guest re-points the surface and
++    /// the next resolve without a vCPU sees it, both when the mapper's own
++    /// page list changes and when the kernel page holding it is re-wired.
++    #[test]
++    fn a_rewire_is_seen_on_the_next_resolve_without_a_vcpu() {
++        let (mut state, mut host) = fixture(entry(0x2_1000));
++        validate_on_the_vcpu(&mut state, &host);
++        host.kva_no_cpu = true;
++        let generation = state.mappings[&MID].map_generation;
++
++        kput(&mut host, B, &entry(0x2_2000).to_le_bytes());
++        assert!(resolve_mapping_backing(&mut state, &host, MID));
++        assert_eq!(state.mappings[&MID].page_entries, vec![entry(0x2_2000)]);
++        assert_ne!(state.mappings[&MID].map_generation, generation);
++
++        // The kernel page holding the page table now lives elsewhere, with the
++        // first surface page in it again.
++        let moved = 0x3_1000_0000u64;
++        host.map_range(moved, G as usize, 0);
++        host.write_gpa(moved, &entry(0x2_1000).to_le_bytes())
++            .unwrap();
++        map_page(&mut host, B, moved);
++        assert!(resolve_mapping_backing(&mut state, &host, MID));
++        assert_eq!(state.mappings[&MID].page_entries, vec![entry(0x2_1000)]);
++    }
++
++    /// Runtime validation catching a walk that reads elsewhere than the CPU:
++    /// it is not used, and strict refuses rather than falling back.
++    #[test]
++    fn a_walk_that_disagrees_with_the_cpu_is_not_used() {
++        let (mut state, mut host) = fixture(entry(0x2_1000));
++        // The CPU now finds the page object somewhere the guest tables do not.
++        let elsewhere = 0x3_2000_0000u64;
++        host.map_range(elsewhere, G as usize, 0);
++        host.write_gpa(
++            elsewhere + iosurface_pages::MAPPING_PAGE_TABLE_FROM_F48,
++            &B.to_le_bytes(),
++        )
++        .unwrap();
++        host.write_gpa(elsewhere, b"cpu-only").unwrap();
++        host.kva_cpu_pages.insert(C, elsewhere);
++        let _ = resolve_mapping_backing(&mut state, &host, MID);
++        let _ = resolve_mapping_backing(&mut state, &host, MID);
++        assert_eq!(state.kernel_walk.gate(), Err(GateRefusal::Mismatched));
++
++        host.kva_no_cpu = true;
++        assert!(!resolve_mapping_backing(&mut state, &host, MID));
++    }
++
++    /// The 13.6 wallpaper's shape, from Codex's diagnostic on that boot:
++    /// `mapper_cached_holes mid=7 pages=9216 holes=4093 first_bad=3
++    /// last_bad=4095 table=0xfffffe551987c000`. The page table itself spans
++    /// three kernel pages, and the re-read without a vCPU has to walk to each
++    /// of them, not only to the surface's data pages.
++    #[test]
++    fn the_wallpapers_table_refills_its_holes_without_a_vcpu() {
++        const TABLE: u64 = 0xffff_fe55_1987_c000;
++        const PAGES: usize = 9216;
++        let (mut state, mut host) = fixture(entry(0x2_1000));
++        for i in 0..3 {
++            kmap(&mut host, TABLE + i * G, 0x3_4000_0000 + i * G);
++        }
++        kput(
++            &mut host,
++            C + iosurface_pages::MAPPING_PAGE_TABLE_FROM_F48,
++            &TABLE.to_le_bytes(),
++        );
++        kput(
++            &mut host,
++            A + iosurface_pages::MAPPING_INTERNAL_PAGE_COUNT,
++            &(PAGES as u64).to_le_bytes(),
++        );
++        let table = |holes: bool| -> Vec<u8> {
++            (0..PAGES as u32)
++                .map(|i| match holes && (3..=4095).contains(&i) {
++                    true => 0,
++                    false => entry(0x5_0000 + i),
++                })
++                .flat_map(u32::to_le_bytes)
++                .collect()
++        };
++        kput(&mut host, TABLE, &table(true));
++        let holes = |state: &DeviceState| {
++            state.mappings[&MID]
++                .page_entries
++                .iter()
++                .filter(|&&e| e & PAGE_ENTRY_VALID == 0)
++                .count()
++        };
++        validate_on_the_vcpu(&mut state, &host);
++        assert_eq!(state.mappings[&MID].page_entries.len(), PAGES);
++        assert_eq!(holes(&state), 4093);
++
++        host.kva_no_cpu = true;
++        kput(&mut host, TABLE, &table(false));
++        assert!(ensure_resolved_for_scanout(&mut state, &host, MID));
++        assert_eq!(holes(&state), 0);
++        assert_eq!(state.mappings[&MID].page_entries[3], entry(0x5_0003));
++    }
++
++    /// A page the guest had not wired at the first resolve is not a permanent
++    /// hole: once it is wired, the next resolve without a vCPU adopts it.
++    #[test]
++    fn a_hole_fills_once_the_guest_wires_it() {
++        let (mut state, mut host) = fixture(0);
++        validate_on_the_vcpu(&mut state, &host);
++        assert!(
++            state.mappings[&MID]
++                .page_entries
++                .iter()
++                .all(|&e| e & PAGE_ENTRY_VALID == 0),
++            "nothing wired yet: {:?}",
++            state.mappings[&MID].page_entries
++        );
++
++        host.kva_no_cpu = true;
++        kput(&mut host, B, &entry(0x2_1000).to_le_bytes());
++        assert!(resolve_mapping_backing(&mut state, &host, MID));
++        assert_eq!(state.mappings[&MID].page_entries, vec![entry(0x2_1000)]);
++    }
++
++    /// Strict, with no root — a shim that does not answer: the cached page list
++    /// is not written through. The re-read is refused, the mapping's pages are
++    /// withdrawn, and a write through it fails rather than being done.
++    #[test]
++    fn strict_refuses_a_write_it_cannot_reread() {
++        let (mut state, mut host) = fixture(entry(0x2_1000));
++        assert!(resolve_mapping_backing(&mut state, &host, MID));
++        state.kernel_walk = Default::default();
++        assert_eq!(state.kernel_walk.gate(), Err(GateRefusal::NoRoot));
++        let vouched = vouch_mapping_pages_verdict(&mut state, &host, MID)
++            .1
++            .expect("vouched on the vCPU");
++
++        host.kva_no_cpu = true;
++        let cap = crate::observe::sink::FailCapture::start();
++        assert!(!resolve_mapping_backing(&mut state, &host, MID));
++        assert_eq!(
++            revalidate_mapping_reason(&mut state, &host, MID),
++            Some("revalidate_resolve_fail")
++        );
++        assert!(state.mappings[&MID].page_entries.is_empty());
++        assert!(!write_mapping_bytes(
++            &mut state, &mut host, MID, 0, b"STALE", &vouched
++        ));
++        let mut page = [0u8; 5];
++        host.read_gpa(u64::from(0x2_1000u32) << PAGE_SHIFT_ARM64E, &mut page)
++            .unwrap();
++        assert_eq!(page, [0u8; 5]);
++        assert!(cap
++            .lines()
++            .iter()
++            .any(|l| l.contains("kva_walk_resolve_refused mapping=5 reason=kva_walk_no_root")));
++    }
++}
+diff --git a/crates/reims-vgpu/src/runtime/mmio.rs b/crates/reims-vgpu/src/runtime/mmio.rs
+index 1d55519f..b21c5b83 100644
+--- a/crates/reims-vgpu/src/runtime/mmio.rs
++++ b/crates/reims-vgpu/src/runtime/mmio.rs
+@@ -274,6 +274,9 @@ pub fn iosfc_write<H: HostMemory + HostOps>(
+             let producer = data as u32;
+             state.iosfc.producer = producer;
+             if state.iosfc.consumer != producer {
++                // The kernel translation root, on the vCPU and before anything
++                // below reads a kernel address. See `runtime::kernel_walk`.
++                crate::runtime::kernel_walk::capture(&mut state.kernel_walk, host);
+                 // Capture MappingInternal* while x19/x21/x22 still hold the
+                 // publishing vCPU's directed handoff.
+                 if let Some(cap) = mapper::capture_at_producer(state, host, producer) {
+diff --git a/crates/reims-vgpu/src/runtime/mod.rs b/crates/reims-vgpu/src/runtime/mod.rs
+index 7c92887b..c13676ba 100644
+--- a/crates/reims-vgpu/src/runtime/mod.rs
++++ b/crates/reims-vgpu/src/runtime/mod.rs
+@@ -111,6 +111,8 @@ pub mod released_pages;
+ /// Type-11 mappings that claim one guest page, held out of writing until the
+ /// guest says which one it released.
+ pub mod surface_quarantine;
++/// Guest kernel addresses translated in software for threads without a vCPU.
++pub mod kernel_walk;
+ /// Transfer a host-resident render frame into guest pages when synchronization
+ /// or a guest-memory reader makes the bytes observable.
+ pub mod render_writeback;
+-- 
+2.43.0
+

@@ -1,0 +1,1553 @@
+From f713d2eb5eccf69cf6db7d20221d9f95714c046e Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 14:50:30 +0800
+Subject: [PATCH 2/4] Believe 15.6.1, 14.6.1 and 13.6 in the wire watch, each
+ by its layout
+
+The watch and guard believed 27.2 and 26.6.2 only. The IPSW
+kernelcaches of the other three (~/forensics/layouts-old.txt on dgx)
+give two layouts:
+
+- 15.6.1 (24G90) runs 27.2's driver at every offset read here: the
+  0x98-byte MappingInternal with the surface descriptor at +0x20,
+  +0x48/+0x50 zero, the page-table descriptor at +0x58 and the page
+  count at +0x80.
+- 13.6 (22G120) and 14.6.1 (23G93) keep the older 0x78-byte one: +0x20
+  is the IOSurface, not a descriptor; the surface descriptor is the one
+  IOSurface::getMemoryDescriptor returns (+0x38 on 13.6, +0x30 on
+  14.6.1); the page-table descriptor is at +0x48, its mapping at +0x50,
+  the page count at +0x70. +0x58 holds the eviction deadline once the
+  mapping was completed and +0x60 is 1 when the table spans two pages,
+  so neither is a reserved zero.
+
+The IOMemoryDescriptor offsets are the same in all five.
+
+KNOWN_KERNELS pairs each exact version string with its layout. The
+string alone picks it, and a mapping that fails its kernel's layout is
+not tried against the other. On the unshifted layout the IOSurface must
+be one by its vtable: its address point lies a fixed distance above the
+kernel's Mach-O header, 0xa5ddc8 on 13.6 (__ZTV9IOSurface
+0xfffffe0007a65db8 + 0x10, header 0xfffffe0007008000) and 0xb0fde8 on
+14.6.1 (0xfffffe0007b17dd8 + 0x10). Those two were not in layouts-old
+or its excerpts; they were read for this from kernelcaches re-extracted
+from the IPSWs and deleted afterwards, and IOSurface's constructor
+stores exactly that address, signed. That the distance holds at run
+time rests on the boot kernel collection being slid as one unit (its
+chained fixups all count from one base); no 13.6 or 14.6.1 object was
+read. A mismatch is refused as iosurface_class with the distance seen.
+The surface descriptor's class is checked as before: the page-table
+descriptor's, inside the kernel's __DATA_CONST. Every layout now also
+checks MappingInternal +0x18 against the mapper device, as the resolve
+does; the +0x48/+0x50 zeros are checked on the shifted layout only.
+
+The chain, MappingInternal to IOSurface to both descriptors, is read
+twice back to back at every check and every sample, and is used only
+when both reads name the same objects (all but the counts, the driver's
+state word and the mixed data). When they differ nothing is concluded:
+OFF wire_watch inconclusive mapping= link= n= at=, counted, read again
+later. A failed read concludes nothing either, as before. A sample whose
+chain differs from the checked one is retired, as an id change was; it
+now covers the IOSurface and the descriptors' class and fields too. None
+of these is ever read as a count or condemns.
+
+Logs: wire_watch_kernel verified and layout_unverified scope=mapping
+name macos= and layout=; wire_watch map gains iosurface=; new mapping
+reasons mi_owner, iosurface_pointer, iosurface_class; the cost and unmap
+lines gain inconclusive=. On 26.6.2 and 27.2 the layout and checks are
+unchanged but for the owner check and the second read, and a descriptor
+reallocated under a checked mapping is now retired rather than read.
+
+Tests (runtime::mapper::wire_watch, --test-threads=1): 32 passed, 0
+failed; 5 new: 15.6.1 believed and guarded with the shifted layout;
+13.6 and 14.6.1 read through their IOSurface, a decoy at 13.6's +0x30
+passed over, surface and table drops found; non-zero and moving
++0x58/+0x60 on the unshifted layout pass and move nothing; seven
+mappings refused by name against their own kernel's layout only; and
+an object swapped between the two reads and back (13.6, 14.6.1, 27.2)
+is inconclusive, never a count, before a real drop is found. The 26.6.2
+test's mismatch loop now uses near misses of the known strings, and the
+layout breakages add mi_unshifted_layout and mi_owner. No guest was
+booted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/runtime/mapper/wire_watch.rs          | 645 ++++++++++++++----
+ .../src/runtime/mapper/wire_watch_tests.rs    | 483 ++++++++++++-
+ 2 files changed, 979 insertions(+), 149 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs b/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
+index 051707cf..ac86d759 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
+@@ -24,10 +24,14 @@
+ //!
+ //! # What it reads, and why it believes it
+ //!
+-//! The offsets below are 27.2's (26B123), inferred from the driver's code and
+-//! checked against both dumps. macOS 26.6.2 (25G83) has the same offsets, checked
+-//! on every wired mapping of one panic dump. Nothing here is trusted before it
+-//! is checked:
++//! The shifted layout is 27.2's (26B123), inferred from the driver's code and
++//! checked against both dumps; macOS 26.6.2 (25G83) has the same offsets,
++//! checked on every wired mapping of one panic dump, and 15.6.1 (24G90) the same
++//! code at every offset read here. 13.6 (22G120) and 14.6.1 (23G93) use the
++//! older, unshifted layout, with an `IOSurface` between the `MappingInternal`
++//! and the surface descriptor. Those three were read from the IPSW
++//! kernelcaches only (`~/forensics/layouts-old.txt` on dgx). Nothing here is
++//! trusted before it is checked:
+ //!
+ //! 1. The kernel. The Mach-O header of the kernel is found by stepping down
+ //!    page by page from `VBAR_EL1` (captured with the kernel root, see
+@@ -35,16 +39,25 @@
+ //!    `MH_EXECUTE` (26.6.2 has a kext's on the way); its `__TEXT` must start at
+ //!    the header itself, `VBAR_EL1` must lie in one of its segments (27.2 enters
+ //!    at `__TEXT_EXEC`'s start, 26.6.2 0x6000 into it), and `__TEXT,__const`
+-//!    must hold one of [`KNOWN_KERNEL_VERSIONS`] exactly. Any other kernel turns
+-//!    the watch off for the boot: 13.6 and 14.6.1 lay the mapping out
+-//!    differently, and 15.6.1 has not been checked.
+-//! 2. Each mapping. The `MappingInternal` must name the mapping's id, the
+-//!    `0x200` descriptor size and the page count this device resolved; the
+-//!    page-table descriptor's buffer must be the page table this device reads;
+-//!    the surface descriptor's length must be the mapping's size; both
++//!    must hold one of [`KNOWN_KERNELS`] exactly. That string, and nothing
++//!    else, picks the layout. Any other kernel turns the watch off for the boot.
++//! 2. Each mapping, against its kernel's layout and no other. The
++//!    `MappingInternal` must name the mapping's id, the `0x200` descriptor size,
++//!    the mapper device as its owner and the page count this device resolved;
++//!    on the shifted layout `+0x48` and `+0x50` must be zero. On the unshifted
++//!    layout `+0x20` must be an `IOSurface` by its vtable, at its known distance
++//!    from the kernel header, and the surface descriptor is the one it keeps.
++//!    The page-table descriptor's buffer must be the page table this device
++//!    reads; the surface descriptor's length must be the mapping's size; both
+ //!    descriptors must be initialised and of one kernel class. A mapping that
+ //!    fails any of these is not watched.
+ //!
++//! The chain is read twice, back to back, every time: once to check, once to
++//! see that nothing in it moved. When the two reads name different objects
++//! nothing is concluded (`wire_watch inconclusive`) and it is read again later.
++//! Once checked, every sample must name the same chain as the check; one that
++//! does not is retired, never read as a count.
++//!
+ //! A failed check is `wire_watch_layout_unverified`. A read that could not be
+ //! made — off a vCPU before the kernel walk validated — is not a failure and is
+ //! tried again; it is counted as `unreadable`.
+@@ -69,7 +82,8 @@
+ //! With `REIMS_VGPU_WIRE_GUARD` on as well, the first anomaly condemns the
+ //! mapping's incarnation (`wire_guard_condemned`): the guest completed a
+ //! descriptor it still had mapped, which on 27.2 is IOMFB cancelling a swap that
+-//! waited on this device past its five-second limit. From then on, for as long
++//! waited on this device past its five-second limit, and on 13.6 can also be
++//! its own `UNMAP` failing or timing out. From then on, for as long
+ //! as the `MappingInternal` is the same, every host write into it, CPU or GPU,
+ //! is refused (`wire_guard_refused`), its owed frame is dropped rather than
+ //! landed, and a display present naming it that was already published in its
+@@ -164,16 +178,64 @@ pub(crate) fn with_switches<R>(watch: bool, guard: bool, f: impl FnOnce() -> R)
+ 
+ // MARK: - Layout
+ 
+-/// `version[]` of macOS 27.2 (26B123), the kernel the offsets below were read
+-/// from.
++/// `version[]` of macOS 27.2 (26B123), the kernel the shifted offsets below
++/// were read from.
+ pub const KERNEL_VERSION_27_2: &str = "Darwin Kernel Version 27.2.0: Wed Oct 14 23:44:09 PDT \
+      2026; root:xnu-13432.41.4~25/RELEASE_ARM64_VMAPPLE";
+ /// `version[]` of macOS 26.6.2 (25G83), whose offsets are 27.2's; see
+ /// `~/forensics/layouts.txt` on dgx for what was checked.
+ pub const KERNEL_VERSION_26_6_2: &str = "Darwin Kernel Version 25.6.0: Fri Jul 31 19:16:43 PDT \
+      2026; root:xnu-12377.161.14~5/RELEASE_ARM64_VMAPPLE";
+-/// The kernels the watch believes, matched exactly.
+-pub const KNOWN_KERNEL_VERSIONS: [&str; 2] = [KERNEL_VERSION_27_2, KERNEL_VERSION_26_6_2];
++/// `version[]` of macOS 15.6.1 (24G90). Its driver is 27.2's at every offset
++/// the watch reads; see `~/forensics/layouts-old.txt` on dgx.
++pub const KERNEL_VERSION_15_6_1: &str = "Darwin Kernel Version 24.6.0: Mon Jul 14 11:30:18 PDT \
++     2025; root:xnu-11417.140.69~1/RELEASE_ARM64_VMAPPLE";
++/// `version[]` of macOS 14.6.1 (23G93), the unshifted layout.
++pub const KERNEL_VERSION_14_6_1: &str = "Darwin Kernel Version 23.6.0: Mon Jul 29 21:13:03 PDT \
++     2024; root:xnu-10063.141.2~1/RELEASE_ARM64_VMAPPLE";
++/// `version[]` of macOS 13.6 (22G120), the unshifted layout.
++pub const KERNEL_VERSION_13_6: &str = "Darwin Kernel Version 22.6.0: Fri Sep 15 13:39:33 PDT \
++     2023; root:xnu-8796.141.3.700.8~1/RELEASE_ARM64_VMAPPLE";
++
++/// A kernel the watch believes: its `version[]`, matched exactly, and the
++/// layout its driver gives a mapping.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct KnownKernel {
++    pub macos: &'static str,
++    pub version: &'static str,
++    layout: Layout,
++}
++
++/// The kernels the watch believes. The version string alone picks the
++/// layout; a mapping that fails its kernel's layout is not tried against the
++/// other one.
++pub const KNOWN_KERNELS: [KnownKernel; 5] = [
++    KnownKernel {
++        macos: "27.2",
++        version: KERNEL_VERSION_27_2,
++        layout: SHIFTED,
++    },
++    KnownKernel {
++        macos: "26.6.2",
++        version: KERNEL_VERSION_26_6_2,
++        layout: SHIFTED,
++    },
++    KnownKernel {
++        macos: "15.6.1",
++        version: KERNEL_VERSION_15_6_1,
++        layout: SHIFTED,
++    },
++    KnownKernel {
++        macos: "14.6.1",
++        version: KERNEL_VERSION_14_6_1,
++        layout: UNSHIFTED_14_6_1,
++    },
++    KnownKernel {
++        macos: "13.6",
++        version: KERNEL_VERSION_13_6,
++        layout: UNSHIFTED_13_6,
++    },
++];
+ const VERSION_PREFIX: &[u8] = b"Darwin Kernel Version ";
+ /// Longest version string read back for the log.
+ const VERSION_MAX: usize = 256;
+@@ -194,24 +256,96 @@ const TEXT_CONST_MAX: u64 = 8 << 20;
+ /// guess at the answer.
+ const KERNEL_SCAN_BYTES: u64 = 256 << 20;
+ 
+-/// `IOSurfaceParavirtMappingInternal`, 27.2 and 26.6.2. `+0x10` is the
+-/// driver's own `refs * 4 | wired` word, `+0x20` the surface descriptor,
+-/// `+0x58` the page-table descriptor (macOS 15 and later moved the page fields
+-/// by [`iosurface_pages::MAPPING_INTERNAL_SEQUOIA_SHIFT`]).
++/// `IOSurfaceParavirtMappingInternal`, the same in every known kernel up to
++/// the size word: `+0x10` is the driver's own `refs * 4 | wired` word, `+0x18`
++/// the mapper device that owns it, `+0x20` the surface (see [`SurfaceAt`]).
+ const MI_STATE: u64 = 0x10;
+-const MI_SURFACE_IOMD: u64 = 0x20;
++const MI_OWNER: u64 = iosurface_pages::MAPPING_INTERNAL_BACKPTR;
++const MI_OBJECT: u64 = 0x20;
+ const MI_ID: u64 = iosurface_pages::MAPPING_INTERNAL_ID;
+ const MI_SIZE: u64 = iosurface_pages::MAPPING_INTERNAL_SIZE;
+-const MI_FIELD_48: u64 = iosurface_pages::MAPPING_INTERNAL_PAGE_FIELD_48;
+-const MI_FIELD_50: u64 = iosurface_pages::MAPPING_INTERNAL_PAGE_FIELD_50;
+-const MI_TABLE_IOMD: u64 = iosurface_pages::MAPPING_INTERNAL_PAGE_FIELD_48
+-    + iosurface_pages::MAPPING_INTERNAL_SEQUOIA_SHIFT;
+-const MI_PAGE_COUNT: u64 =
+-    iosurface_pages::MAPPING_INTERNAL_PAGE_COUNT + iosurface_pages::MAPPING_INTERNAL_SEQUOIA_SHIFT;
+-/// One read covers every field above.
+-const MI_WINDOW: std::ops::Range<u64> = MI_STATE..MI_PAGE_COUNT + 8;
+-
+-/// `IOBufferMemoryDescriptor` on 27.2's and 26.6.2's xnu:
++
++/// Where one kernel's driver keeps the fields the watch reads past the size
++/// word.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Layout {
++    name: &'static str,
++    surface: SurfaceAt,
++    table_iomd: u64,
++    page_count: u64,
++    /// Two fields this layout leaves zero on every mapping this device sees,
++    /// where it has such fields.
++    reserved_zero: Option<(u64, u64)>,
++}
++
++/// What `MappingInternal +0x20` holds.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum SurfaceAt {
++    /// The surface's descriptor itself, which 15.6.1 and later cache there.
++    Descriptor,
++    /// The `IOSurface`. Its descriptor is the pointer at `descriptor` in it
++    /// (`IOSurface::getMemoryDescriptor`), and its class is told by its vtable,
++    /// whose address point lies `vtable_from_header` above the kernel's Mach-O
++    /// header: the boot kernel collection's chained fixups all count from one
++    /// base, so the booter slides its kexts with the kernel and the distance
++    /// read from the IPSW kernelcache holds at run time.
++    IoSurface {
++        descriptor: u64,
++        vtable_from_header: u64,
++    },
++}
++
++/// 15.6.1, 26.6.2 and 27.2: a 0x98-byte `MappingInternal` with the surface
++/// descriptor at `+0x20`, `+0x48`/`+0x50` zero, the page-table descriptor at
++/// `+0x58` and the page count at `+0x80` (macOS 15 moved the page fields by
++/// [`iosurface_pages::MAPPING_INTERNAL_SEQUOIA_SHIFT`]).
++const SHIFTED: Layout = Layout {
++    name: "shifted",
++    surface: SurfaceAt::Descriptor,
++    table_iomd: iosurface_pages::MAPPING_INTERNAL_PAGE_FIELD_48
++        + iosurface_pages::MAPPING_INTERNAL_SEQUOIA_SHIFT,
++    page_count: iosurface_pages::MAPPING_INTERNAL_PAGE_COUNT
++        + iosurface_pages::MAPPING_INTERNAL_SEQUOIA_SHIFT,
++    reserved_zero: Some((
++        iosurface_pages::MAPPING_INTERNAL_PAGE_FIELD_48,
++        iosurface_pages::MAPPING_INTERNAL_PAGE_FIELD_50,
++    )),
++};
++
++/// 13.6 and 14.6.1: a 0x78-byte `MappingInternal` with an `IOSurface` at
++/// `+0x20`, the page-table descriptor at `+0x48`, its mapping at `+0x50`, and
++/// the page count at `+0x70`. Nothing here is reserved: `+0x58` holds the
++/// eviction deadline from the first `complete()` on, and `+0x60` is 1 once the
++/// page table spans two pages.
++const fn unshifted(name: &'static str, descriptor: u64, vtable_from_header: u64) -> Layout {
++    Layout {
++        name,
++        surface: SurfaceAt::IoSurface {
++            descriptor,
++            vtable_from_header,
++        },
++        table_iomd: iosurface_pages::MAPPING_INTERNAL_PAGE_FIELD_48,
++        page_count: iosurface_pages::MAPPING_INTERNAL_PAGE_COUNT,
++        reserved_zero: None,
++    }
++}
++
++/// 14.6.1's `IOSurface` keeps its descriptor at `+0x30`; `__ZTV9IOSurface` is
++/// at 0xfffffe0007b17dd8 in its kernelcache, header 0xfffffe0007008000, and the
++/// constructor stores the symbol plus 0x10.
++const UNSHIFTED_14_6_1: Layout = unshifted("unshifted", 0x30, 0xb0_fde8);
++/// 13.6's keeps it at `+0x38` (`+0x30` reads zero there);
++/// `__ZTV9IOSurface` is at 0xfffffe0007a65db8, header 0xfffffe0007008000.
++const UNSHIFTED_13_6: Layout = unshifted("unshifted", 0x38, 0xa5_ddc8);
++
++impl Layout {
++    /// One read of the `MappingInternal` covers every field the layout names.
++    fn mi_window(&self) -> std::ops::Range<u64> {
++        MI_STATE..self.page_count + 8
++    }
++}
++
++/// `IOBufferMemoryDescriptor` in every known kernel's xnu:
+ /// `IOMemoryDescriptor::_length`, `IOGeneralMemoryDescriptor::_task`,
+ /// `_wireCount`, `_initialized`, `_memoryEntries`, `_pages`, and
+ /// `IOBufferMemoryDescriptor::_buffer`.
+@@ -421,11 +555,12 @@ impl std::fmt::Display for WriteNote {
+ 
+ // MARK: - State
+ 
+-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ struct KernelImage {
+     header: u64,
+     data_const: (u64, u64),
+     va_bits: u32,
++    kernel: KnownKernel,
+ }
+ 
+ #[derive(Clone, Debug, Default, PartialEq, Eq)]
+@@ -528,11 +663,11 @@ impl IomdFields {
+ struct Watched {
+     internal: u64,
+     phase: Phase,
+-    surface_iomd: u64,
+-    table_iomd: u64,
+-    pages: u64,
+-    surface_fields: IomdFields,
+-    table_fields: IomdFields,
++    /// The chain as it was checked, which every sample must read again.
++    checked: Chain,
++    /// Samples whose two reads of the chain disagreed, and the lines said.
++    inconclusive: u64,
++    inconclusive_lines: u32,
+     /// `None` when the layout was checked after `MAP`, so the `MAP`-time value
+     /// was never seen.
+     at_map: Option<Counts>,
+@@ -599,11 +734,9 @@ impl Watched {
+         Self {
+             internal,
+             phase: Phase::Pending,
+-            surface_iomd: 0,
+-            table_iomd: 0,
+-            pages: 0,
+-            surface_fields: IomdFields::default(),
+-            table_fields: IomdFields::default(),
++            checked: Chain::default(),
++            inconclusive: 0,
++            inconclusive_lines: 0,
+             at_map: None,
+             last: Counts::default(),
+             display: false,
+@@ -638,6 +771,7 @@ struct Cost {
+     debts_dropped: u64,
+     swaps_refused: u64,
+     reads_refused: u64,
++    inconclusive: u64,
+ }
+ 
+ /// The watch's state for one boot. Lives in [`DeviceState`] and is replaced
+@@ -720,7 +854,8 @@ impl WireWatch {
+         format!(
+             "wire_watch_cost boot={boot} watched={} samples={} reads={} unreadable={} us={} \
+              transitions={} anomalies={} guard_refused={} condemned={} debts_dropped={} \
+-             swaps_refused={} reads_refused={} peeks={} unstamped_dropped={} kernel={}",
++             swaps_refused={} reads_refused={} peeks={} unstamped_dropped={} kernel={} \
++             inconclusive={}",
+             self.watched.len(),
+             c.samples,
+             c.reads,
+@@ -739,9 +874,17 @@ impl WireWatch {
+                 KernelCheck::Unchecked => "unchecked",
+                 KernelCheck::Verified(_) => "verified",
+                 KernelCheck::Unverified => "unverified",
+-            }
++            },
++            c.inconclusive
+         )
+     }
++
++    fn image(&self) -> Option<KernelImage> {
++        match self.kernel {
++            KernelCheck::Verified(image) => Some(image),
++            _ => None,
++        }
++    }
+ }
+ 
+ // MARK: - Reading
+@@ -795,32 +938,41 @@ impl<'a, H: HostMemory + HostOps> Reader<'a, H> {
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+ struct MiFields {
+     state: u32,
+-    surface: u64,
++    owner: u64,
++    /// `+0x20`: the surface descriptor or the `IOSurface`, by layout.
++    object: u64,
+     id: u32,
+     size: u32,
+-    field_48: u64,
+-    field_50: u64,
++    /// The layout's two reserved fields; zero where it has none.
++    reserved: (u64, u64),
+     table: u64,
+     pages: u64,
+ }
+ 
+-fn read_mi<H: HostMemory + HostOps>(rd: &Reader<'_, H>, internal: u64) -> Option<MiFields> {
+-    let mut b = [0u8; (MI_WINDOW.end - MI_WINDOW.start) as usize];
+-    if !rd.bytes(internal.checked_add(MI_WINDOW.start)?, &mut b) {
++fn read_mi<H: HostMemory + HostOps>(
++    rd: &Reader<'_, H>,
++    layout: &Layout,
++    internal: u64,
++) -> Option<MiFields> {
++    let window = layout.mi_window();
++    let mut b = vec![0u8; (window.end - window.start) as usize];
++    if !rd.bytes(internal.checked_add(window.start)?, &mut b) {
+         return None;
+     }
+-    let at = |o: u64| (o - MI_WINDOW.start) as usize;
++    let at = |o: u64| (o - window.start) as usize;
+     let u64_at = |o: u64| u64::from_le_bytes(b[at(o)..at(o) + 8].try_into().unwrap());
+     let u32_at = |o: u64| u32::from_le_bytes(b[at(o)..at(o) + 4].try_into().unwrap());
+     Some(MiFields {
+         state: u32_at(MI_STATE),
+-        surface: u64_at(MI_SURFACE_IOMD),
++        owner: u64_at(MI_OWNER),
++        object: u64_at(MI_OBJECT),
+         id: u32_at(MI_ID),
+         size: u32_at(MI_SIZE),
+-        field_48: u64_at(MI_FIELD_48),
+-        field_50: u64_at(MI_FIELD_50),
+-        table: u64_at(MI_TABLE_IOMD),
+-        pages: u64_at(MI_PAGE_COUNT),
++        reserved: layout
++            .reserved_zero
++            .map_or((0, 0), |(a, b)| (u64_at(a), u64_at(b))),
++        table: u64_at(layout.table_iomd),
++        pages: u64_at(layout.page_count),
+     })
+ }
+ 
+@@ -829,6 +981,147 @@ fn read_iomd<H: HostMemory + HostOps>(rd: &Reader<'_, H>, iomd: u64) -> Option<I
+     rd.bytes(iomd, &mut b).then(|| IomdFields::decode(&b))
+ }
+ 
++/// An `IOSurface`'s vtable and the descriptor pointer it keeps.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++struct IoSurfaceFields {
++    vtable: u64,
++    descriptor: u64,
++}
++
++/// One read of a mapping's whole chain: the `MappingInternal`, the
++/// `IOSurface` where the layout puts one between it and the surface
++/// descriptor, and both descriptors with their counts. A pointer that is not a
++/// kernel address is not followed, and what it would have led to reads as zero.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++struct Chain {
++    mi: MiFields,
++    iosurface: Option<IoSurfaceFields>,
++    surface_iomd: u64,
++    surface: IomdFields,
++    table: IomdFields,
++}
++
++impl Chain {
++    fn counts(&self) -> Counts {
++        Counts {
++            surface: self.surface.wire,
++            table: self.table.wire,
++            mi_state: self.mi.state,
++        }
++    }
++
++    /// The first link that names another object than in `other`, or `None`.
++    /// The counts, the driver's state word and the mixed data are the guest's to
++    /// move and are not compared.
++    fn moved_from(&self, other: &Self) -> Option<&'static str> {
++        let identity = |m: &MiFields| MiFields { state: 0, ..*m };
++        if identity(&self.mi) != identity(&other.mi) {
++            Some("mapping_internal")
++        } else if self.iosurface != other.iosurface {
++            Some("iosurface")
++        } else if self.surface_iomd != other.surface_iomd
++            || !self
++                .surface
++                .differs_besides_wiring(&other.surface)
++                .is_empty()
++        {
++            Some("surface_iomd")
++        } else if !self.table.differs_besides_wiring(&other.table).is_empty() {
++            Some("table_iomd")
++        } else {
++            None
++        }
++    }
++
++    /// The chain's pointers, for the log.
++    fn named(&self) -> String {
++        format!(
++            "id={} owner={:#x} object={:#x} iosurface_vtable={} surface_iomd={:#x} table_iomd={:#x} \
++             surface_vtable={:#x} table_vtable={:#x}",
++            self.mi.id,
++            self.mi.owner,
++            self.mi.object,
++            self.iosurface
++                .map_or_else(|| "-".to_string(), |s| format!("{:#x}", s.vtable)),
++            self.surface_iomd,
++            self.mi.table,
++            self.surface.vtable,
++            self.table.vtable
++        )
++    }
++}
++
++fn read_chain<H: HostMemory + HostOps>(
++    rd: &Reader<'_, H>,
++    layout: &Layout,
++    internal: u64,
++) -> Option<Chain> {
++    let mi = read_mi(rd, layout, internal)?;
++    let (iosurface, surface_iomd) = match layout.surface {
++        SurfaceAt::Descriptor => (None, mi.object),
++        SurfaceAt::IoSurface { descriptor, .. } => {
++            let mut s = IoSurfaceFields::default();
++            if guest_kernel_va(mi.object) {
++                let mut b = vec![0u8; descriptor as usize + 8];
++                if !rd.bytes(mi.object, &mut b) {
++                    return None;
++                }
++                let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
++                s = IoSurfaceFields {
++                    vtable: u64_at(0),
++                    descriptor: u64_at(descriptor as usize),
++                };
++            }
++            (Some(s), s.descriptor)
++        }
++    };
++    let iomd = |at: u64| {
++        if guest_kernel_va(at) {
++            read_iomd(rd, at)
++        } else {
++            Some(IomdFields::default())
++        }
++    };
++    Some(Chain {
++        mi,
++        iosurface,
++        surface_iomd,
++        surface: iomd(surface_iomd)?,
++        table: iomd(mi.table)?,
++    })
++}
++
++/// What two reads of a chain say.
++enum Sandwich {
++    /// Both reads named the same objects; the counts are the first read's,
++    /// which lie between the two.
++    Same(Chain),
++    /// Something in the chain named another object at the second read than
++    /// at the first. Nothing is concluded; it is read again later.
++    Moved(&'static str),
++    /// A read failed. Nothing is concluded either.
++    Unreadable,
++}
++
++/// The chain read twice. Only a chain both reads agree on is ever checked or
++/// compared, so a count is never taken from an object swapped in mid-read.
++fn read_sandwich<H: HostMemory + HostOps>(
++    rd: &Reader<'_, H>,
++    layout: &Layout,
++    internal: u64,
++) -> Sandwich {
++    let (Some(first), Some(second)) = (
++        read_chain(rd, layout, internal),
++        read_chain(rd, layout, internal),
++    ) else {
++        return Sandwich::Unreadable;
++    };
++    match first.moved_from(&second) {
++        Some(link) => Sandwich::Moved(link),
++        None => Sandwich::Same(first),
++    }
++}
++
+ /// The length word of a descriptor's mixed-data object, for the log.
+ fn mixed_data_len<H: HostMemory + HostOps>(rd: &Reader<'_, H>, iomd: u64) -> String {
+     rd.u64(iomd + IOMD_MEMORY_ENTRIES)
+@@ -1015,16 +1308,17 @@ fn check_kernel<H: HostMemory + HostOps>(
+             }
+         })
+         .collect();
+-    if !KNOWN_KERNEL_VERSIONS.contains(&version.as_str()) {
++    let Some(kernel) = KNOWN_KERNELS.iter().find(|k| k.version == version) else {
+         return KernelVerdict::Wrong(
+             "kernel_version_mismatch",
+             format!("version=\"{version}\" {at_header}"),
+         );
+-    }
++    };
+     let image = KernelImage {
+         header,
+         data_const: (dc, dc.saturating_add(dc_len)),
+         va_bits,
++        kernel: *kernel,
+     };
+     KernelVerdict::Verified(image, version, scanned)
+ }
+@@ -1045,8 +1339,11 @@ fn kernel_image<H: HostMemory + HostOps>(
+     match check_kernel(rd, &root, state.page_size()) {
+         KernelVerdict::Verified(image, version, scanned) => {
+             crate::observe::off(format!(
+-                "wire_watch_kernel verified version=\"{version}\" header={:#x} vbar={:#x} \
+-                 data_const={:#x}..{:#x} va_bits={} scanned_pages={scanned} us={}",
++                "wire_watch_kernel verified version=\"{version}\" macos={} layout={} \
++                 header={:#x} vbar={:#x} data_const={:#x}..{:#x} va_bits={} \
++                 scanned_pages={scanned} us={}",
++                image.kernel.macos,
++                image.kernel.layout.name,
+                 image.header,
+                 root.vbar.unwrap_or(0),
+                 image.data_const.0,
+@@ -1061,7 +1358,7 @@ fn kernel_image<H: HostMemory + HostOps>(
+             crate::observe::fail(format!(
+                 "wire_watch_layout_unverified scope=kernel reason={reason} {seen} expected=\"{}\" \
+                  (the watch is off for this boot)",
+-                KNOWN_KERNEL_VERSIONS.join("\" | \"")
++                KNOWN_KERNELS.map(|k| k.version).join("\" | \"")
+             ));
+             ww.kernel = KernelCheck::Unverified;
+             None
+@@ -1072,11 +1369,18 @@ fn kernel_image<H: HostMemory + HostOps>(
+ 
+ // MARK: - Mapping layout
+ 
+-/// A `MappingInternal` and its surface and page-table descriptors, checked.
+-type Checked = (MiFields, IomdFields, IomdFields);
++/// What a check of one mapping's layout came to, short of a refusal.
++enum Checked {
++    /// Passed: the chain, as both reads named it.
++    Passed(Chain),
++    /// Not resolved yet, or a read failed: checked again later.
++    NotYet,
++    /// The two reads disagreed at this link: checked again later.
++    Moved(&'static str),
++}
+ 
+-/// The checks of the module doc, on one mapping. `Err` names the first that
+-/// failed; `Ok(None)` is a read that could not be made yet.
++/// The checks of the module doc, on one mapping, against the layout its
++/// kernel was believed for. `Err` names the first that failed.
+ fn check_mapping<H: HostMemory + HostOps>(
+     rd: &Reader<'_, H>,
+     state: &DeviceState,
+@@ -1084,16 +1388,26 @@ fn check_mapping<H: HostMemory + HostOps>(
+     mapping_id: u32,
+     internal: u64,
+     at_map: bool,
+-) -> Result<Option<Checked>, (&'static str, String)> {
++) -> Result<Checked, (&'static str, String)> {
+     let Some(m) = state.mappings.get(&mapping_id) else {
+-        return Ok(None);
++        return Ok(Checked::NotYet);
+     };
+     if m.page_entries.is_empty() || m.page_table_kva == 0 {
+-        return Ok(None);
++        return Ok(Checked::NotYet);
+     }
+-    let Some(mi) = read_mi(rd, internal) else {
+-        return Ok(None);
++    let layout = image.kernel.layout;
++    let chain = match read_sandwich(rd, &layout, internal) {
++        Sandwich::Same(chain) => chain,
++        Sandwich::Moved(link) => return Ok(Checked::Moved(link)),
++        Sandwich::Unreadable => return Ok(Checked::NotYet),
+     };
++    let Chain {
++        mi,
++        iosurface,
++        surface_iomd,
++        surface,
++        table,
++    } = chain;
+     let pages = m.page_entries.len() as u64;
+     let seen = |what: String| format!("internal={internal:#x} {what}");
+     if mi.id != mapping_id {
+@@ -1102,10 +1416,20 @@ fn check_mapping<H: HostMemory + HostOps>(
+     if mi.size != MAPPING_INTERNAL_EXPECTED_SIZE {
+         return Err(("mi_size", seen(format!("size={:#x}", mi.size))));
+     }
+-    if mi.field_48 != 0 || mi.field_50 != 0 {
++    // The resolve checks the same back pointer when it knows the device.
++    if state.mapper_device_kva != 0 && mi.owner != state.mapper_device_kva {
++        return Err((
++            "mi_owner",
++            seen(format!(
++                "owner={:#x} mapper_device={:#x}",
++                mi.owner, state.mapper_device_kva
++            )),
++        ));
++    }
++    if layout.reserved_zero.is_some() && mi.reserved != (0, 0) {
+         return Err((
+             "mi_unshifted_layout",
+-            seen(format!("f48={:#x} f50={:#x}", mi.field_48, mi.field_50)),
++            seen(format!("f48={:#x} f50={:#x}", mi.reserved.0, mi.reserved.1)),
+         ));
+     }
+     if mi.pages != pages {
+@@ -1114,19 +1438,51 @@ fn check_mapping<H: HostMemory + HostOps>(
+             seen(format!("mi_pages={} device_pages={pages}", mi.pages)),
+         ));
+     }
+-    if !guest_kernel_va(mi.surface) || !guest_kernel_va(mi.table) || mi.surface == mi.table {
++    if let (
++        Some(s),
++        SurfaceAt::IoSurface {
++            vtable_from_header, ..
++        },
++    ) = (iosurface, layout.surface)
++    {
++        if !guest_kernel_va(mi.object) || mi.object == mi.table {
++            return Err((
++                "iosurface_pointer",
++                seen(format!("iosurface={:#x} table={:#x}", mi.object, mi.table)),
++            ));
++        }
++        let want = image.header.wrapping_add(vtable_from_header);
++        let got = strip(s.vtable, image.va_bits);
++        if got != want {
++            return Err((
++                "iosurface_class",
++                seen(format!(
++                    "iosurface={:#x} vtable={got:#x} expected={want:#x} from_header={:#x}",
++                    mi.object,
++                    got.wrapping_sub(image.header)
++                )),
++            ));
++        }
++    }
++    // Under an `IOSurface`, its descriptor is a third object.
++    let surface_is_apart = iosurface.is_none() || surface_iomd != mi.object;
++    if !guest_kernel_va(surface_iomd)
++        || !guest_kernel_va(mi.table)
++        || surface_iomd == mi.table
++        || !surface_is_apart
++    {
+         return Err((
+             "iomd_pointer",
+-            seen(format!("surface={:#x} table={:#x}", mi.surface, mi.table)),
++            seen(format!(
++                "surface={surface_iomd:#x} table={:#x} object={:#x}",
++                mi.table, mi.object
++            )),
+         ));
+     }
+-    let (Some(surface), Some(table)) = (read_iomd(rd, mi.surface), read_iomd(rd, mi.table)) else {
+-        return Ok(None);
+-    };
+     let iomds = |what: String| {
+         seen(format!(
+-            "surface_iomd={:#x} table_iomd={:#x} {what}",
+-            mi.surface, mi.table
++            "surface_iomd={surface_iomd:#x} table_iomd={:#x} {what}",
++            mi.table
+         ))
+     };
+     if table.buffer != m.page_table_kva {
+@@ -1186,7 +1542,7 @@ fn check_mapping<H: HostMemory + HostOps>(
+             )),
+         ));
+     }
+-    Ok(Some((mi, surface, table)))
++    Ok(Checked::Passed(chain))
+ }
+ 
+ /// Check a pending mapping's layout, and start watching it when it passes.
+@@ -1208,54 +1564,55 @@ fn activate<H: HostMemory + HostOps>(
+     };
+     let internal = w.internal;
+     match check_mapping(rd, state, &image, mapping_id, internal, at_map) {
+-        Ok(None) => {}
++        Ok(Checked::NotYet) => {}
++        Ok(Checked::Moved(link)) => {
++            note_inconclusive(ww, mapping_id, link, if at_map { "map" } else { "late" });
++        }
+         Err((reason, seen)) => {
+             ww.watched.remove(&mapping_id);
+             if ww.unverified.insert((mapping_id, internal)) {
+                 crate::observe::fail(format!(
+                     "wire_watch_layout_unverified scope=mapping mapping={mapping_id} \
+-                     reason={reason} {seen} (this mapping is not watched)"
++                     reason={reason} macos={} layout={} {seen} (this mapping is not watched)",
++                    image.kernel.macos, image.kernel.layout.name
+                 ));
+             }
+         }
+-        Ok(Some((mi, surface, table))) => {
+-            let counts = Counts {
+-                surface: surface.wire,
+-                table: table.wire,
+-                mi_state: mi.state,
+-            };
++        Ok(Checked::Passed(chain)) => {
++            let counts = chain.counts();
+             let gen = state
+                 .mappings
+                 .get(&mapping_id)
+                 .map_or(0, |m| m.map_generation);
+             let event = ww.push(Ev::Map {
+                 mapping: mapping_id,
+-                surface: surface.wire,
+-                table: table.wire,
++                surface: counts.surface,
++                table: counts.table,
+             });
+             crate::observe::off(format!(
+                 "wire_watch map mapping={mapping_id} internal={internal:#x} surface_iomd={:#x} \
+                  table_iomd={:#x} surface_wire={} table_wire={} mi_state={:#x} pages={} \
+-                 length={:#x} md_len={} gen={gen} at={} seq={} t_us={}",
+-                mi.surface,
+-                mi.table,
+-                surface.wire as i32,
+-                table.wire as i32,
+-                mi.state,
+-                mi.pages,
+-                surface.length,
+-                mixed_data_len(rd, mi.surface),
++                 length={:#x} md_len={} gen={gen} at={} seq={} t_us={} iosurface={}",
++                chain.surface_iomd,
++                chain.mi.table,
++                counts.surface as i32,
++                counts.table as i32,
++                chain.mi.state,
++                chain.mi.pages,
++                chain.surface.length,
++                mixed_data_len(rd, chain.surface_iomd),
+                 if at_map { "map" } else { "late" },
+                 event.seq,
+-                event.t_us
++                event.t_us,
++                if chain.iosurface.is_some() {
++                    format!("{:#x}", chain.mi.object)
++                } else {
++                    "-".to_string()
++                }
+             ));
+             let w = ww.watched.get_mut(&mapping_id).expect("looked up above");
+             w.phase = Phase::Active;
+-            w.surface_iomd = mi.surface;
+-            w.table_iomd = mi.table;
+-            w.pages = mi.pages;
+-            w.surface_fields = surface;
+-            w.table_fields = table;
++            w.checked = chain;
+             w.at_map = at_map.then_some(counts);
+             w.last = counts;
+             w.sampled_us = Some(now_us());
+@@ -1275,6 +1632,26 @@ fn activate<H: HostMemory + HostOps>(
+     }
+ }
+ 
++/// Two reads of a chain disagreed: nothing is concluded from either. Counted,
++/// and said at the first and each power of two after it.
++fn note_inconclusive(ww: &mut WireWatch, mapping_id: u32, link: &'static str, at: &str) {
++    ww.cost.inconclusive += 1;
++    let Some(w) = ww.watched.get_mut(&mapping_id) else {
++        return;
++    };
++    w.inconclusive += 1;
++    if w.inconclusive.is_power_of_two() && w.inconclusive_lines < LINES_PER_MAPPING {
++        w.inconclusive_lines += 1;
++        crate::observe::off(format!(
++            "wire_watch inconclusive mapping={mapping_id} internal={:#x} link={link} n={} at={at} \
++             t_us={} (the two reads of the chain named different objects; read again later)",
++            w.internal,
++            w.inconclusive,
++            now_us()
++        ));
++    }
++}
++
+ // MARK: - Sampling
+ 
+ /// Read one watched mapping's counts and report what moved. `false` when the
+@@ -1306,36 +1683,39 @@ fn sample_one<H: HostMemory + HostOps>(
+         }
+         Some(_) => {}
+     }
+-    if w.phase == Phase::Pending {
+-        activate(ww, rd, state, mapping_id, false);
+-        return false;
++    match w.phase {
++        Phase::Pending => {
++            activate(ww, rd, state, mapping_id, false);
++            return false;
++        }
++        Phase::Active => {}
+     }
+-    let (internal, surface_iomd, table_iomd) = (w.internal, w.surface_iomd, w.table_iomd);
+-    ww.cost.samples += 1;
+-    let Some(mi) = read_mi(rd, internal) else {
++    let Some(image) = ww.image() else {
+         return false;
+     };
+-    if mi.id != mapping_id || mi.surface != surface_iomd || mi.table != table_iomd {
++    let (internal, checked) = (w.internal, w.checked);
++    ww.cost.samples += 1;
++    let chain = match read_sandwich(rd, &image.kernel.layout, internal) {
++        Sandwich::Same(chain) => chain,
++        Sandwich::Moved(link) => {
++            note_inconclusive(ww, mapping_id, link, at);
++            return false;
++        }
++        Sandwich::Unreadable => return false,
++    };
++    if let Some(link) = chain.moved_from(&checked) {
+         retire(
+             ww,
+             &format!(
+-                "internal_changed id={} surface={:#x} table={:#x}",
+-                mi.id, mi.surface, mi.table
++                "internal_changed link={link} now=[{}] checked=[{}]",
++                chain.named(),
++                checked.named()
+             ),
+         );
+         return false;
+     }
+-    let (Some(surface), Some(table)) = (
+-        rd.u32(surface_iomd + IOMD_WIRE_COUNT),
+-        rd.u32(table_iomd + IOMD_WIRE_COUNT),
+-    ) else {
+-        return false;
+-    };
+-    let now = Counts {
+-        surface,
+-        table,
+-        mi_state: mi.state,
+-    };
++    let (surface_iomd, table_iomd) = (checked.surface_iomd, checked.mi.table);
++    let now = chain.counts();
+     let w = ww.watched.get_mut(&mapping_id).expect("checked above");
+     w.sampled_us = Some(now_us());
+     let (last, at_map) = (w.last, w.at_map);
+@@ -1421,8 +1801,8 @@ fn first_anomaly<H: HostMemory + HostOps>(
+     }
+     ww.cost.anomalies += 1;
+     let (iomd, recorded) = match field {
+-        Field::Surface => (w.surface_iomd, w.surface_fields),
+-        _ => (w.table_iomd, w.table_fields),
++        Field::Surface => (w.checked.surface_iomd, w.checked.surface),
++        _ => (w.checked.mi.table, w.checked.table),
+     };
+     let (internal, writes, at_map) = (w.internal, w.writes, w.at_map);
+     let own_write = w
+@@ -1658,7 +2038,8 @@ pub fn on_map<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H, mappin
+ }
+ 
+ /// Before an `UNMAP` is applied: the last sample, then the mapping leaves the
+-/// watch. The guest completes both descriptors only after this request.
++/// watch. The guest completes both descriptors only after this request; 14.6.1
++/// and later only once it succeeded, 13.6 whatever became of it.
+ pub fn on_unmap<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H, mapping_id: u32) {
+     if !enabled() || !state.wire_watch.watched.contains_key(&mapping_id) {
+         return;
+@@ -1671,15 +2052,17 @@ pub fn on_unmap<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H, mapp
+         if let Some(w) = ww.watched.remove(&mapping_id) {
+             crate::observe::off(format!(
+                 "wire_watch unmap mapping={mapping_id} surface_wire={} table_wire={} pages={} \
+-                 writes={} writes_after_anomaly={} anomalous={:?} reads_refused={:?} seq={}",
++                 writes={} writes_after_anomaly={} anomalous={:?} reads_refused={:?} seq={} \
++                 inconclusive={}",
+                 w.last.surface as i32,
+                 w.last.table as i32,
+-                w.pages,
++                w.checked.mi.pages,
+                 w.writes,
+                 w.writes_after_anomaly,
+                 w.anomalous,
+                 w.reads_refused,
+-                event.seq
++                event.seq,
++                w.inconclusive
+             ));
+         }
+     });
+diff --git a/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs b/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs
+index 556b5ee5..a9df5400 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs
+@@ -142,16 +142,12 @@ fn put_iomd(host: &mut FakeHost, at: u64, length: u64, wire: u32, pages: u32, bu
+ fn put_surface(host: &mut FakeHost, s: &Surface, wire: u32) {
+     let n = s.gpas.len() as u64;
+     put32(host, s.mi + MI_STATE, 5);
+-    put64(
+-        host,
+-        s.mi + iosurface_pages::MAPPING_INTERNAL_BACKPTR,
+-        MAPPER,
+-    );
+-    put64(host, s.mi + MI_SURFACE_IOMD, s.surface);
++    put64(host, s.mi + MI_OWNER, MAPPER);
++    put64(host, s.mi + MI_OBJECT, s.surface);
+     put32(host, s.mi + MI_ID, s.mid);
+     put32(host, s.mi + MI_SIZE, MAPPING_INTERNAL_EXPECTED_SIZE);
+-    put64(host, s.mi + MI_TABLE_IOMD, s.table);
+-    put64(host, s.mi + MI_PAGE_COUNT, n);
++    put64(host, s.mi + SHIFTED.table_iomd, s.table);
++    put64(host, s.mi + SHIFTED.page_count, n);
+     put_iomd(host, s.surface, n * PAGE, wire, n as u32, 0);
+     put_iomd(host, s.table, PAGE, 2, 1, s.page_table);
+     for (i, &gpa) in s.gpas.iter().enumerate() {
+@@ -175,10 +171,19 @@ fn set_surface_wire(host: &mut FakeHost, wire: i32) {
+ }
+ 
+ fn fixture(version: &str) -> (DeviceState, FakeHost) {
++    fixture_with(version, |host| put_surface(host, &old_surface(), 1))
++}
++
++/// A kernel with `version`, mapping 2 as `put` lays it out, and the device
++/// state a resolve of it leaves.
++fn fixture_with(version: &str, put: impl FnOnce(&mut FakeHost)) -> (DeviceState, FakeHost) {
+     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+     let mut host = FakeHost::new();
++    // A real page under mapping 2's MappingInternal, so a test can have the
++    // guest rewrite it in the middle of a read (see `Rewire`).
++    host.map_range(MI & !(PAGE - 1), PAGE as usize, 0);
+     put_kernel(&mut host, version);
+-    put_surface(&mut host, &old_surface(), 1);
++    put(&mut host);
+     state.mapper_device_kva = MAPPER;
+     state.kernel_walk.root = Some(KernelRoot {
+         tcr: TCR_16K_47,
+@@ -457,7 +462,8 @@ fn a_kext_header_below_vbar_is_passed_over() {
+ /// 26.6.2's kernel is believed as 27.2's is: its own version string, matched
+ /// exactly, with `VBAR_EL1` 0x6000 into a two-page `__TEXT_EXEC` and a kext's
+ /// header met on the way down. Its mapping is watched and the guard condemns it
+-/// at the drop. 13.6, 14.6.1 and 15.6.1 stay off.
++/// at the drop. A string that differs from a known one in a single field is
++/// not believed.
+ #[test]
+ fn the_26_6_2_kernel_is_believed_and_its_mappings_guarded() {
+     with_switches(true, true, || {
+@@ -502,20 +508,25 @@ fn the_26_6_2_kernel_is_believed_and_its_mappings_guarded() {
+     });
+     for (macos, version) in [
+         (
+-            "13.6",
++            "13.6, development kernel",
+             "Darwin Kernel Version 22.6.0: Fri Sep 15 13:39:33 PDT 2023; \
+-             root:xnu-8796.141.3.700.8~1/RELEASE_ARM64_VMAPPLE",
++             root:xnu-8796.141.3.700.8~1/DEVELOPMENT_ARM64_VMAPPLE",
+         ),
+         (
+-            "14.6.1",
++            "14.6.1, another build",
+             "Darwin Kernel Version 23.6.0: Mon Jul 29 21:13:03 PDT 2024; \
+-             root:xnu-10063.141.2~1/RELEASE_ARM64_VMAPPLE",
++             root:xnu-10063.141.2~2/RELEASE_ARM64_VMAPPLE",
+         ),
+         (
+-            "15.6.1",
+-            "Darwin Kernel Version 24.6.0: Mon Jul 14 11:30:18 PDT 2025; \
++            "15.6.1, another date",
++            "Darwin Kernel Version 24.6.0: Tue Jul 15 11:30:18 PDT 2025; \
+              root:xnu-11417.140.69~1/RELEASE_ARM64_VMAPPLE",
+         ),
++        (
++            "15.6, the release before",
++            "Darwin Kernel Version 24.6.0: Mon Jun 30 21:00:00 PDT 2025; \
++             root:xnu-11417.140.40~1/RELEASE_ARM64_VMAPPLE",
++        ),
+     ] {
+         with_switches(true, true, || {
+             let (mut state, host) = fixture(version);
+@@ -538,11 +549,14 @@ type Breakage = (&'static str, fn(&mut FakeHost));
+ #[test]
+ fn a_mapping_whose_layout_disagrees_is_not_watched() {
+     with_switches(true, true, || {
+-        let cases: [Breakage; 4] = [
++        let cases: [Breakage; 6] = [
+             ("surface_length", |h| {
+                 put64(h, SURFACE + IOMD_LENGTH, 2 * PAGE)
+             }),
+-            ("mi_page_count", |h| put64(h, MI + MI_PAGE_COUNT, 4)),
++            ("mi_page_count", |h| put64(h, MI + SHIFTED.page_count, 4)),
++            // Where 13.6 and 14.6.1 keep the page-table descriptor.
++            ("mi_unshifted_layout", |h| put64(h, MI + 0x48, TABLE)),
++            ("mi_owner", |h| put64(h, MI + MI_OWNER, MAPPER + 0x1000)),
+             ("table_buffer", |h| {
+                 put64(h, TABLE + IOBMD_BUFFER, PAGE_TABLE + PAGE)
+             }),
+@@ -1528,3 +1542,436 @@ fn a_condemned_incarnations_pages_are_never_read() {
+         assert_eq!(buf, [0x5A; 16]);
+     });
+ }
++
++// MARK: - 15.6.1, and the unshifted layout of 14.6.1 and 13.6
++
++/// The `IOSurface` mapping 2's MappingInternal names on the unshifted layout.
++const IOSURFACE: u64 = 0xffff_fe24_13d6_0000;
++/// The page-table descriptor's mapping, `MappingInternal +0x50` there.
++const TABLE_MAP: u64 = 0xffff_fe1e_47da_9000;
++/// The unshifted layout's eviction deadline and two-table-pages flag.
++const DEADLINE: u64 = 0x58;
++const TWO_TABLE_PAGES: u64 = 0x60;
++/// Another surface's `IOSurface` and descriptor, the descriptor at a wire count
++/// of zero and of the same class: what a freed and reused MappingInternal can
++/// name.
++const OTHER_IOSURFACE: u64 = 0xffff_fe24_13d6_8000;
++const OTHER_IOMD: u64 = 0xffff_fe24_13d7_8398;
++
++/// `pointer` signed as the guest signs a vtable pointer.
++fn signed(pointer: u64) -> u64 {
++    pointer & ((1 << 47) - 1) | 0x2a5c_0000_0000_0000
++}
++
++/// An `IOSurface` of `layout`'s kernel at `at`, keeping `descriptor`.
++fn put_iosurface(host: &mut FakeHost, layout: &Layout, at: u64, descriptor: u64) {
++    let SurfaceAt::IoSurface {
++        descriptor: field,
++        vtable_from_header,
++    } = layout.surface
++    else {
++        panic!("the {} layout has no IOSurface", layout.name);
++    };
++    put64(host, at, signed(KERNEL + vtable_from_header));
++    put64(host, at + field, descriptor);
++}
++
++/// Mapping 2 as 13.6 and 14.6.1 lay it out: a 0x78-byte MappingInternal whose
++/// `+0x20` is an `IOSurface` keeping the surface descriptor, the page-table
++/// descriptor at `+0x48`, its mapping at `+0x50`, an eviction deadline left at
++/// `+0x58` by an earlier `complete()`, and the page counts at `+0x68`/`+0x70`.
++fn put_unshifted(host: &mut FakeHost, s: &Surface, layout: &Layout, wire: u32) {
++    let n = s.gpas.len() as u64;
++    put32(host, s.mi + MI_STATE, 5);
++    put64(host, s.mi + MI_OWNER, MAPPER);
++    put64(host, s.mi + MI_OBJECT, IOSURFACE);
++    put32(host, s.mi + MI_ID, s.mid);
++    put32(host, s.mi + MI_SIZE, MAPPING_INTERNAL_EXPECTED_SIZE);
++    put64(host, s.mi + layout.table_iomd, s.table);
++    put64(host, s.mi + 0x50, TABLE_MAP);
++    put64(host, s.mi + DEADLINE, 0x0000_0123_4567_89ab);
++    put64(host, s.mi + TWO_TABLE_PAGES, 0);
++    put64(host, s.mi + 0x68, 1);
++    put64(host, s.mi + layout.page_count, n);
++    put_iosurface(host, layout, IOSURFACE, s.surface);
++    put_iomd(host, s.surface, n * PAGE, wire, n as u32, 0);
++    put_iomd(host, s.table, PAGE, 2, 1, s.page_table);
++    for (i, &gpa) in s.gpas.iter().enumerate() {
++        put32(host, s.page_table + 4 * i as u64, entry(gpa));
++        host.map_range(gpa, PAGE as usize, 0);
++    }
++    put64(host, MIXED + MIXED_DATA_LENGTH, 0x2000);
++}
++
++/// The other surface: its descriptor, and on the unshifted layout its
++/// `IOSurface`.
++fn put_other(host: &mut FakeHost, layout: &Layout) {
++    let n = G.len() as u64;
++    put_iomd(host, OTHER_IOMD, n * PAGE, 0, n as u32, 0);
++    if layout.surface != SurfaceAt::Descriptor {
++        put_iosurface(host, layout, OTHER_IOSURFACE, OTHER_IOMD);
++    }
++}
++
++/// Mapping 2 laid out as `layout` says, under the kernel `version`.
++fn laid_out(version: &str, layout: Layout) -> (DeviceState, FakeHost) {
++    fixture_with(version, |host| {
++        if layout.surface == SurfaceAt::Descriptor {
++            put_surface(host, &old_surface(), 1);
++        } else {
++            put_unshifted(host, &old_surface(), &layout, 1);
++        }
++        put_other(host, &layout);
++    })
++}
++
++/// What `MappingInternal +0x20` names on `layout`: mapping 2's own object, and
++/// the other surface's.
++fn objects(layout: &Layout) -> (u64, u64) {
++    match layout.surface {
++        SurfaceAt::Descriptor => (SURFACE, OTHER_IOMD),
++        SurfaceAt::IoSurface { .. } => (IOSURFACE, OTHER_IOSURFACE),
++    }
++}
++
++/// 15.6.1 runs 27.2's driver at every offset read here: believed by its own
++/// string, read with the shifted layout, and guarded the same way.
++#[test]
++fn the_15_6_1_kernel_is_believed_with_the_shifted_layout() {
++    with_switches(true, true, || {
++        let (mut state, mut host) = fixture(KERNEL_VERSION_15_6_1);
++        let cap = crate::observe::FailCapture::start();
++        on_map(&mut state, &host, MID);
++        let kernel = lines_with(&cap, "wire_watch_kernel verified");
++        assert_eq!(kernel.len(), 1, "{:?}", cap.lines());
++        assert!(
++            kernel[0].contains(&format!("version=\"{KERNEL_VERSION_15_6_1}\""))
++                && kernel[0].contains("macos=15.6.1 layout=shifted"),
++            "{}",
++            kernel[0]
++        );
++        let map = lines_with(&cap, "wire_watch map mapping=2 ");
++        assert_eq!(map.len(), 1, "{:?}", cap.lines());
++        assert!(
++            map[0].contains(&format!(
++                "surface_iomd={SURFACE:#x} table_iomd={TABLE:#x} surface_wire=1 table_wire=2"
++            )) && map[0].contains("iosurface=-"),
++            "{}",
++            map[0]
++        );
++        set_surface_wire(&mut host, 0);
++        assert!(!write_now(
++            &mut state,
++            &host,
++            MID,
++            "mapping_write",
++            WriteKind::Cpu
++        ));
++        assert!(cap
++            .one("wire_guard_condemned")
++            .contains("mapping=2 field=surface"));
++    });
++}
++
++/// 13.6 and 14.6.1 are believed by their own strings, each with its own
++/// `IOSurface`: the surface descriptor is the one the `IOSurface` at `+0x20`
++/// keeps (13.6 at `+0x38`, with another descriptor at `+0x30` to be passed
++/// over), and its drop is found and condemned as on 27.2. The table's drop is
++/// found at `+0x48`.
++#[test]
++fn the_13_6_and_14_6_1_kernels_read_the_surface_through_its_iosurface() {
++    for (macos, version, layout) in [
++        ("13.6", KERNEL_VERSION_13_6, UNSHIFTED_13_6),
++        ("14.6.1", KERNEL_VERSION_14_6_1, UNSHIFTED_14_6_1),
++    ] {
++        with_switches(true, true, || {
++            let (mut state, mut host) = laid_out(version, layout);
++            if layout == UNSHIFTED_13_6 {
++                put64(&mut host, IOSURFACE + 0x30, OTHER_IOMD);
++            }
++            let cap = crate::observe::FailCapture::start();
++            on_map(&mut state, &host, MID);
++            let kernel = lines_with(&cap, "wire_watch_kernel verified");
++            assert_eq!(kernel.len(), 1, "{macos}: {:?}", cap.lines());
++            assert!(
++                kernel[0].contains(&format!("version=\"{version}\""))
++                    && kernel[0].contains(&format!("macos={macos} layout=unshifted")),
++                "{}",
++                kernel[0]
++            );
++            let map = lines_with(&cap, "wire_watch map mapping=2 ");
++            assert_eq!(map.len(), 1, "{macos}: {:?}", cap.lines());
++            assert!(
++                map[0].contains(&format!(
++                    "surface_iomd={SURFACE:#x} table_iomd={TABLE:#x} surface_wire=1 table_wire=2"
++                )) && map[0].contains("pages=3 ")
++                    && map[0].contains("at=map")
++                    && map[0].ends_with(&format!("iosurface={IOSURFACE:#x}")),
++                "{}",
++                map[0]
++            );
++            assert!(write_now(
++                &mut state,
++                &host,
++                MID,
++                "mapping_write",
++                WriteKind::Cpu
++            ));
++            put32(&mut host, TABLE + IOMD_WIRE_COUNT, 1);
++            set_surface_wire(&mut host, 0);
++            assert!(!write_now(
++                &mut state,
++                &host,
++                MID,
++                "mapping_write",
++                WriteKind::Cpu
++            ));
++            assert!(
++                cap.one("wire_guard_condemned")
++                    .contains("mapping=2 field=surface"),
++                "{macos}"
++            );
++            let anomalies = lines_with(&cap, "wire_watch first_anomaly ");
++            assert_eq!(anomalies.len(), 2, "{macos}: {:?}", cap.lines());
++            assert!(
++                anomalies[0].contains(&format!("field=surface value=0 map=1 iomd={SURFACE:#x}"))
++            );
++            assert!(anomalies[1].contains(&format!("field=table value=1 map=2 iomd={TABLE:#x}")));
++        });
++    }
++}
++
++/// `+0x58` and `+0x60` are no reserved zeros on the unshifted layout: they
++/// hold the eviction deadline `MappingInternal::complete` arms and the flag a
++/// page table of two or more pages sets. Non-zero at `MAP` they are passed
++/// over, and moving between samples they move nothing.
++#[test]
++fn an_unshifted_deadline_and_table_flag_are_not_reserved_zeros() {
++    for layout in [UNSHIFTED_13_6, UNSHIFTED_14_6_1] {
++        with_switches(true, true, || {
++            let version = if layout == UNSHIFTED_13_6 {
++                KERNEL_VERSION_13_6
++            } else {
++                KERNEL_VERSION_14_6_1
++            };
++            let (mut state, mut host) = laid_out(version, layout);
++            put64(&mut host, MI + DEADLINE, 0x0000_0456_7890_abcd);
++            put64(&mut host, MI + TWO_TABLE_PAGES, 1);
++            let cap = crate::observe::FailCapture::start();
++            on_map(&mut state, &host, MID);
++            assert_eq!(
++                lines_with(&cap, "wire_watch map mapping=2 ").len(),
++                1,
++                "{:?}",
++                cap.lines()
++            );
++            for (deadline, flag) in [
++                (0x0000_0456_7891_0000u64, 1u64),
++                (0, 0),
++                (0x0000_0456_7899_0000, 1),
++            ] {
++                put64(&mut host, MI + DEADLINE, deadline);
++                put64(&mut host, MI + TWO_TABLE_PAGES, flag);
++                assert!(write_now(
++                    &mut state,
++                    &host,
++                    MID,
++                    "mapping_write",
++                    WriteKind::Cpu
++                ));
++                state.wire_watch.all_sampled_us = None;
++                tick(&mut state, &host);
++            }
++            for quiet in [
++                "wire_watch_layout_unverified",
++                "wire_watch transition",
++                "wire_watch inconclusive",
++                "wire_watch retired",
++                "wire_guard",
++            ] {
++                assert!(
++                    lines_with(&cap, quiet).is_empty(),
++                    "{quiet}: {:?}",
++                    cap.lines()
++                );
++            }
++            assert_eq!(state.wire_watch.watched[&MID].phase, Phase::Active);
++            assert!(state.wire_watch.cost.samples >= 6);
++        });
++    }
++}
++
++/// The kernel's string picks the layout and a mapping is held to it alone: a
++/// mapping laid out the other way, an `IOSurface` of the other kernel, a
++/// descriptor kept where the other kernel keeps it, or one of another class is
++/// refused by name, never tried against the other layout, and never refuses a
++/// write.
++#[test]
++fn a_mapping_is_checked_against_its_own_kernels_layout_only() {
++    type Case = (&'static str, &'static str, fn(&mut FakeHost), &'static str);
++    let cases: [Case; 7] = [
++        (
++            "27.2 kernel, unshifted MappingInternal",
++            KERNEL_VERSION_27_2,
++            |h| put_unshifted(h, &old_surface(), &UNSHIFTED_13_6, 1),
++            "mi_unshifted_layout",
++        ),
++        (
++            "13.6 kernel, shifted MappingInternal",
++            KERNEL_VERSION_13_6,
++            |h| put_surface(h, &old_surface(), 1),
++            "mi_page_count",
++        ),
++        (
++            "13.6 kernel, 14.6.1's IOSurface",
++            KERNEL_VERSION_13_6,
++            |h| put_unshifted(h, &old_surface(), &UNSHIFTED_14_6_1, 1),
++            "iosurface_class",
++        ),
++        (
++            "14.6.1 kernel, 13.6's IOSurface",
++            KERNEL_VERSION_14_6_1,
++            |h| put_unshifted(h, &old_surface(), &UNSHIFTED_13_6, 1),
++            "iosurface_class",
++        ),
++        (
++            "13.6 kernel, descriptor where 14.6.1 keeps it",
++            KERNEL_VERSION_13_6,
++            |h| {
++                put_unshifted(h, &old_surface(), &UNSHIFTED_13_6, 1);
++                put64(h, IOSURFACE + 0x38, 0);
++                put64(h, IOSURFACE + 0x30, SURFACE);
++            },
++            "iomd_pointer",
++        ),
++        (
++            "13.6 kernel, the IOSurface's descriptor of another class",
++            KERNEL_VERSION_13_6,
++            |h| {
++                put_unshifted(h, &old_surface(), &UNSHIFTED_13_6, 1);
++                put64(h, SURFACE, 0x5b95_7e00_2000_0638);
++            },
++            "iomd_class",
++        ),
++        (
++            "14.6.1 kernel, another device's MappingInternal",
++            KERNEL_VERSION_14_6_1,
++            |h| {
++                put_unshifted(h, &old_surface(), &UNSHIFTED_14_6_1, 1);
++                put64(h, MI + MI_OWNER, MAPPER + 0x1000);
++            },
++            "mi_owner",
++        ),
++    ];
++    for (what, version, set_up, reason) in cases {
++        with_switches(true, true, || {
++            let (mut state, mut host) = fixture_with(version, set_up);
++            let cap = crate::observe::FailCapture::start();
++            on_map(&mut state, &host, MID);
++            let refused = cap.one("wire_watch_layout_unverified");
++            assert!(
++                refused.contains("scope=mapping mapping=2")
++                    && refused.contains(&format!("reason={reason} ")),
++                "{what}: {refused}"
++            );
++            assert!(lines_with(&cap, "wire_watch map ").is_empty(), "{what}");
++            set_surface_wire(&mut host, 0);
++            assert!(
++                write_now(&mut state, &host, MID, "mapping_write", WriteKind::Cpu),
++                "{what}: an unchecked mapping never refuses a write"
++            );
++            on_map(&mut state, &host, MID);
++            assert_eq!(
++                lines_with(&cap, "wire_watch_layout_unverified").len(),
++                1,
++                "{what}: said once, and not retried another way"
++            );
++            assert!(lines_with(&cap, "wire_watch map ").is_empty(), "{what}");
++        });
++    }
++}
++
++/// The guest swaps mapping 2's MappingInternal to another surface between the
++/// two reads of one sample and back, so the first read follows it to a
++/// descriptor at zero. Nothing is concluded: no transition, no anomaly, no
++/// condemnation, no loss, no refusal. The next sample reads the mapping as it
++/// is, and a real drop is found then.
++#[test]
++fn an_object_swapped_mid_read_is_inconclusive_and_never_a_count() {
++    use crate::runtime::host::Rewire;
++    for (version, layout) in [
++        (KERNEL_VERSION_13_6, UNSHIFTED_13_6),
++        (KERNEL_VERSION_14_6_1, UNSHIFTED_14_6_1),
++        (KERNEL_VERSION_27_2, SHIFTED),
++    ] {
++        with_switches(true, true, || {
++            let (mut state, mut host) = laid_out(version, layout);
++            on_map(&mut state, &host, MID);
++            let (own, other) = objects(&layout);
++            let cap = crate::observe::FailCapture::start();
++            host.arm_rewire(Rewire {
++                on_read_gpa: MI + MI_ID,
++                on_read_len: 4,
++                pte_gpa: MI + MI_OBJECT,
++                bytes: other.to_le_bytes().to_vec(),
++            });
++            host.arm_rewire(Rewire {
++                on_read_gpa: OTHER_IOMD + IOMD_WIRE_COUNT,
++                on_read_len: 4,
++                pte_gpa: MI + MI_OBJECT,
++                bytes: own.to_le_bytes().to_vec(),
++            });
++            assert!(write_now(
++                &mut state,
++                &host,
++                MID,
++                "mapping_write",
++                WriteKind::Cpu
++            ));
++            assert_eq!(
++                host.rewires_fired(),
++                2,
++                "{}: the swap and the swap back both fell inside the sample",
++                layout.name
++            );
++            let inconclusive = lines_with(&cap, "wire_watch inconclusive");
++            assert_eq!(inconclusive.len(), 1, "{:?}", cap.lines());
++            assert!(
++                inconclusive[0].contains("mapping=2 ")
++                    && inconclusive[0].contains("link=mapping_internal n=1 at=mapping_write"),
++                "{}",
++                inconclusive[0]
++            );
++            for quiet in [
++                "wire_watch transition",
++                "wire_watch first_anomaly",
++                "wire_watch retired",
++                "wire_guard",
++            ] {
++                assert!(
++                    lines_with(&cap, quiet).is_empty(),
++                    "{quiet}: {:?}",
++                    cap.lines()
++                );
++            }
++            assert_eq!(state.wire_watch.cost.inconclusive, 1);
++            assert_eq!(state.wire_watch.watched[&MID].phase, Phase::Active);
++            assert_eq!(state.wire_watch.watched[&MID].last.surface, 1);
++
++            set_surface_wire(&mut host, 0);
++            assert!(!write_now(
++                &mut state,
++                &host,
++                MID,
++                "mapping_write",
++                WriteKind::Cpu
++            ));
++            assert_eq!(
++                lines_with(&cap, "wire_watch first_anomaly ").len(),
++                1,
++                "{:?}",
++                cap.lines()
++            );
++        });
++    }
++}
+-- 
+2.43.0
+

@@ -1,0 +1,307 @@
+From e1ffa45f9684458b370ab8ad3b97611916ff0ac1 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 08:43:43 +0800
+Subject: [PATCH 3/3] Build the construct tree alongside the large-CFG feed
+
+A source CFG within the relooper's cap first gets the raw relooper
+feed and only then the construct tree. On macOS 27.2's uber fragment
+shader the feed fails validation (a block before its dominator) and its
+2,000-block graph is past what the relooper takes, so 2.9 s of feed ran
+in series before the construct tree that is adopted.
+
+What the construct tree builds does not depend on the feed, only
+whether it is adopted does. Build it on a scoped thread while the feed
+runs. If the feed is adopted, or fails in a way the construct tree cannot
+fix, the thread stops at its next pass-phase boundary and its result is
+dropped. Otherwise nothing cancelled it, so its verdict is the one the
+sequential call reaches, and it is kept as that call's would be.
+spirv-val scratch files get a name per call so two candidates can be
+validated at once.
+
+The shader's SPIR-V is unchanged, and translation drops from 6.1 s to
+3.8 s on the little cores and from 2.9 s to 1.8 s on two big ones (17.0
+and 7.9 s before either change). Peak RSS goes from 77 to 124 MB.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/lib.rs        | 47 +++++++++++++++++++++++++++++++++++++-
+ src/passes/mod.rs | 23 +++++++++++--------
+ src/retry.rs      | 57 +++++++++++++++++++++++++++++++++++++++++++++++
+ src/tools.rs      |  6 ++++-
+ 4 files changed, 122 insertions(+), 11 deletions(-)
+
+diff --git a/src/lib.rs b/src/lib.rs
+index 7fd3f2a..03153af 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -909,6 +909,10 @@ pub fn translate_bda_probe(
+     })
+ }
+ 
++/// Stack for the thread that builds the construct-tree candidate alongside the large-CFG feed: at
++/// least what a process main thread gets, since that is where the CLI runs the sequential path.
++const SPECULATIVE_STACK_BYTES: usize = 16 << 20;
++
+ fn translate_sanitized_with_meta(
+     san_ll: &str,
+     stage: passes::Stage,
+@@ -943,10 +947,51 @@ fn translate_sanitized_with_meta(
+     // select later retries. Count structural LLVM blocks without parsing instruction bodies.
+     let max_function_blocks = sanitized_max_function_basic_block_count(san_ll);
+     if large_cfg_relooper_eligible(max_function_blocks) {
+-        if let Some(relooped) = rc.raw_feed_then_relooper() {
++        // The construct tree is tried only after the feed fails in a way it can fix, but what it
++        // builds does not depend on the feed. Build it on a second thread while the feed runs, and
++        // stop it at its next phase boundary if the feed's outcome says it is not needed.
++        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
++        let (relooped, speculative) = std::thread::scope(|scope| {
++            let speculative = std::thread::Builder::new()
++                .name("m2v-construct-tree".into())
++                .stack_size(SPECULATIVE_STACK_BYTES)
++                .spawn_scoped(scope, {
++                    let cancel = cancel.clone();
++                    move || {
++                        retry::speculate(cancel, || {
++                            retry::RetryCtx::new(
++                                san_ll,
++                                stage,
++                                frag,
++                                vert,
++                                kern,
++                                promoted_kern,
++                                entry_name,
++                                tmp,
++                                options,
++                                psb_retry_enabled,
++                            )
++                            .construct_tree_retry()
++                        })
++                    }
++                });
++            let relooped = rc.raw_feed_then_relooper();
++            if relooped.is_some() || !rc.large_cfg_construct_tree_eligible() {
++                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
++            }
++            let speculative = speculative.map(|handle| handle.join());
++            (relooped, speculative)
++        });
++        if let Some(relooped) = relooped {
+             return Ok(relooped);
+         }
+         if rc.large_cfg_construct_tree_eligible() {
++            // Never cancelled on this path, so its verdict is the one the sequential call reaches.
++            match speculative {
++                Ok(Ok(verdict)) => rc.remember_construct_tree_verdict(verdict),
++                Ok(Err(panic)) => std::panic::resume_unwind(panic),
++                Err(_) => {}
++            }
+             if let Some(constructed) = rc.construct_tree_retry() {
+                 return Ok(constructed);
+             }
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index 5e1b432..462d2c3 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -1704,16 +1704,21 @@ pub(crate) fn transform_with_options_and_sidecar(
+     }
+     let mut ctx = Ctx::with_options_and_sidecar(module, emit_sidecar, stage, options);
+     let retry_debug = crate::env_vars::retry_debug();
+-    let debug_phase = |phase: &str| {
++    // Each phase boundary is also where a speculative candidate nobody needs any more stops.
++    let debug_phase = |phase: &str| -> Result<(), String> {
+         if retry_debug {
+             eprintln!("[retry-debug] passes: {phase}");
+         }
++        if crate::retry::speculation_cancelled() {
++            return Err(crate::retry::SPECULATION_CANCELLED.to_string());
++        }
++        Ok(())
+     };
+ 
+     let mut entry_idx = find_entry_index(&ctx.module, entry_name)
+         .ok_or_else(|| "no entry function with a body found".to_string())?;
+ 
+-    debug_phase("cleanup start");
++    debug_phase("cleanup start")?;
+     // Producer-side closure already made the entry self-contained. Preserve the former residual
+     // inliner's two post-splice cleanup operations at this phase.
+     compose_chained_access_chains(&mut ctx, entry_idx);
+@@ -1725,7 +1730,7 @@ pub(crate) fn transform_with_options_and_sidecar(
+     agx_cluster::lower_agx2_cluster_numbers(&mut ctx, entry_idx, &stage)?;
+     neutralize_null_access_chains(&mut ctx, entry_idx);
+ 
+-    debug_phase("interface start");
++    debug_phase("interface start")?;
+     // 1a) decoded params -> stage-input/resource vars and entry-body replacements. Preserve the
+     //     original type snapshot for the immediately-following return rewrite.
+     let input_defs = build_stage_input(&mut ctx, entry_idx, &stage, frag, vert, kern)?;
+@@ -1750,7 +1755,7 @@ pub(crate) fn transform_with_options_and_sidecar(
+     // placeholders be neutralized as genuinely unmodeled memory.
+     neutralize_private_placeholder_access_chains(&mut ctx, entry_idx)?;
+ 
+-    debug_phase("air lowering start");
++    debug_phase("air lowering start")?;
+     // 2) lower residual air.* calls inside the entry function.
+     lower_air_calls(&mut ctx, entry_idx)?;
+     // AIR calls can materialize opaque handles after interface binding's earlier resource-wrapper
+@@ -1770,13 +1775,13 @@ pub(crate) fn transform_with_options_and_sidecar(
+     //     divergent values from guarded select expressions.
+     guard_integer_division_by_zero(&mut ctx, entry_idx);
+ 
+-    debug_phase("cfg repair start");
++    debug_phase("cfg repair start")?;
+     // 2d) establish the complete structured-CFG invariant. The same compositional phase is rerun
+     // after finish_module's native module rewrites, because those late rewrites can create new CFG
+     // edges and must not bypass the invariant established here.
+     repair_structured_cfg(&mut ctx, entry_idx);
+ 
+-    debug_phase("memory lowering start");
++    debug_phase("memory lowering start")?;
+     // 2e) narrow 64-bit access-chain INDEX operands to 32-bit. NVIDIA's SPIR-V->NVVM compiler crashes
+     //     when an access-chain index is a 64-bit (`%ulong`) value (a driver-fragility class), so we
+     //     value-preservingly rewrite each i64 index to a 32-bit equivalent. After this the i64 index
+@@ -1843,7 +1848,7 @@ pub(crate) fn transform_with_options_and_sidecar(
+     // structural placeholder closure after every pointer-producing memory pass has run.
+     neutralize_private_placeholder_access_chains(&mut ctx, entry_idx)?;
+ 
+-    debug_phase("integer lowering start");
++    debug_phase("integer lowering start")?;
+     // 2h) width-normalize integer arithmetic operands. A value widened to `ulong` for a StorageBuffer
+     //     access-chain index that is then reused in a 32-bit offset multiply leaves an `OpIMul %uint`
+     //     with a `ulong` operand, which spirv-val rejects. This inserts a truncating `OpUConvert` for
+@@ -1856,7 +1861,7 @@ pub(crate) fn transform_with_options_and_sidecar(
+     //     modular result as the original `ulong` arithmetic and is structural over integer width.
+     lower_scalar_i64_arithmetic_to_u32_halves(&mut ctx);
+ 
+-    debug_phase("workgroup/finalize start");
++    debug_phase("workgroup/finalize start")?;
+     // 2g) deterministic threadgroup memory: zero-fill every Workgroup variable at kernel entry
+     //     (stores of OpConstantNull + one control barrier), the candidate half of the harness's
+     //     defined refinement of Metal's undefined threadgroup contents. Kernel-only: Workgroup
+@@ -1877,7 +1882,7 @@ pub(crate) fn transform_with_options_and_sidecar(
+     // Run on the complete type graph: retained helper functions can carry a Workgroup aggregate
+     // stride that entry-focused lowering could not see until all synthesized globals were appended.
+     split_workgroup_ptr_access_chain_descent(&mut ctx, entry_idx);
+-    debug_phase("complete");
++    debug_phase("complete")?;
+ 
+     Ok((ctx.module, ctx.emit_sidecar))
+ }
+diff --git a/src/retry.rs b/src/retry.rs
+index 2a9533f..718a21e 100644
+--- a/src/retry.rs
++++ b/src/retry.rs
+@@ -23,8 +23,41 @@ use crate::{
+     finish_module, meta, native, passes, stage_buffer_layouts, tools, FinishRewrites,
+     FinishedModule,
+ };
++use std::cell::RefCell;
+ use std::collections::HashMap;
+ use std::path::Path;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::Arc;
++
++thread_local! {
++    /// Set on a thread building a candidate that may turn out not to be needed; see
++    /// [`speculate`].
++    static SPECULATION_CANCEL: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
++}
++
++/// Run `work` on this thread so that [`speculation_cancelled`] answers from `cancel`.
++///
++/// A speculative candidate is only ever adopted when nobody cancelled it, so a cancelled one may
++/// stop early with any refusal: whatever it returns is discarded.
++pub(crate) fn speculate<T>(cancel: Arc<AtomicBool>, work: impl FnOnce() -> T) -> T {
++    SPECULATION_CANCEL.with(|slot| *slot.borrow_mut() = Some(cancel));
++    let result = work();
++    SPECULATION_CANCEL.with(|slot| *slot.borrow_mut() = None);
++    result
++}
++
++/// Whether this thread's speculative candidate is no longer wanted. Always false on a thread that
++/// is not running [`speculate`].
++pub(crate) fn speculation_cancelled() -> bool {
++    SPECULATION_CANCEL.with(|slot| {
++        slot.borrow()
++            .as_ref()
++            .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
++    })
++}
++
++/// The refusal a cancelled speculative candidate stops with.
++pub(crate) const SPECULATION_CANCELLED: &str = "speculative candidate no longer needed";
+ 
+ fn module_bytes(module: &Module) -> Vec<u8> {
+     module
+@@ -989,6 +1022,12 @@ impl<'a> RetryCtx<'a> {
+         result
+     }
+ 
++    /// Keep a verdict [`Self::construct_tree_retry`] reached on another context built from the same
++    /// inputs, so this context reuses it rather than repeating the work.
++    pub(crate) fn remember_construct_tree_verdict(&self, verdict: Option<Vec<u8>>) {
++        *self.construct_tree_retry_cache.borrow_mut() = Some(verdict);
++    }
++
+     fn construct_tree_retry_uncached(&self) -> Option<Vec<u8>> {
+         if self.retry_debug_on {
+             eprintln!("[retry-debug] construct_tree: emit start");
+@@ -1047,6 +1086,9 @@ impl<'a> RetryCtx<'a> {
+             if self.retry_debug_on {
+                 eprintln!("[retry-debug] construct_tree: finish start");
+             }
++            if speculation_cancelled() {
++                return Err(SPECULATION_CANCELLED.to_string());
++            }
+             self.finish(emitted)
+         });
+         if self.retry_debug_on {
+@@ -1055,6 +1097,9 @@ impl<'a> RetryCtx<'a> {
+             }
+         }
+         let finished = r.ok()?;
++        if speculation_cancelled() {
++            return None;
++        }
+         // Keep the retry dump contract useful when the primary emitter cannot produce bytes: the
+         // construct-tree candidate is then the first complete module available for inspecting a
+         // finish-time validation failure. Diagnostics remain best-effort and never affect routing.
+@@ -1344,6 +1389,18 @@ mod tests {
+         module
+     }
+ 
++    #[test]
++    fn only_a_cancelled_speculation_reads_as_cancelled() {
++        assert!(!speculation_cancelled());
++        let cancel = Arc::new(AtomicBool::new(false));
++        speculate(cancel.clone(), || {
++            assert!(!speculation_cancelled());
++            cancel.store(true, Ordering::Relaxed);
++            assert!(speculation_cancelled());
++        });
++        assert!(!speculation_cancelled());
++    }
++
+     #[test]
+     fn post_finish_graph_over_relooper_cap_keeps_construct_tree_eligible() {
+         assert!(!module_exceeds_relooper_cap(&module_with_blocks(
+diff --git a/src/tools.rs b/src/tools.rs
+index 71db2a5..159559b 100644
+--- a/src/tools.rs
++++ b/src/tools.rs
+@@ -509,7 +509,11 @@ pub fn spirv_val(spv_path: &str) -> Result<(), String> {
+ 
+ /// Validate in-memory SPIR-V bytes by writing them to a temp file and invoking `spirv-val`.
+ pub fn spirv_val_bytes(spv: &[u8], tmp: &Path) -> Result<(), String> {
+-    let path = tmp.join("a2v_val.spv");
++    // Two candidates of one translation can be validated at once (see the construct tree built
++    // alongside the large-CFG feed), so each validation gets its own scratch name.
++    static SCRATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++    let serial = SCRATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    let path = tmp.join(format!("a2v_val-{serial}.spv"));
+     std::fs::write(&path, spv).map_err(|e| format!("spirv_val_bytes write: {e}"))?;
+     let result = spirv_val(path.to_str().ok_or("spirv_val_bytes: bad tmp path")?);
+     // spirv-val only needs the path for the subprocess lifetime.
+-- 
+2.43.0
+

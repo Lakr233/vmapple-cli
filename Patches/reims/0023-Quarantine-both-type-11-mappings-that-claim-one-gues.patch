@@ -1,0 +1,780 @@
+From 2f4b8d514ee6316a09d65e579562bb53d6234f55 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 05:04:54 +0800
+Subject: [PATCH 07/24] Quarantine both type-11 mappings that claim one guest
+ page
+
+On macOS 27 the guest handed a live display surface's pages (mid=2) to
+the kernel and to new surfaces without any UNMAP for it. The device saw
+the new surfaces collide with mid=2, closed the new mappings, and went on
+flushing frames through mid=2 into what was by then the kernel's memory.
+The old surface's table re-read identically, so nothing on the device side
+said it was stale; nothing said the new one was either.
+
+A collision now quarantines both mappings' current incarnations. A page
+proof covers neither, including one minted before the collision, so every
+CPU flush, import write and direct write refuses for the whole mapping;
+GPU writes already submitted to either page list are waited for; their
+owed frames stay in the ledger unwritten. Re-reading the same table lifts
+nothing. A quarantine lifts only on protocol evidence about that mapping:
+its UNMAP, a new MAP or MappingInternal for its id, or its backing's
+delete, which also drops its frame unwritten; a partner left without a
+counterpart lifts with it and keeps its frame. surface_quarantine logs
+both sides' ids, generations, time since their last adopted table, owed
+frames and in-flight writes, and the shared page; surface_quarantine_lifted
+logs the evidence.
+
+The mapper ring now also counts, always on, a backlog, an overrun and a
+consumer ahead of the producer, and logs a ring read that fails, after
+which the rest of the backlog, an UNMAP included, waits for the next
+publish.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 8beb95da6126e88b60135517e74f720095dbf0b0)
+---
+ crates/reims-vgpu/src/model/state.rs          |  13 +
+ crates/reims-vgpu/src/runtime/drain/mod.rs    |  71 +++++
+ crates/reims-vgpu/src/runtime/drain/tests.rs  |  14 +
+ crates/reims-vgpu/src/runtime/mapper/mod.rs   |  14 +
+ .../src/runtime/mapper/quarantine_tests.rs    | 192 ++++++++++++++
+ crates/reims-vgpu/src/runtime/mod.rs          |   3 +
+ .../src/runtime/render_writeback.rs           |   3 +
+ .../src/runtime/surface_quarantine.rs         | 246 ++++++++++++++++++
+ .../reims-vgpu/src/runtime/writeback_debt.rs  |  12 +
+ 9 files changed, 568 insertions(+)
+ create mode 100644 crates/reims-vgpu/src/runtime/mapper/quarantine_tests.rs
+ create mode 100644 crates/reims-vgpu/src/runtime/surface_quarantine.rs
+
+diff --git a/crates/reims-vgpu/src/model/state.rs b/crates/reims-vgpu/src/model/state.rs
+index 2de899c5..a7f7eec6 100644
+--- a/crates/reims-vgpu/src/model/state.rs
++++ b/crates/reims-vgpu/src/model/state.rs
+@@ -1506,6 +1506,11 @@ pub struct MappingEntry {
+     /// (bump + drop condemned windows). Cleared by every explicit lifecycle
+     /// event (fresh MAP, unmap, MappingInternal reattach, ReplacePhysical).
+     pub condemned_entries: Option<Vec<u32>>,
++    /// Set while another live mapping claims one of this mapping's pages; no
++    /// write goes through it. See [`crate::runtime::surface_quarantine`].
++    pub quarantine: Option<crate::runtime::surface_quarantine::Quarantine>,
++    /// `observe::elapsed_ms` when a resolve last adopted this page list.
++    pub validated_ms: u64,
+     /// Guest KVA of MappingInternal (from capture or recover).
+     pub mapping_internal: u64,
+     pub page_table_kva: u64,
+@@ -3585,6 +3590,9 @@ impl DeviceState {
+     /// plan) or bumps + drops (different plan). Returns whether a fingerprint
+     /// was stashed; on `false` the caller should fall back to full teardown.
+     pub fn condemn_surface_backing(&mut self, mapping_id: u32) -> bool {
++        // The guest deleted this backing: whatever it collided with is no longer
++        // in dispute on its account.
++        crate::runtime::surface_quarantine::lift(self, mapping_id, "delete_backing");
+         self.forget_compositor_mapping(mapping_id);
+         self.host_surfaces.remove(&mapping_id);
+         let Some(e) = self.mappings.get_mut(&mapping_id) else {
+@@ -3624,6 +3632,7 @@ impl DeviceState {
+             StateMutationDecline::MapSurfaceIdSentinel { mapping_id }.emit(u64::from(mapping_id));
+             return false;
+         }
++        crate::runtime::surface_quarantine::lift(self, mapping_id, "map");
+         let e = self.mappings.entry(mapping_id).or_default();
+         e.mapped = true;
+         // Fresh MAP invalidates any previous page table / geom for this slot.
+@@ -3678,6 +3687,7 @@ impl DeviceState {
+             StateMutationDecline::UnmapSurfaceIdSentinel { mapping_id }.emit(u64::from(mapping_id));
+             return false;
+         }
++        crate::runtime::surface_quarantine::lift(self, mapping_id, "unmap");
+         self.forget_compositor_mapping(mapping_id);
+         if let Some(e) = self.mappings.get_mut(&mapping_id) {
+             e.mapped = false;
+@@ -3722,6 +3732,9 @@ impl DeviceState {
+                 .emit(u64::from(mapping_id));
+             return false;
+         }
++        if self.mappings.get(&mapping_id).map(|m| m.mapping_internal) != Some(mapping_internal) {
++            crate::runtime::surface_quarantine::lift(self, mapping_id, "new_internal");
++        }
+         let e = self.mappings.entry(mapping_id).or_default();
+         // A re-statement of the SAME MappingInternal (notify trailing our
+         // eager resolve) is not a new surface: keep bindings, generation,
+diff --git a/crates/reims-vgpu/src/runtime/drain/mod.rs b/crates/reims-vgpu/src/runtime/drain/mod.rs
+index d2bb3c93..f2c0828f 100644
+--- a/crates/reims-vgpu/src/runtime/drain/mod.rs
++++ b/crates/reims-vgpu/src/runtime/drain/mod.rs
+@@ -5149,6 +5149,7 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut
+         state.pending.iosfc = false;
+         return;
+     }
++    note_iosfc_ring_backlog(state, producer, consumer);
+ 
+     // Process requests between consumer and producer when ring is programmed.
+     // Request `idx` lives in slot `idx % capacity`; see
+@@ -5172,6 +5173,17 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut
+                 .read_gpa(state.iosfc.ring_base + entry_off, &mut e)
+                 .is_err()
+             {
++                // The rest of this backlog, an UNMAP included, waits for the
++                // next publish: `pending.iosfc` is cleared below either way.
++                note_store_route("iosfc_ring_read_failed");
++                if crate::observe::first_sight("iosfc_ring_read_failed", 0) {
++                    crate::observe::fail(format!(
++                        "iosfc_ring_read_failed idx={idx} producer={producer} consumer={consumer} \
++                         gpa={:#x} (the requests from here on are read at the next publish, not \
++                         now; an UNMAP among them arrives late)",
++                        state.iosfc.ring_base + entry_off
++                    ));
++                }
+                 break;
+             }
+             let rtype = ld32(&e[MAPPER_REQUEST_TYPE..]);
+@@ -5247,6 +5259,65 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut
+     state.pending.iosfc = false;
+ }
+ 
++/// What the mapper ring holds unread when the guest publishes.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum RingBacklog {
++    /// One request, the one just published: the ordinary case, since the ring
++    /// is drained at every publish.
++    One,
++    /// Several unread requests, all still in their slots.
++    Several(u32),
++    /// More unread requests than slots: the guest has overwritten `lost`
++    /// requests this device never read.
++    Overrun { lost: u32 },
++    /// The consumer is ahead of the producer. The drain catches it up without
++    /// reading anything.
++    ConsumerAhead,
++}
++
++pub(crate) fn ring_backlog(producer: u32, consumer: u32, capacity: u32) -> RingBacklog {
++    if producer < consumer {
++        return RingBacklog::ConsumerAhead;
++    }
++    match producer - consumer {
++        0 | 1 => RingBacklog::One,
++        lag if lag > capacity => RingBacklog::Overrun {
++            lost: lag - capacity,
++        },
++        lag => RingBacklog::Several(lag),
++    }
++}
++
++/// Count the mapper ring's backlog at a publish. Always on: one subtraction per
++/// publish, and a line only the first time a request is lost.
++///
++/// A lost UNMAP leaves this device holding the page list of a surface the
++/// guest has freed and writing frames into it, which is what reading past the
++/// ring did before 8a7b3334. An overrun is the other way to lose one, and so is
++/// a consumer the guest moved ahead of the producer.
++fn note_iosfc_ring_backlog(state: &DeviceState, producer: u32, consumer: u32) {
++    let capacity = state.iosfc.capacity;
++    if state.iosfc.ring_base == 0 || capacity == 0 {
++        return;
++    }
++    let (route, lost) = match ring_backlog(producer, consumer, capacity) {
++        RingBacklog::One => return,
++        RingBacklog::Several(_) => ("iosfc_ring_backlog", None),
++        RingBacklog::Overrun { lost } => ("iosfc_ring_overrun", Some(lost.to_string())),
++        RingBacklog::ConsumerAhead => ("iosfc_ring_consumer_ahead", Some("unknown".into())),
++    };
++    note_store_route(route);
++    if let Some(lost) = lost {
++        if crate::observe::first_sight(route, 0) {
++            crate::observe::fail(format!(
++                "{route} producer={producer} consumer={consumer} capacity={capacity} lost={lost} \
++                 (mapper requests the guest published and this device will not read; a lost \
++                 UNMAP leaves its pages written after the guest freed them)"
++            ));
++        }
++    }
++}
++
+ /// Display-side present completion: after `presentFrame` retains the surface,
+ /// set pending bit 1 on the display shared page, read the enable mask, and poke
+ /// the display IRQ when the guest asked for present notifications. This is the
+diff --git a/crates/reims-vgpu/src/runtime/drain/tests.rs b/crates/reims-vgpu/src/runtime/drain/tests.rs
+index 9315d6da..d84340d6 100644
+--- a/crates/reims-vgpu/src/runtime/drain/tests.rs
++++ b/crates/reims-vgpu/src/runtime/drain/tests.rs
+@@ -6774,3 +6774,17 @@ mod pipeline_wait {
+         );
+     }
+ }
++
++/// The ring backlog the mapper reports, at each edge.
++#[test]
++fn the_mapper_ring_backlog_names_an_overrun_and_a_consumer_ahead() {
++    assert_eq!(ring_backlog(5, 4, 4), RingBacklog::One);
++    assert_eq!(ring_backlog(7, 4, 4), RingBacklog::Several(3));
++    assert_eq!(
++        ring_backlog(8, 4, 4),
++        RingBacklog::Several(4),
++        "a full ring is not lost yet"
++    );
++    assert_eq!(ring_backlog(10, 4, 4), RingBacklog::Overrun { lost: 2 });
++    assert_eq!(ring_backlog(3, 4, 4), RingBacklog::ConsumerAhead);
++}
+diff --git a/crates/reims-vgpu/src/runtime/mapper/mod.rs b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+index d2c29175..bd60ebae 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/mod.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+@@ -714,6 +714,7 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
+             }
+         }
+         m.page_entries = plan.entries;
++        m.validated_ms = crate::observe::elapsed_ms() as u64;
+         m.page_table_kva = plan.page_table_kva;
+         m.mapping_internal = internal;
+         m.mapped = true;
+@@ -891,6 +892,9 @@ fn fail_closed_surface_page_collision(
+     path: &str,
+ ) {
+     note_surface_page_collision(mapping_id, gpa, owner, mine_pages, path);
++    // Both sides, before this one's page list is withdrawn below: the collision
++    // does not say which of the two is stale.
++    crate::runtime::surface_quarantine::quarantine_collision(state, mapping_id, owner, gpa, path);
+     let _ = state.invalidate_mapping_pages(mapping_id);
+ }
+ 
+@@ -1416,6 +1420,9 @@ impl PagesVouched {
+                 .mappings
+                 .get(&mapping_id)
+                 .is_some_and(|m| m.map_generation == self.map_generation)
++            // A quarantine revokes every proof at once, including one minted
++            // before it: see `runtime::surface_quarantine`.
++            && !crate::runtime::surface_quarantine::is_quarantined(state, mapping_id)
+     }
+ }
+ 
+@@ -1448,6 +1455,10 @@ pub fn vouch_mapping_pages_verdict<H: HostMemory + HostOps>(
+     if verdict == PagesVerdict::Drifted {
+         return (verdict, None);
+     }
++    if crate::runtime::surface_quarantine::is_quarantined(state, mapping_id) {
++        crate::runtime::surface_quarantine::note_refused(mapping_id, "vouch");
++        return (verdict, None);
++    }
+     let token = state.mappings.get(&mapping_id).map(|m| PagesVouched {
+         mapping_id,
+         map_generation: m.map_generation,
+@@ -2558,5 +2569,8 @@ fn mapping_run_import_is_slow(elapsed_us: u64) -> bool {
+ #[cfg(test)]
+ mod revalidate_tests;
+ 
++#[cfg(test)]
++mod quarantine_tests;
++
+ #[cfg(test)]
+ mod tests;
+diff --git a/crates/reims-vgpu/src/runtime/mapper/quarantine_tests.rs b/crates/reims-vgpu/src/runtime/mapper/quarantine_tests.rs
+new file mode 100644
+index 00000000..26412dc0
+--- /dev/null
++++ b/crates/reims-vgpu/src/runtime/mapper/quarantine_tests.rs
+@@ -0,0 +1,192 @@
++//! Tests for the quarantine of two type-11 mappings that claim one guest page.
++//! See [`crate::runtime::surface_quarantine`].
++
++use super::*;
++use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
++use crate::model::{DeviceId, PAGE_SHIFT_X86};
++use crate::runtime::host::FakeHost;
++use crate::runtime::host_writes::HostWriteVerdict;
++use crate::runtime::surface_quarantine::is_quarantined;
++
++const PAGE: u64 = 1 << PAGE_SHIFT_X86;
++/// The old surface's two pages, apart so writes take the fragmented path.
++const P0: u64 = 0x1000_0000;
++const P1: u64 = 0x2000_0000;
++/// The display surface the guest stopped owning without an UNMAP, and the new
++/// surface handed one of its pages, as on the 27 boot (mid=2, mid=8).
++const OLD: u32 = 2;
++const NEW: u32 = 8;
++
++fn entry(gpa: u64) -> u32 {
++    ((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT | PAGE_ENTRY_VALID
++}
++
++fn surface(state: &mut DeviceState, mid: u32, pages: &[u64]) {
++    state.map_surface(mid);
++    let m = state.mappings.get_mut(&mid).unwrap();
++    m.page_entries = pages.iter().map(|&p| entry(p)).collect();
++    m.mapping_internal = 1;
++    m.has_geom = true;
++    m.width = 4;
++    m.height = 4;
++    m.format = crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
++}
++
++fn fixture() -> (FakeHost, DeviceState) {
++    let mut host = FakeHost::new();
++    host.strict_linux_map = true;
++    host.map_range(P0, PAGE as usize, 0);
++    host.map_range(P1, PAGE as usize, 0);
++    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
++    surface(&mut state, OLD, &[P0, P1]);
++    (host, state)
++}
++
++fn owe_a_frame(state: &mut DeviceState, mid: u32) {
++    let generation = state.mappings[&mid].map_generation;
++    let _ = state.pending_writebacks.arm(
++        mid,
++        crate::runtime::writeback_debt::test_resident_identity(mid, 4, 4, 1),
++        4,
++        4,
++        generation,
++    );
++}
++
++fn untouched(host: &FakeHost) -> bool {
++    [P0, P1].iter().all(|&gpa| {
++        let mut b = [0u8; 16];
++        host.read_gpa(gpa, &mut b).unwrap();
++        b == [0u8; 16]
++    })
++}
++
++/// The guest hands a page of a live surface to a new one: both are
++/// quarantined, the evidence is logged with both sides, and the old surface
++/// takes nothing through any writer — a flush, a proof minted before the
++/// collision, its owed frame — nor after its own table is re-read unchanged.
++#[test]
++fn a_collision_quarantines_both_and_the_old_surface_takes_no_write() {
++    let (mut host, mut state) = fixture();
++    owe_a_frame(&mut state, OLD);
++    let early = vouch_mapping_pages_verdict(&mut state, &host, OLD)
++        .1
++        .expect("vouched before the collision");
++    surface(&mut state, NEW, &[P1]);
++    let epoch = state.host_writes.epoch();
++
++    let cap = crate::observe::sink::FailCapture::start();
++    let (gpa, owner) = first_surface_page_collision(&state, NEW).expect("the new surface collides");
++    assert_eq!((gpa, owner), (P1, OLD));
++    fail_closed_surface_page_collision(&mut state, NEW, gpa, owner, 1, "rewire");
++
++    assert!(is_quarantined(&state, OLD) && is_quarantined(&state, NEW));
++    let line = cap
++        .lines()
++        .into_iter()
++        .find(|l| l.contains("surface_quarantine site=rewire"))
++        .expect("a quarantine line");
++    assert!(line.contains(&format!("gpa={P1:#x}")), "{line}");
++    assert!(line.contains("new=[mid=8 gen="), "{line}");
++    assert!(line.contains("owner=[mid=2 gen="), "{line}");
++    assert!(
++        line.contains("owes=true pages=2"),
++        "the old side's debt: {line}"
++    );
++    assert!(line.contains("in_flight="), "{line}");
++
++    let frame: Vec<u8> = [89u8, 101, 112, 255].repeat(16);
++    assert!(!crate::runtime::mapping_write::write_bgra8_uncached(
++        &mut state, &mut host, OLD, &frame, 16, 4, 4
++    ));
++    assert!(!write_mapping_bytes(
++        &mut state, &mut host, OLD, 0, b"EARLY", &early
++    ));
++    crate::runtime::writeback_debt::pay_for_mapping(&mut state, &mut host, OLD);
++    assert!(
++        state.pending_writebacks.get(OLD).is_some(),
++        "the frame is held, neither written nor dropped"
++    );
++
++    // A resolve that reads the same old table back changes nothing.
++    {
++        let m = state.mappings.get_mut(&OLD).unwrap();
++        m.page_entries = vec![entry(P0), entry(P1)];
++        m.validated_ms = crate::observe::elapsed_ms() as u64;
++    }
++    assert!(!crate::runtime::mapping_write::write_bgra8_uncached(
++        &mut state, &mut host, OLD, &frame, 16, 4, 4
++    ));
++
++    assert!(untouched(&host), "no byte reached either page");
++    assert_eq!(
++        state.host_writes.wrote_any_since(epoch, &[P0, P1]),
++        HostWriteVerdict::Quiet
++    );
++}
++
++/// The guest's UNMAP of the old surface is the evidence: its quarantine lifts
++/// and its frame is dropped unwritten, and the new surface, left without a
++/// counterpart, is lifted with it and writes again.
++#[test]
++fn the_old_surfaces_unmap_lifts_both_and_drops_only_its_frame() {
++    let (mut host, mut state) = fixture();
++    owe_a_frame(&mut state, OLD);
++    surface(&mut state, NEW, &[P1]);
++    fail_closed_surface_page_collision(&mut state, NEW, P1, OLD, 1, "rewire");
++    let cap = crate::observe::sink::FailCapture::start();
++
++    assert!(state.unmap_surface(OLD));
++    assert!(!is_quarantined(&state, OLD) && !is_quarantined(&state, NEW));
++    assert!(
++        state.pending_writebacks.get(OLD).is_none(),
++        "dropped, not paid"
++    );
++    let lines = cap.lines();
++    assert!(lines.iter().any(
++        |l| l.contains("surface_quarantine_lifted mid=2 evidence=unmap")
++            && l.contains("debt_dropped=true")
++    ));
++    assert!(lines
++        .iter()
++        .any(|l| l.contains("surface_quarantine_lifted mid=8 evidence=partner_unmap")));
++
++    // The new surface re-resolves its page and owns it now.
++    state.mappings.get_mut(&NEW).unwrap().page_entries = vec![entry(P1)];
++    let token = vouch_mapping_pages_verdict(&mut state, &host, NEW)
++        .1
++        .expect("the survivor can be vouched");
++    assert!(write_mapping_bytes(
++        &mut state, &mut host, NEW, 0, b"MINE", &token
++    ));
++    let mut got = [0u8; 4];
++    host.read_gpa(P1, &mut got).unwrap();
++    assert_eq!(&got, b"MINE");
++}
++
++/// A new MAP of the old id is a rebind: its quarantine lifts and its old
++/// frame is dropped. A MappingInternal re-stated unchanged is not evidence.
++#[test]
++fn a_rebind_lifts_the_quarantine_and_a_restatement_does_not() {
++    let (_host, mut state) = fixture();
++    owe_a_frame(&mut state, OLD);
++    surface(&mut state, NEW, &[P1]);
++    fail_closed_surface_page_collision(&mut state, NEW, P1, OLD, 1, "rewire");
++
++    assert!(
++        state.attach_mapping_internal(OLD, 1),
++        "the same MappingInternal"
++    );
++    assert!(
++        is_quarantined(&state, OLD),
++        "a re-statement is not a rebind"
++    );
++
++    assert!(state.map_surface(OLD));
++    assert!(!is_quarantined(&state, OLD));
++    assert!(state.pending_writebacks.get(OLD).is_none());
++    assert!(
++        !is_quarantined(&state, NEW),
++        "its only counterpart was rebound"
++    );
++}
+diff --git a/crates/reims-vgpu/src/runtime/mod.rs b/crates/reims-vgpu/src/runtime/mod.rs
+index bd8c5bb4..7c92887b 100644
+--- a/crates/reims-vgpu/src/runtime/mod.rs
++++ b/crates/reims-vgpu/src/runtime/mod.rs
+@@ -108,6 +108,9 @@ pub mod present_identity;
+ /// edit of them requires — the direction that is ordered is the map.
+ pub mod range_coverage;
+ pub mod released_pages;
++/// Type-11 mappings that claim one guest page, held out of writing until the
++/// guest says which one it released.
++pub mod surface_quarantine;
+ /// Transfer a host-resident render frame into guest pages when synchronization
+ /// or a guest-memory reader makes the bytes observable.
+ pub mod render_writeback;
+diff --git a/crates/reims-vgpu/src/runtime/render_writeback.rs b/crates/reims-vgpu/src/runtime/render_writeback.rs
+index 452342ba..c4b88916 100644
+--- a/crates/reims-vgpu/src/runtime/render_writeback.rs
++++ b/crates/reims-vgpu/src/runtime/render_writeback.rs
+@@ -697,6 +697,9 @@ settle_sites! {
+     MappingBytesWrite => "settle_mapping_bytes_write",
+     /// `mapper::read_mapping_bytes`.
+     MappingBytesRead => "settle_mapping_bytes_read",
++    /// `surface_quarantine::quarantine_collision` — both colliding mappings'
++    /// pages, before anything is decided about them.
++    Quarantine => "settle_quarantine",
+ }
+ 
+ /// Block until every guest-page write this device has submitted has executed.
+diff --git a/crates/reims-vgpu/src/runtime/surface_quarantine.rs b/crates/reims-vgpu/src/runtime/surface_quarantine.rs
+new file mode 100644
+index 00000000..db9d5802
+--- /dev/null
++++ b/crates/reims-vgpu/src/runtime/surface_quarantine.rs
+@@ -0,0 +1,246 @@
++//! Type-11 mappings that claim the same guest page, held out of writing until
++//! the guest says which one it released.
++//!
++//! # Why
++//!
++//! Two live IOSurface mappings over one physical page means one of them names
++//! memory it no longer owns. On macOS 27 the guest handed a display surface's
++//! pages to the kernel and to new surfaces without any UNMAP for the old one;
++//! the device saw the new surface collide, closed the *new* mapping, and went on
++//! writing frames through the old one — into the kernel's memory. Nothing on the
++//! device side says which of the two is stale: the old mapping's table re-reads
++//! identically, a fresh walk only proves the address translation, and `mapped`
++//! only says no UNMAP arrived.
++//!
++//! # What this does
++//!
++//! On a collision both mappings' current incarnations are quarantined. Their
++//! write authority is revoked at once — a page proof (`PagesVouched`) covers
++//! neither, so every CPU write-back, import write and direct write refuses for
++//! the whole mapping, not only the colliding page — and GPU writes already
++//! submitted to either page list are waited for. Their owed frames stay in the
++//! ledger and are not written: the collision alone does not say whose they are.
++//!
++//! A quarantine is lifted only by protocol evidence about that mapping: an
++//! UNMAP, a new MAP or MappingInternal for its id, or its backing's delete; and
++//! a partner whose every counterpart was released that way is lifted with it.
++//! Re-reading the same page table lifts nothing. There is no page blacklist:
++//! the pages are free to belong to whoever the next protocol event names.
++
++use crate::model::DeviceState;
++
++/// Why one mapping is not written.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Quarantine {
++    /// The mappings it collided with, in order.
++    pub partners: Vec<u32>,
++    /// The first page they were found to share.
++    pub gpa: u64,
++    /// The mapping's own `map_generation` when it was quarantined.
++    pub generation: u32,
++    pub since_ms: u64,
++}
++
++pub fn is_quarantined(state: &DeviceState, mapping_id: u32) -> bool {
++    state
++        .mappings
++        .get(&mapping_id)
++        .is_some_and(|m| m.quarantine.is_some())
++}
++
++/// What one side of a collision held at the moment it was found.
++struct Side {
++    mapping_id: u32,
++    generation: u32,
++    validated_ago_ms: Option<u64>,
++    owes: bool,
++    pages: Vec<u64>,
++}
++
++impl Side {
++    fn of(state: &DeviceState, mapping_id: u32, now_ms: u64) -> Option<Self> {
++        let m = state.mappings.get(&mapping_id)?;
++        let shift = state.page_shift;
++        Some(Self {
++            mapping_id,
++            generation: m.map_generation,
++            validated_ago_ms: (m.validated_ms != 0).then(|| now_ms.saturating_sub(m.validated_ms)),
++            owes: state.pending_writebacks.get(mapping_id).is_some(),
++            pages: m
++                .page_entries
++                .iter()
++                .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, shift))
++                .collect(),
++        })
++    }
++
++    fn render(&self) -> String {
++        format!(
++            "mid={} gen={} validated_ago_ms={} owes={} pages={}",
++            self.mapping_id,
++            self.generation,
++            self.validated_ago_ms
++                .map_or_else(|| "never".to_string(), |ms| ms.to_string()),
++            self.owes,
++            self.pages.len()
++        )
++    }
++}
++
++/// Whether GPU writes already submitted can reach these pages.
++fn in_flight(pages: &[u64]) -> &'static str {
++    #[cfg(feature = "backend-vulkan")]
++    {
++        use crate::backend::vulkan::engine::{self, GuestWriteReach};
++        if !engine::guest_writes_outstanding() {
++            return "none";
++        }
++        match engine::guest_writes_reaching(pages) {
++            GuestWriteReach::Disjoint => "none",
++            GuestWriteReach::Overlap => "overlap",
++            GuestWriteReach::Unnamed => "unnamed",
++        }
++    }
++    #[cfg(not(feature = "backend-vulkan"))]
++    {
++        let _ = pages;
++        "none"
++    }
++}
++
++/// Quarantine both mappings of a collision `mapping_id` found with `owner` at
++/// `gpa`. Called before the caller fails the new mapping's resolve, while both
++/// page lists are still as they were.
++pub fn quarantine_collision(
++    state: &mut DeviceState,
++    mapping_id: u32,
++    owner: u32,
++    gpa: u64,
++    site: &str,
++) {
++    let now_ms = crate::observe::elapsed_ms() as u64;
++    let (Some(mine), Some(theirs)) = (
++        Side::of(state, mapping_id, now_ms),
++        Side::of(state, owner, now_ms),
++    ) else {
++        return;
++    };
++    let mut both: Vec<u64> = mine.pages.iter().chain(&theirs.pages).copied().collect();
++    both.sort_unstable();
++    both.dedup();
++    let in_flight = in_flight(&both);
++    let mut fresh = false;
++    for (side, partner) in [(&mine, owner), (&theirs, mapping_id)] {
++        let Some(m) = state.mappings.get_mut(&side.mapping_id) else {
++            continue;
++        };
++        match m.quarantine.as_mut() {
++            Some(q) => {
++                if !q.partners.contains(&partner) {
++                    q.partners.push(partner);
++                    fresh = true;
++                }
++            }
++            None => {
++                m.quarantine = Some(Quarantine {
++                    partners: vec![partner],
++                    gpa,
++                    generation: side.generation,
++                    since_ms: now_ms,
++                });
++                fresh = true;
++            }
++        }
++    }
++    crate::runtime::drain::note_store_route("surface_quarantine");
++    // Writes already submitted to either page list land before anything else
++    // is decided about them.
++    crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
++        crate::runtime::render_writeback::SettleSite::Quarantine,
++        || Some(both),
++    );
++    if fresh {
++        crate::observe::fail(format!(
++            "surface_quarantine site={site} gpa={gpa:#x} new=[{}] owner=[{}] in_flight={in_flight} \
++             (two live mappings claim one guest page; neither is written until a release, \
++             rebind or delete of one of them says which)",
++            mine.render(),
++            theirs.render()
++        ));
++    }
++}
++
++/// A protocol event about `mapping_id` that ends its claim: lift its
++/// quarantine, drop its owed frame unwritten, and lift every partner left
++/// without a counterpart, keeping that partner's frame.
++pub fn lift(state: &mut DeviceState, mapping_id: u32, evidence: &'static str) {
++    let now_ms = crate::observe::elapsed_ms() as u64;
++    let Some(q) = state
++        .mappings
++        .get_mut(&mapping_id)
++        .and_then(|m| m.quarantine.take())
++    else {
++        return;
++    };
++    let dropped = drop_debt(state, mapping_id);
++    crate::runtime::drain::note_store_route("surface_quarantine_lifted");
++    crate::observe::fail(format!(
++        "surface_quarantine_lifted mid={mapping_id} evidence={evidence} held_ms={} gen_then={} \
++         partners={:?} debt_dropped={dropped}",
++        now_ms.saturating_sub(q.since_ms),
++        q.generation,
++        q.partners
++    ));
++    for partner in q.partners {
++        let orphaned = state
++            .mappings
++            .get_mut(&partner)
++            .and_then(|m| m.quarantine.as_mut())
++            .map(|pq| {
++                pq.partners.retain(|&p| p != mapping_id);
++                pq.partners.is_empty()
++            })
++            .unwrap_or(false);
++        if !orphaned {
++            continue;
++        }
++        let Some(pq) = state
++            .mappings
++            .get_mut(&partner)
++            .and_then(|m| m.quarantine.take())
++        else {
++            continue;
++        };
++        crate::runtime::drain::note_store_route("surface_quarantine_lifted");
++        crate::observe::fail(format!(
++            "surface_quarantine_lifted mid={partner} evidence=partner_{evidence} partner={mapping_id} \
++             held_ms={} gen_then={} debt_dropped=false (its counterpart released its claim; \
++             this mapping's frame is kept)",
++            now_ms.saturating_sub(pq.since_ms),
++            pq.generation
++        ));
++    }
++}
++
++/// The released side's owed frame: dropped, never written.
++fn drop_debt(state: &mut DeviceState, mapping_id: u32) -> bool {
++    let Some(debt) = state.pending_writebacks.take(mapping_id) else {
++        return false;
++    };
++    #[cfg(feature = "backend-vulkan")]
++    crate::backend::vulkan::engine::note_resident_content_copied_out(&debt.identity);
++    #[cfg(not(feature = "backend-vulkan"))]
++    let _ = debt;
++    true
++}
++
++/// A write a quarantine refused. Counted every time, logged once a mapping.
++pub fn note_refused(mapping_id: u32, writer: &'static str) {
++    crate::runtime::drain::note_store_route("surface_quarantine_refused");
++    if crate::observe::first_sight("surface_quarantine_refused", u64::from(mapping_id)) {
++        crate::observe::fail(format!(
++            "surface_quarantine_refused mid={mapping_id} writer={writer} (a write to a mapping \
++             whose pages another live mapping also claims; not written)"
++        ));
++    }
++}
+diff --git a/crates/reims-vgpu/src/runtime/writeback_debt.rs b/crates/reims-vgpu/src/runtime/writeback_debt.rs
+index 49da4564..612f6bc5 100644
+--- a/crates/reims-vgpu/src/runtime/writeback_debt.rs
++++ b/crates/reims-vgpu/src/runtime/writeback_debt.rs
+@@ -297,6 +297,11 @@ impl PendingWritebacks {
+         self.debts.remove(&mapping_id)
+     }
+ 
++    /// Put back a debt that was taken and could not be paid, keeping its age.
++    pub fn restore(&mut self, mapping_id: u32, debt: WritebackDebt) {
++        self.debts.insert(mapping_id, debt);
++    }
++
+     /// Every mapping owed a frame, oldest arm first.
+     pub fn mappings_by_age(&self) -> Vec<u32> {
+         let mut all: Vec<(u64, u32)> = self.debts.iter().map(|(id, d)| (d.seq, *id)).collect();
+@@ -1436,6 +1441,13 @@ fn pay<M: HostMemory + HostOps>(
+     debt: WritebackDebt,
+     route: &'static str,
+ ) {
++    // A quarantined mapping's frame is neither written nor dropped: the
++    // collision does not say whose it is, and a release or rebind will.
++    if crate::runtime::surface_quarantine::is_quarantined(state, mapping_id) {
++        state.pending_writebacks.restore(mapping_id, debt);
++        crate::runtime::surface_quarantine::note_refused(mapping_id, "debt");
++        return;
++    }
+     let Some(entry) = state.mappings.get(&mapping_id) else {
+         crate::runtime::drain::note_store_route("wbdebt_generation_moved");
+         return;
+-- 
+2.43.0
+

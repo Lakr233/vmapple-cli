@@ -1,0 +1,1874 @@
+From b573dfb08d6af1ebc83221f77ec2b310eaadd548 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 07:31:12 +0800
+Subject: [PATCH 01/24] Keep metal2vulkan translations on disk across boots
+
+Every boot translated every shader again. m2v_cache lives for one
+process, and the only directory it had, reims-vgpu-m2v-cache-<pid>, is
+the translator's scratch. On macOS 27.2 the first frame's fragment
+shader (AIR 94568 bytes, SPIR-V 1.47 MB) takes about 8.3 s, and the
+translation-order hold keeps the display channel waiting behind it for
+longer than the guest waits for its first swap.
+
+runtime::m2v_disk sits under m2v_cache's translation. It keeps the
+translator's own output, SPIR-V and reflection, in
+$TMPDIR/reims-vgpu-m2v-cache/<translator>/<identity>.m2v, and the next
+process loads it instead of translating. A loaded entry goes through
+the same finish_translated as a fresh one, so only what reaches the
+translator is keyed: the AIR, kept in the entry and compared whole; the
+stage; the TransformOptions; and the translator itself, which is a
+build-time SHA-256 of metal2vulkan's source and Cargo.lock, its commit,
+the target, every METAL2VULKAN_* variable, and the path, size, mtime and
+version of llvm-dis and spirv-val. No device state reaches the
+translator on this path, so none is keyed.
+
+An entry is written to a temporary file in its directory, synced and
+renamed, so QEMUs racing on one key leave one whole entry. It carries
+its lengths and ends in a SHA-256 of everything before it; an entry
+that fails a check or names another identity is refused with a line
+saying which check, translated again and republished. Static-sampler
+LOD fields travel beside the reflection JSON as bit patterns, because
+JSON has no infinity.
+
+The hold, the queue and the translation order are unchanged.
+REIMS_VGPU_M2V_DISK_CACHE=off translates every boot cold again, for an
+A/B with one binary. Each outcome is a linux_m2v_disk line: open (with
+the entry count found), hit (load_ms), miss (translate_ms), refused,
+store_failed, and a summary when the queue drains.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit d414a3f535d06a358689a43051fdd1681318737b)
+---
+ Cargo.lock                                    |   3 +
+ crates/reims-vgpu/Cargo.toml                  |  12 +-
+ crates/reims-vgpu/build.rs                    |  92 ++-
+ crates/reims-vgpu/src/env.rs                  |  12 +-
+ crates/reims-vgpu/src/runtime/m2v_cache.rs    | 148 +++-
+ crates/reims-vgpu/src/runtime/m2v_disk/mod.rs | 699 ++++++++++++++++++
+ .../reims-vgpu/src/runtime/m2v_disk/sha256.rs | 125 ++++
+ .../reims-vgpu/src/runtime/m2v_disk/tests.rs  | 524 +++++++++++++
+ crates/reims-vgpu/src/runtime/mod.rs          |   2 +
+ 9 files changed, 1580 insertions(+), 37 deletions(-)
+ create mode 100644 crates/reims-vgpu/src/runtime/m2v_disk/mod.rs
+ create mode 100644 crates/reims-vgpu/src/runtime/m2v_disk/sha256.rs
+ create mode 100644 crates/reims-vgpu/src/runtime/m2v_disk/tests.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index d7508a0d..7990f322 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -655,6 +655,8 @@ dependencies = [
+ name = "metal2vulkan"
+ version = "0.1.0"
+ dependencies = [
++ "serde",
++ "serde_json",
+  "spirv",
+  "wait-timeout",
+ ]
+@@ -1252,6 +1254,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
+ dependencies = [
+  "serde_core",
++ "serde_derive",
+ ]
+ 
+ [[package]]
+diff --git a/crates/reims-vgpu/Cargo.toml b/crates/reims-vgpu/Cargo.toml
+index 1515a090..a0f73b47 100644
+--- a/crates/reims-vgpu/Cargo.toml
++++ b/crates/reims-vgpu/Cargo.toml
+@@ -46,8 +46,10 @@ reims-vgpu-wire = { path = "../reims-vgpu-wire" }
+ # run coalescing, window region planning. `no_std` + alloc, no host traits.
+ reims-vgpu-paging = { path = "../reims-vgpu-paging" }
+ ash = { version = "0.38", optional = true }
+-# Always available for Linux MTLB→AIR→SPIR-V (encode path + probes).
+-metal2vulkan = { path = "../../../metal2vulkan" }
++# Always available for Linux MTLB→AIR→SPIR-V (encode path + probes). `serde`
++# lets `runtime::m2v_disk` keep a translation's reflection across boots.
++metal2vulkan = { path = "../../../metal2vulkan", features = ["serde"] }
++serde_json = "1"
+ winit = { version = "0.30", optional = true }
+ ash-window = { version = "0.13", optional = true }
+ raw-window-handle = { version = "0.6", optional = true }
+@@ -60,12 +62,6 @@ block = "0.1"
+ foreign-types = "0.5"
+ libc = "0.2"
+ 
+-[dev-dependencies]
+-# Reads `reims-vgpu-wire`'s oracle fixtures — bytes Apple's own serializer
+-# produced — so `wire_fixtures_reach_the_decoders` can run them through this
+-# crate's decoders. Test-only: nothing here reaches the staticlib QEMU links.
+-serde_json = "1"
+-
+ [build-dependencies]
+ cc = "1"
+ 
+diff --git a/crates/reims-vgpu/build.rs b/crates/reims-vgpu/build.rs
+index 2bac6d1a..50594ba1 100644
+--- a/crates/reims-vgpu/build.rs
++++ b/crates/reims-vgpu/build.rs
+@@ -2,16 +2,106 @@
+ //!
+ //! Pre-rewrite C packages lived under `host/utils/` (deleted; git history only).
+ //!
+-//! The one thing it computes is whether the wire crate's oracle fixtures are on
++//! It computes two things. Whether the wire crate's oracle fixtures are on
+ //! disk, so `tests/wire_fixtures_reach_the_decoders.rs` stands down as `ignored`
+ //! rather than as `ok` when they are not. See `../reims-vgpu-wire/oracle/fixture_presence.rs`
+ //! for why the answer is shared with the wire crate instead of decided twice.
++//! And which metal2vulkan this build links, for `runtime::m2v_disk`'s key.
+ 
+ include!("../reims-vgpu-wire/oracle/fixture_presence.rs");
++include!("src/runtime/m2v_disk/sha256.rs");
++
++use std::path::{Path, PathBuf};
+ 
+ fn main() {
+     println!("cargo:rerun-if-changed=build.rs");
+     println!("cargo:rerun-if-changed=../reims-vgpu-wire/oracle/fixture_presence.rs");
++    println!("cargo:rerun-if-changed=src/runtime/m2v_disk/sha256.rs");
+     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
+     probe_wire_fixtures(&format!("{manifest}/../reims-vgpu-wire/fixtures"));
++    describe_translator(Path::new(&manifest));
++}
++
++// MARK: - Translator identity
++
++/// Export what `runtime::m2v_disk` keys a translation on that only the build
++/// knows: a SHA-256 over metal2vulkan's manifest and every file under its
++/// `src/`, plus the workspace `Cargo.lock` that pins its dependencies; its git
++/// commit; and the target triple.
++///
++/// The digest rather than the commit decides, because an uncommitted edit to
++/// the translator changes its output without changing its commit. An empty
++/// digest is how a build that could not read the source says so, and the
++/// runtime turns the disk cache off for it rather than key on nothing.
++fn describe_translator(manifest: &Path) {
++    // The same relative path Cargo.toml gives the dependency.
++    let translator = manifest.join("../../../metal2vulkan");
++    let lock = manifest.join("../../Cargo.lock");
++    for watched in [
++        translator.join("src"),
++        translator.join("Cargo.toml"),
++        lock.clone(),
++    ] {
++        println!("cargo:rerun-if-changed={}", watched.display());
++    }
++    let digest = match translator_source_digest(&translator, &lock) {
++        Ok(digest) => digest,
++        Err(error) => {
++            println!(
++                "cargo:warning=metal2vulkan source unreadable at {} ({error}); \
++                 the m2v disk cache is off in this build",
++                translator.display()
++            );
++            String::new()
++        }
++    };
++    let commit = std::process::Command::new("git")
++        .arg("-C")
++        .arg(&translator)
++        .args(["rev-parse", "HEAD"])
++        .output()
++        .ok()
++        .filter(|out| out.status.success())
++        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
++        .unwrap_or_else(|| "unknown".to_owned());
++    let target = std::env::var("TARGET").unwrap_or_default();
++    println!("cargo:rustc-env=REIMS_M2V_SOURCE_DIGEST={digest}");
++    println!("cargo:rustc-env=REIMS_M2V_COMMIT={commit}");
++    println!("cargo:rustc-env=REIMS_M2V_TARGET={target}");
++}
++
++fn translator_source_digest(translator: &Path, lock: &Path) -> std::io::Result<String> {
++    let mut files = vec![translator.join("Cargo.toml")];
++    collect_files(&translator.join("src"), &mut files)?;
++    files.sort();
++    let mut hasher = Sha256::default();
++    for path in &files {
++        let name = path.strip_prefix(translator).unwrap_or(path);
++        digest_file(&mut hasher, name, path)?;
++    }
++    digest_file(&mut hasher, Path::new("Cargo.lock"), lock)?;
++    Ok(sha256_hex(&hasher.finish()))
++}
++
++/// The name as well as the bytes, so a rename is a different translator, and
++/// the length first, so no two files' bytes can run together.
++fn digest_file(hasher: &mut Sha256, name: &Path, path: &Path) -> std::io::Result<()> {
++    let bytes = std::fs::read(path)?;
++    hasher.update(name.to_string_lossy().as_bytes());
++    hasher.update(&[0]);
++    hasher.update(&(bytes.len() as u64).to_le_bytes());
++    hasher.update(&bytes);
++    Ok(())
++}
++
++fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
++    for entry in std::fs::read_dir(dir)? {
++        let path = entry?.path();
++        if path.is_dir() {
++            collect_files(&path, files)?;
++        } else {
++            files.push(path);
++        }
++    }
++    Ok(())
+ }
+diff --git a/crates/reims-vgpu/src/env.rs b/crates/reims-vgpu/src/env.rs
+index ebff4908..a4c7c1cb 100644
+--- a/crates/reims-vgpu/src/env.rs
++++ b/crates/reims-vgpu/src/env.rs
+@@ -1089,6 +1089,15 @@ pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
+ /// flight instead of the last half millisecond of a batch.
+ pub const BATCH_DRAWS: &str = "REIMS_VGPU_BATCH_DRAWS";
+ 
++/// **Default on.** metal2vulkan translations outlive the process: each one is
++/// published under `$TMPDIR/reims-vgpu-m2v-cache` and the next boot loads it
++/// instead of translating again — see [`crate::runtime::m2v_disk`].
++///
++/// `off` keeps translations in this process only, which is what every boot did
++/// before the disk cache existed. It is the other arm of the cache's A/B: the
++/// same binary, translating every shader cold.
++pub const M2V_DISK_CACHE: &str = "REIMS_VGPU_M2V_DISK_CACHE";
++
+ /// What one variable says, including the two ways it says nothing usable.
+ ///
+ /// Four states rather than a `bool` because "unset", "explicitly on" and
+@@ -1207,7 +1216,7 @@ pub fn switch(name: &str) -> Switch {
+ /// Nothing enforces that a new `pub const` above is added to this list; the rule
+ /// is stated and honestly unenforced. What keeps it small is that the list is
+ /// next to the constants, and [`report_line`] is the only consumer.
+-pub const ALL: [&str; 27] = [
++pub const ALL: [&str; 28] = [
+     COLOR_GENERAL,
+     LAZY_WRITEBACK,
+     SLAB_RETAIN,
+@@ -1245,6 +1254,7 @@ pub const ALL: [&str; 27] = [
+     PASS_CHURN,
+     SHARED_TARGET,
+     FULLSCREEN,
++    M2V_DISK_CACHE,
+ ];
+ 
+ /// Every variable read as a [`count`] rather than as a [`Switch`].
+diff --git a/crates/reims-vgpu/src/runtime/m2v_cache.rs b/crates/reims-vgpu/src/runtime/m2v_cache.rs
+index c1d9f44a..ad104c35 100644
+--- a/crates/reims-vgpu/src/runtime/m2v_cache.rs
++++ b/crates/reims-vgpu/src/runtime/m2v_cache.rs
+@@ -12,16 +12,20 @@
+ //! hash narrows the bucket and `Slot::is` decides the hit; `ShaderId` carries
+ //! the argument for why the digest is not allowed to.
+ //! Measure-only hit/miss counters for fail-log census.
++//!
++//! Under it, [`crate::runtime::m2v_disk`] keeps what the translator returned
++//! across processes, so a miss here is a translation only once per translator.
+ 
+ use std::collections::{HashMap, VecDeque};
+ use std::hash::{Hash, Hasher};
+ use std::path::PathBuf;
+ use std::sync::{Arc, Mutex, OnceLock};
+ 
+-use metal2vulkan::passes::Stage;
++use metal2vulkan::passes::{Stage, TransformOptions};
+ use metal2vulkan::reflect::ShaderReflection;
+ 
+ use crate::observe::Decline;
++use crate::runtime::m2v_disk;
+ 
+ type FragmentRelocationCache = HashMap<(bool, bool), Arc<ShaderVariant>>;
+ type M2vResult<T> = Result<T, M2vCacheDecline>;
+@@ -695,6 +699,9 @@ fn air_key_kernel(air: &[u8], local_size: [u32; 3]) -> u64 {
+ }
+ 
+ /// Process-local temp dir for m2v path-based translate (reused across draws).
++///
++/// Scratch only, despite the name: what outlives the process is
++/// [`crate::runtime::m2v_disk`]'s `reims-vgpu-m2v-cache/` beside it.
+ fn tmp_dir() -> PathBuf {
+     static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+     DIR.get_or_init(|| {
+@@ -710,7 +717,23 @@ fn translation_lock() -> &'static Mutex<()> {
+     LOCK.get_or_init(|| Mutex::new(()))
+ }
+ 
+-fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
++/// Translate through [`crate::runtime::m2v_disk`], which answers from disk when
++/// an earlier process translated the same AIR with the same translator, and
++/// otherwise runs the translator and keeps its output for the next one. Either
++/// way the result goes through the same [`finish_translated`].
++fn translate_air(air: &[u8], stage: Stage, pipeline_ref: u32) -> M2vResult<CachedShader> {
++    let options = TransformOptions::default();
++    let key = m2v_disk::Key::new(stage, &options, air);
++    let translation =
++        m2v_disk::load_or_translate(&key, pipeline_ref, || run_translator(air, stage, options))?;
++    finish_translated(translation.spirv, translation.reflection, stage)
++}
++
++fn run_translator(
++    air: &[u8],
++    stage: Stage,
++    options: TransformOptions,
++) -> M2vResult<m2v_disk::Translation> {
+     // metal2vulkan's tool boundary uses fixed scratch names inside `tmp_dir`.
+     // Serialize sync and background calls so their AIR/LLVM/SPIR-V files never
+     // alias one another.
+@@ -726,28 +749,51 @@ fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
+     // Reflected translate: byte-identical SPIR-V PLUS the stage-interface facade.
+     // `reflection.datalayout` carries the source `target datalayout` the sanitizer
+     // strips, so the post-emit ABI reconciliation below no longer re-reads `k.ll`.
+-    let (spirv, reflection) =
+-        metal2vulkan::translate_reflected(path.to_str().unwrap_or(name), stage, &tmp)
+-            .map_err(|e| {
+-                // The next shader reuses the scratch name; keep this one for
+-                // the translator.
+-                let _ = std::fs::copy(&path, tmp.join(format!("failed-{}-{name}", air.len())));
+-                translate_decline(stage, e.to_string())
+-            })?;
+-    finish_translated(spirv, reflection, stage)
++    // The options are passed rather than defaulted inside the translator, so
++    // the ones the disk key names are the ones it ran with.
++    let (spirv, reflection) = metal2vulkan::translate_reflected_with_options(
++        path.to_str().unwrap_or(name),
++        stage,
++        &tmp,
++        options,
++    )
++    .map_err(|e| {
++        // The next shader reuses the scratch name; keep this one for
++        // the translator.
++        let _ = std::fs::copy(&path, tmp.join(format!("failed-{}-{name}", air.len())));
++        translate_decline(stage, e.to_string())
++    })?;
++    Ok(m2v_disk::Translation { spirv, reflection })
++}
++
++fn translate_kernel_air(
++    air: &[u8],
++    local_size: [u32; 3],
++    pipeline_ref: u32,
++) -> M2vResult<CachedShader> {
++    let opts = TransformOptions {
++        kernel_local_size: local_size,
++        ..Default::default()
++    };
++    let key = m2v_disk::Key::new(Stage::Kernel, &opts, air);
++    let m2v_disk::Translation { spirv, reflection } =
++        m2v_disk::load_or_translate(&key, pipeline_ref, || run_kernel_translator(air, opts))?;
++    if reflection.local_size != Some(local_size) {
++        return Err(M2vCacheDecline::KernelLocalSizeMismatch {
++            requested: local_size,
++            reflected: reflection.local_size,
++        });
++    }
++    finish_translated(spirv, reflection, Stage::Kernel)
+ }
+ 
+-fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedShader> {
++fn run_kernel_translator(air: &[u8], opts: TransformOptions) -> M2vResult<m2v_disk::Translation> {
+     let _guard = translation_lock().lock().unwrap_or_else(|e| e.into_inner());
+     let tmp = tmp_dir();
+     let path = tmp.join("k.air");
+     std::fs::write(&path, air).map_err(|e| M2vCacheDecline::KernelScratchWrite {
+         detail: e.to_string(),
+     })?;
+-    let opts = metal2vulkan::passes::TransformOptions {
+-        kernel_local_size: local_size,
+-        ..Default::default()
+-    };
+     let (spirv, reflection) = metal2vulkan::translate_reflected_with_options(
+         path.to_str().unwrap_or("k.air"),
+         Stage::Kernel,
+@@ -757,13 +803,7 @@ fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedSha
+     .map_err(|e| M2vCacheDecline::KernelTranslate {
+         detail: e.to_string(),
+     })?;
+-    if reflection.local_size != Some(local_size) {
+-        return Err(M2vCacheDecline::KernelLocalSizeMismatch {
+-            requested: local_size,
+-            reflected: reflection.local_size,
+-        });
+-    }
+-    finish_translated(spirv, reflection, Stage::Kernel)
++    Ok(m2v_disk::Translation { spirv, reflection })
+ }
+ 
+ /// Post-emit ABI reconciliation + package the translated shader with its reflection.
+@@ -915,13 +955,15 @@ fn async_worker() {
+                 Some(task) => task,
+                 None => {
+                     c.async_worker_running = false;
++                    drop(c);
++                    m2v_disk::summarize();
+                     return;
+                 }
+             }
+         };
+         let result = match task.kernel_local_size {
+-            Some(local_size) => translate_kernel_air(&task.air, local_size),
+-            None => translate_air(&task.air, task.stage),
++            Some(local_size) => translate_kernel_air(&task.air, local_size, task.pipeline_ref),
++            None => translate_air(&task.air, task.stage, task.pipeline_ref),
+         };
+         let (hits, misses, detail, failure) = {
+             let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
+@@ -1075,7 +1117,7 @@ pub fn translate_cached_reflected(
+         }
+     }
+ 
+-    let shader = Arc::new(translate_air(air, stage)?);
++    let shader = Arc::new(translate_air(air, stage, pipeline_ref)?);
+ 
+     {
+         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
+@@ -1136,7 +1178,7 @@ pub fn translate_cached_kernel_reflected(
+         }
+     }
+ 
+-    let shader = Arc::new(translate_kernel_air(air, local_size)?);
++    let shader = Arc::new(translate_kernel_air(air, local_size, pipeline_ref)?);
+ 
+     {
+         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
+@@ -1808,6 +1850,58 @@ mod tests {
+         reset_for_test();
+     }
+ 
++    /// A shader the next process loads from disk is the shader this process
++    /// translated: the same SPIR-V bytes and words and the same reflection,
++    /// through the same `finish_translated`. "The next process" is an emptied
++    /// memory cache over a newly opened disk cache on the same directory.
++    #[test]
++    fn a_shader_loaded_from_disk_is_the_shader_a_translation_makes() {
++        use crate::runtime::m2v_disk::tests::{Installed, TempRoot};
++        use crate::runtime::m2v_disk::{translator_fingerprint, DiskCache};
++
++        let _guard = test_lock();
++        if metal2vulkan::tools::run("llvm-dis", &["--version"]).is_err() {
++            eprintln!("skipped: no llvm-dis to translate with (QEMU gets /usr/lib/llvm-20/bin)");
++            return;
++        }
++        let air = std::fs::read(concat!(
++            env!("CARGO_MANIFEST_DIR"),
++            "/tests/fixtures/air/render_frag_static_sampler.air"
++        ))
++        .expect("the fixture is checked in");
++        let root = TempRoot::new("translate");
++        let translator = translator_fingerprint();
++
++        reset_for_test();
++        let first = Arc::new(DiskCache::open(root.path(), &translator).expect("open"));
++        let installed = Installed::new(Arc::clone(&first));
++        let fresh = translate_cached_reflected(&air, Stage::Fragment, 22).expect("translates");
++        drop(installed);
++        assert_eq!((first.counts().misses, first.counts().stored), (1, 1));
++        assert!(
++            fresh
++                .reflection
++                .bindings
++                .iter()
++                .any(|binding| binding.static_sampler.is_some()),
++            "the fixture's static sampler reached the reflection"
++        );
++
++        reset_for_test();
++        let second = Arc::new(DiskCache::open(root.path(), &translator).expect("reopen"));
++        assert_eq!(second.entries_at_open(), 1);
++        let _installed = Installed::new(Arc::clone(&second));
++        let loaded = translate_cached_reflected(&air, Stage::Fragment, 22).expect("loads");
++        assert_eq!((second.counts().hits, second.counts().misses), (1, 0));
++        assert_eq!(loaded.spirv, fresh.spirv);
++        assert_eq!(*loaded.words, *fresh.words);
++        assert_eq!(
++            format!("{:?}", loaded.reflection),
++            format!("{:?}", fresh.reflection)
++        );
++        reset_for_test();
++    }
++
+     #[test]
+     fn every_cache_decline_has_a_unique_log_safe_reason_and_fields() {
+         let all = [
+diff --git a/crates/reims-vgpu/src/runtime/m2v_disk/mod.rs b/crates/reims-vgpu/src/runtime/m2v_disk/mod.rs
+new file mode 100644
+index 00000000..26de1e5b
+--- /dev/null
++++ b/crates/reims-vgpu/src/runtime/m2v_disk/mod.rs
+@@ -0,0 +1,699 @@
++//! metal2vulkan translations kept on disk, so a boot loads what an earlier boot
++//! translated instead of translating it again.
++//!
++//! # Why
++//!
++//! [`super::m2v_cache`] holds translations for the life of one process, and
++//! every process started it empty. On a macOS 27.2 guest the first frame's
++//! fragment shader (AIR ~94 KB, SPIR-V ~1.47 MB) takes ~8.3 s to translate on
++//! every boot, and while it does, the translation-order hold keeps its sibling
++//! channels — the display channel among them — waiting for 9–18 s. The guest's
++//! display driver gives up on its first swap after 5 s. The Vulkan pipeline
++//! cache beside it in `$TMPDIR` already persisted; the translation in front of
++//! it did not, because its only directory was named after the process id.
++//!
++//! This is only the persistence. The hold, the queue and the order in which
++//! translations resolve stay `m2v_cache`'s: an entry found here resolves the
++//! same task the translator would have, sooner.
++//!
++//! # What is keyed
++//!
++//! An entry is the translator's own output — the SPIR-V and the reflection that
++//! `metal2vulkan::translate_reflected_with_options` returned — not the
++//! [`super::m2v_cache::CachedShader`] Reims derives from it. The caller runs the
++//! same post-processing on a loaded entry as on a fresh one, so a change on the
++//! Reims side of that line needs no key change. What reaches the translator is
++//! keyed:
++//!
++//! - the AIR, stored in the entry and compared whole on load. The file name is
++//!   a SHA-256 of the identity and only finds the file; as in `m2v_cache`, the
++//!   retained bytes decide the hit.
++//! - the stage, and the whole `TransformOptions` the caller passes (which holds
++//!   a kernel's LocalSize) by its `Debug` text, so a field added to the options
++//!   is keyed without anyone remembering to.
++//! - the translator, [`translator_fingerprint`]: a digest of metal2vulkan's
++//!   source and of `Cargo.lock` taken by `build.rs`, its commit, the target,
++//!   whether debug assertions are on, every `METAL2VULKAN_*` variable, and the
++//!   path, size, mtime and `--version` of the `llvm-dis` and `spirv-val` it runs.
++//!
++//! Nothing about the Vulkan device reaches the translator on this path. The
++//! options are the default, plus LocalSize for a kernel; metal2vulkan derives
++//! the rest (denormals, 32-lane SIMD) from the AIR; and the paravirt stream
++//! carries no function-constant values, so the translator folds those from the
++//! AIR too. No device capability or specialization state is keyed because none
++//! is an input.
++//!
++//! # On disk
++//!
++//! `$TMPDIR/reims-vgpu-m2v-cache/<translator>/` holds one `<identity>.m2v` per
++//! translation, and a `translator.txt` spelling out what `<translator>` stands
++//! for. A new translator starts an empty directory; the old one stays until an
++//! operator deletes it.
++//!
++//! An entry is written to a temporary file in its directory, synced, and renamed
++//! over its name. A reader sees no entry or a whole one, and two processes that
++//! publish one key leave whichever renamed last — the same translation either
++//! way. Every entry carries its lengths and ends in a SHA-256 of everything
++//! before it. One that fails either check, or whose identity is not the one
++//! asked for, is refused with a line naming the check, translated again, and
++//! republished.
++
++use std::io::Write;
++use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Arc, Mutex};
++use std::time::{Instant, UNIX_EPOCH};
++
++use metal2vulkan::passes::{Stage, TransformOptions};
++use metal2vulkan::reflect::ShaderReflection;
++
++use crate::env::Switch;
++
++mod sha256;
++#[cfg(test)]
++pub(crate) mod tests;
++
++use sha256::{sha256, sha256_hex, Sha256};
++
++/// Changes whenever the entry layout in [`DiskCache::encode`] does.
++const FORMAT: u32 = 1;
++const MAGIC: &[u8; 8] = b"RM2VDISK";
++const ROOT: &str = "reims-vgpu-m2v-cache";
++const ENTRY_SUFFIX: &str = ".m2v";
++const CHECKSUM_LEN: usize = 32;
++const SPIRV_MAGIC: u32 = 0x0723_0203;
++
++/// The programs metal2vulkan runs during a translation (`metal2vulkan::tools`).
++const TOOLS: [&str; 2] = ["llvm-dis", "spirv-val"];
++
++// MARK: - Identity
++
++/// One translation's inputs, short of the translator itself.
++pub struct Key<'a> {
++    stage: Stage,
++    options: String,
++    air: &'a [u8],
++}
++
++impl<'a> Key<'a> {
++    pub fn new(stage: Stage, options: &TransformOptions, air: &'a [u8]) -> Self {
++        Self {
++            stage,
++            options: format!("{options:?}"),
++            air,
++        }
++    }
++}
++
++fn stage_tag(stage: Stage) -> u8 {
++    match stage {
++        Stage::Vertex => 1,
++        Stage::Fragment => 2,
++        Stage::Kernel => 3,
++    }
++}
++
++/// Everything about the translator that a translation depends on and the AIR
++/// does not say, one fact a line. Its SHA-256 names the cache directory and is
++/// checked in every entry.
++pub fn translator_fingerprint() -> String {
++    let mut text = format!(
++        "format {FORMAT}\nm2v_source {}\nm2v_commit {}\ntarget {}\ndebug_assertions {}\n",
++        env!("REIMS_M2V_SOURCE_DIGEST"),
++        env!("REIMS_M2V_COMMIT"),
++        env!("REIMS_M2V_TARGET"),
++        cfg!(debug_assertions),
++    );
++    let mut variables: Vec<(String, String)> = std::env::vars_os()
++        .map(|(name, value)| {
++            (
++                name.to_string_lossy().into_owned(),
++                value.to_string_lossy().into_owned(),
++            )
++        })
++        .filter(|(name, _)| name.starts_with("METAL2VULKAN_"))
++        .collect();
++    variables.sort();
++    for (name, value) in variables {
++        text.push_str(&format!("env {name}={value}\n"));
++    }
++    for tool in TOOLS {
++        text.push_str(&format!("tool {tool} {}\n", tool_identity(tool)));
++    }
++    text
++}
++
++fn tool_identity(tool: &str) -> String {
++    let file = match resolve_tool(tool).map(std::fs::canonicalize) {
++        Some(Ok(path)) => match std::fs::metadata(&path) {
++            Ok(meta) => {
++                let mtime = meta
++                    .modified()
++                    .ok()
++                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
++                    .map_or(0, |since| since.as_nanos());
++                format!("{} size={} mtime={mtime}", path.display(), meta.len())
++            }
++            Err(error) => format!("{} unreadable({error})", path.display()),
++        },
++        Some(Err(error)) => format!("unresolved({error})"),
++        None => "unresolved".to_owned(),
++    };
++    // Through metal2vulkan's own runner, so the version is of whichever binary
++    // it resolves even if `resolve_tool` ever drifts from its search.
++    let version = match metal2vulkan::tools::run(tool, &["--version"]) {
++        Ok((out, err)) => one_line(&[out, err].concat()),
++        Err(error) => format!("error({})", one_line(error.as_bytes())),
++    };
++    format!("{file} version={version}")
++}
++
++/// `metal2vulkan::tools`' search, which is private: the `METAL2VULKAN_<TOOL>`
++/// override, four Homebrew and local directories, then `PATH`.
++fn resolve_tool(tool: &str) -> Option<PathBuf> {
++    let variable = format!(
++        "METAL2VULKAN_{}",
++        tool.replace('-', "_").to_ascii_uppercase()
++    );
++    if let Some(path) = std::env::var_os(variable) {
++        return Some(PathBuf::from(path));
++    }
++    let fixed = [
++        "/opt/homebrew/opt/llvm/bin",
++        "/usr/local/opt/llvm/bin",
++        "/opt/homebrew/bin",
++        "/usr/local/bin",
++    ]
++    .map(PathBuf::from);
++    let path = std::env::var_os("PATH").unwrap_or_default();
++    fixed
++        .into_iter()
++        .chain(std::env::split_paths(&path))
++        .map(|dir| dir.join(tool))
++        .find(|candidate| candidate.is_file())
++}
++
++fn one_line(bytes: &[u8]) -> String {
++    String::from_utf8_lossy(bytes)
++        .split_whitespace()
++        .collect::<Vec<_>>()
++        .join(" ")
++}
++
++// MARK: - Cache
++
++/// What the translator returned for one [`Key`].
++pub struct Translation {
++    pub spirv: Vec<u8>,
++    pub reflection: ShaderReflection,
++}
++
++pub enum Lookup {
++    Hit(Box<Translation>),
++    Miss,
++    /// An entry was there and was not used; the reason names the check it
++    /// failed.
++    Refused(&'static str),
++}
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct Counts {
++    pub hits: u64,
++    pub misses: u64,
++    pub refused: u64,
++    pub stored: u64,
++    pub store_failed: u64,
++}
++
++impl std::fmt::Display for Counts {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(
++            f,
++            "hits={} misses={} refused={} stored={} store_failed={}",
++            self.hits, self.misses, self.refused, self.stored, self.store_failed
++        )
++    }
++}
++
++#[derive(Default)]
++struct Counters {
++    hits: AtomicU64,
++    misses: AtomicU64,
++    refused: AtomicU64,
++    stored: AtomicU64,
++    store_failed: AtomicU64,
++}
++
++/// One translator's directory of entries.
++pub struct DiskCache {
++    dir: PathBuf,
++    translator: [u8; 32],
++    entries_at_open: usize,
++    counters: Counters,
++    summarized: Mutex<Counts>,
++}
++
++impl DiskCache {
++    /// The directory for `translator` (a [`translator_fingerprint`]) under
++    /// `root`, created if it is not there.
++    pub fn open(root: &Path, translator: &str) -> std::io::Result<Self> {
++        let digest = sha256(translator.as_bytes());
++        let dir = root.join(sha256_hex(&digest[..8]));
++        std::fs::create_dir_all(&dir)?;
++        if !dir.join("translator.txt").is_file() {
++            publish(&dir, "translator.txt", translator.as_bytes())?;
++        }
++        let entries_at_open = std::fs::read_dir(&dir)?
++            .filter_map(Result::ok)
++            .filter(|entry| is_entry_name(&entry.file_name().to_string_lossy()))
++            .count();
++        Ok(Self {
++            dir,
++            translator: digest,
++            entries_at_open,
++            counters: Counters::default(),
++            summarized: Mutex::new(Counts::default()),
++        })
++    }
++
++    pub fn dir(&self) -> &Path {
++        &self.dir
++    }
++
++    /// Entries in the directory when this process opened it: what an earlier
++    /// boot left to load.
++    pub fn entries_at_open(&self) -> usize {
++        self.entries_at_open
++    }
++
++    pub fn counts(&self) -> Counts {
++        let c = &self.counters;
++        Counts {
++            hits: c.hits.load(Ordering::Relaxed),
++            misses: c.misses.load(Ordering::Relaxed),
++            refused: c.refused.load(Ordering::Relaxed),
++            stored: c.stored.load(Ordering::Relaxed),
++            store_failed: c.store_failed.load(Ordering::Relaxed),
++        }
++    }
++
++    fn entry_name(&self, key: &Key<'_>) -> String {
++        let mut hasher = Sha256::default();
++        hasher.update(&self.translator);
++        hasher.update(&[stage_tag(key.stage)]);
++        hasher.update(&(key.options.len() as u64).to_le_bytes());
++        hasher.update(key.options.as_bytes());
++        hasher.update(key.air);
++        format!("{}{ENTRY_SUFFIX}", sha256_hex(&hasher.finish()))
++    }
++
++    pub fn load(&self, key: &Key<'_>) -> Lookup {
++        let lookup = match std::fs::read(self.dir.join(self.entry_name(key))) {
++            Ok(bytes) => match self.decode(&bytes, key) {
++                Ok(translation) => Lookup::Hit(Box::new(translation)),
++                Err(reason) => Lookup::Refused(reason),
++            },
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Lookup::Miss,
++            Err(_) => Lookup::Refused("unreadable"),
++        };
++        let counter = match lookup {
++            Lookup::Hit(_) => &self.counters.hits,
++            Lookup::Miss => &self.counters.misses,
++            Lookup::Refused(_) => &self.counters.refused,
++        };
++        counter.fetch_add(1, Ordering::Relaxed);
++        lookup
++    }
++
++    pub fn store(
++        &self,
++        key: &Key<'_>,
++        spirv: &[u8],
++        reflection: &ShaderReflection,
++    ) -> Result<(), String> {
++        let stored = self.encode(key, spirv, reflection).and_then(|bytes| {
++            publish(&self.dir, &self.entry_name(key), &bytes).map_err(|error| error.to_string())
++        });
++        let counter = match stored {
++            Ok(()) => &self.counters.stored,
++            Err(_) => &self.counters.store_failed,
++        };
++        counter.fetch_add(1, Ordering::Relaxed);
++        stored
++    }
++
++    /// The translator's output for `key`: loaded when this directory holds it,
++    /// otherwise `translate`d and published. Every outcome is one line.
++    pub fn load_or_translate<E>(
++        &self,
++        key: &Key<'_>,
++        pipeline_ref: u32,
++        translate: impl FnOnce() -> Result<Translation, E>,
++    ) -> Result<Translation, E> {
++        let stage = key.stage;
++        let air = key.air.len();
++        let started = Instant::now();
++        let refused = match self.load(key) {
++            Lookup::Hit(translation) => {
++                crate::observe::off(format!(
++                    "linux_m2v_disk hit pipe={pipeline_ref} stage={stage:?} air={air} spv={} load_ms={} {}",
++                    translation.spirv.len(),
++                    started.elapsed().as_millis(),
++                    self.counts()
++                ));
++                return Ok(*translation);
++            }
++            Lookup::Miss => None,
++            Lookup::Refused(reason) => {
++                crate::observe::fail(format!(
++                    "linux_m2v_disk refused pipe={pipeline_ref} stage={stage:?} air={air} reason={reason} entry={}",
++                    self.dir.join(self.entry_name(key)).display()
++                ));
++                Some(reason)
++            }
++        };
++        let started = Instant::now();
++        let translated = translate();
++        let translate_ms = started.elapsed().as_millis();
++        let (spv, published) = match &translated {
++            Ok(translation) => {
++                let published = match self.store(key, &translation.spirv, &translation.reflection) {
++                    Ok(()) => 1,
++                    Err(error) => {
++                        crate::observe::fail(format!(
++                            "linux_m2v_disk store_failed pipe={pipeline_ref} stage={stage:?} air={air} error={error}"
++                        ));
++                        0
++                    }
++                };
++                (translation.spirv.len(), published)
++            }
++            Err(_) => (0, 0),
++        };
++        let after = refused.map_or(String::new(), |reason| format!(" after_refused={reason}"));
++        crate::observe::off(format!(
++            "linux_m2v_disk miss pipe={pipeline_ref} stage={stage:?} air={air} spv={spv} translate_ms={translate_ms} translated={} published={published}{after} {}",
++            u8::from(translated.is_ok()),
++            self.counts()
++        ));
++        translated
++    }
++
++    // MARK: - Entry layout
++
++    /// `MAGIC`, `FORMAT` (u32), the translator digest (32 bytes), the stage
++    /// tag (u8), then options, AIR, SPIR-V and reflection JSON each as a u64
++    /// length and its bytes, then the static-sampler LOD bits (a u64 count of
++    /// three-u32 groups), then a SHA-256 of all of the above. Little-endian.
++    fn encode(
++        &self,
++        key: &Key<'_>,
++        spirv: &[u8],
++        reflection: &ShaderReflection,
++    ) -> Result<Vec<u8>, String> {
++        let (json, lods) = encode_reflection(reflection)?;
++        // A reflection that would not load as itself is not published: every
++        // later boot would refuse it, translate, and say nothing new.
++        let reloaded = decode_reflection(&json, &lods)?;
++        if format!("{reloaded:?}") != format!("{reflection:?}") {
++            return Err("the reflection does not survive a round trip".to_owned());
++        }
++        let mut out = Vec::with_capacity(
++            128 + key.options.len() + key.air.len() + spirv.len() + json.len() + lods.len() * 12,
++        );
++        out.extend_from_slice(MAGIC);
++        out.extend_from_slice(&FORMAT.to_le_bytes());
++        out.extend_from_slice(&self.translator);
++        out.push(stage_tag(key.stage));
++        for section in [key.options.as_bytes(), key.air, spirv, json.as_slice()] {
++            out.extend_from_slice(&(section.len() as u64).to_le_bytes());
++            out.extend_from_slice(section);
++        }
++        out.extend_from_slice(&(lods.len() as u64).to_le_bytes());
++        for bits in lods.iter().flatten() {
++            out.extend_from_slice(&bits.to_le_bytes());
++        }
++        let checksum = sha256(&out);
++        out.extend_from_slice(&checksum);
++        Ok(out)
++    }
++
++    fn decode(&self, bytes: &[u8], key: &Key<'_>) -> Result<Translation, &'static str> {
++        let body_len = bytes.len().checked_sub(CHECKSUM_LEN).ok_or("truncated")?;
++        let (body, checksum) = bytes.split_at(body_len);
++        if sha256(body)[..] != *checksum {
++            return Err("checksum");
++        }
++        let mut reader = Reader(body);
++        if reader.take(MAGIC.len())? != MAGIC {
++            return Err("magic");
++        }
++        if reader.u32()? != FORMAT {
++            return Err("format");
++        }
++        if reader.take(self.translator.len())? != self.translator {
++            return Err("translator");
++        }
++        if reader.take(1)? != [stage_tag(key.stage)] {
++            return Err("stage");
++        }
++        if reader.section()? != key.options.as_bytes() {
++            return Err("options");
++        }
++        if reader.section()? != key.air {
++            return Err("air");
++        }
++        let spirv = reader.section()?;
++        let json = reader.section()?;
++        let groups = reader.u64()?;
++        let mut lods = Vec::new();
++        for _ in 0..groups {
++            lods.push([reader.u32()?, reader.u32()?, reader.u32()?]);
++        }
++        if !reader.0.is_empty() {
++            return Err("trailing");
++        }
++        if spirv.len() < 20
++            || !spirv.len().is_multiple_of(4)
++            || spirv[..4] != SPIRV_MAGIC.to_le_bytes()
++        {
++            return Err("spirv");
++        }
++        let reflection = decode_reflection(json, &lods).map_err(|_| "reflection")?;
++        Ok(Translation {
++            spirv: spirv.to_vec(),
++            reflection,
++        })
++    }
++}
++
++struct Reader<'a>(&'a [u8]);
++
++impl<'a> Reader<'a> {
++    fn take(&mut self, len: usize) -> Result<&'a [u8], &'static str> {
++        if self.0.len() < len {
++            return Err("truncated");
++        }
++        let (head, rest) = self.0.split_at(len);
++        self.0 = rest;
++        Ok(head)
++    }
++
++    fn u32(&mut self) -> Result<u32, &'static str> {
++        let bytes = self.take(4)?;
++        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
++    }
++
++    fn u64(&mut self) -> Result<u64, &'static str> {
++        let low = u64::from(self.u32()?);
++        let high = u64::from(self.u32()?);
++        Ok(low | (high << 32))
++    }
++
++    fn section(&mut self) -> Result<&'a [u8], &'static str> {
++        let len = usize::try_from(self.u64()?).map_err(|_| "truncated")?;
++        self.take(len)
++    }
++}
++
++/// The reflection as JSON, with its static samplers' LOD fields beside it as
++/// bit patterns.
++///
++/// metal2vulkan decodes those three `f32`s from AIR halves, so a sampler with
++/// no upper clamp carries `inf` — and JSON has no infinity: serde_json writes
++/// `null` and will not read it back. The JSON carries zeros there instead.
++fn encode_reflection(reflection: &ShaderReflection) -> Result<(Vec<u8>, Vec<[u32; 3]>), String> {
++    let mut plain = reflection.clone();
++    let mut lods = Vec::new();
++    for sampler in plain
++        .bindings
++        .iter_mut()
++        .filter_map(|binding| binding.static_sampler.as_mut())
++    {
++        lods.push([
++            sampler.lod_min_clamp.to_bits(),
++            sampler.lod_max_clamp.to_bits(),
++            sampler.lod_bias.to_bits(),
++        ]);
++        sampler.lod_min_clamp = 0.0;
++        sampler.lod_max_clamp = 0.0;
++        sampler.lod_bias = 0.0;
++    }
++    let json = serde_json::to_vec(&plain).map_err(|error| error.to_string())?;
++    Ok((json, lods))
++}
++
++fn decode_reflection(json: &[u8], lods: &[[u32; 3]]) -> Result<ShaderReflection, String> {
++    let mut reflection: ShaderReflection =
++        serde_json::from_slice(json).map_err(|error| error.to_string())?;
++    let mut samplers = reflection
++        .bindings
++        .iter_mut()
++        .filter_map(|binding| binding.static_sampler.as_mut());
++    let mut lods = lods.iter();
++    loop {
++        match (samplers.next(), lods.next()) {
++            (Some(sampler), Some(&[min, max, bias])) => {
++                sampler.lod_min_clamp = f32::from_bits(min);
++                sampler.lod_max_clamp = f32::from_bits(max);
++                sampler.lod_bias = f32::from_bits(bias);
++            }
++            (None, None) => return Ok(reflection),
++            _ => return Err("static sampler count differs from its LOD groups".to_owned()),
++        }
++    }
++}
++
++fn is_entry_name(name: &str) -> bool {
++    name.ends_with(ENTRY_SUFFIX) && !name.starts_with('.')
++}
++
++/// Write `bytes` to `dir/name` so that no reader ever sees part of them: into a
++/// temporary file in the same directory, synced, then renamed over the name.
++fn publish(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
++    // Process-wide, so two caches open on one directory in one process — the
++    // tests, or a second device — cannot pick the same temporary name.
++    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
++    let temporary = dir.join(format!(
++        ".{name}.{}.{}.tmp",
++        std::process::id(),
++        SEQUENCE.fetch_add(1, Ordering::Relaxed)
++    ));
++    let published =
++        write_synced(&temporary, bytes).and_then(|()| std::fs::rename(&temporary, dir.join(name)));
++    if published.is_err() {
++        let _ = std::fs::remove_file(&temporary);
++    }
++    published
++}
++
++fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
++    let mut file = std::fs::OpenOptions::new()
++        .write(true)
++        .create_new(true)
++        .open(path)?;
++    file.write_all(bytes)?;
++    file.sync_all()
++}
++
++// MARK: - This process's cache
++
++/// `None` until first asked for, then the answer for the rest of the process.
++static SHARED: Mutex<Option<Option<Arc<DiskCache>>>> = Mutex::new(None);
++
++/// The cache this process translates through, opened on first use. `None` when
++/// `REIMS_VGPU_M2V_DISK_CACHE=off`, when the build could not digest the
++/// translator's source, or when the directory cannot be made; each says so once.
++pub fn shared() -> Option<Arc<DiskCache>> {
++    SHARED
++        .lock()
++        .unwrap_or_else(|e| e.into_inner())
++        .get_or_insert_with(open_shared)
++        .clone()
++}
++
++fn open_shared() -> Option<Arc<DiskCache>> {
++    // A test that wants a cache installs one with `replace_shared_for_test`;
++    // the rest must not write into the host's `$TMPDIR`.
++    if cfg!(test) {
++        return None;
++    }
++    match crate::env::read(crate::env::M2V_DISK_CACHE) {
++        (Switch::Off, _) => {
++            crate::observe::off("linux_m2v_disk disabled reason=env");
++            return None;
++        }
++        (Switch::Unrecognized, value) => crate::observe::fail(format!(
++            "linux_m2v_disk env_unrecognized value={} kept=on",
++            value.unwrap_or_default()
++        )),
++        (Switch::Unset | Switch::On, _) => {}
++    }
++    if option_env!("REIMS_M2V_SOURCE_DIGEST").is_none_or(str::is_empty) {
++        crate::observe::fail("linux_m2v_disk disabled reason=translator_source_unknown");
++        return None;
++    }
++    let root = std::env::temp_dir().join(ROOT);
++    let started = Instant::now();
++    let translator = translator_fingerprint();
++    match DiskCache::open(&root, &translator) {
++        Ok(cache) => {
++            crate::observe::off(format!(
++                "linux_m2v_disk open dir={} entries={} m2v_commit={} open_ms={}",
++                cache.dir.display(),
++                cache.entries_at_open,
++                env!("REIMS_M2V_COMMIT"),
++                started.elapsed().as_millis()
++            ));
++            Some(Arc::new(cache))
++        }
++        Err(error) => {
++            crate::observe::fail(format!(
++                "linux_m2v_disk disabled reason=open root={} error={error}",
++                root.display()
++            ));
++            None
++        }
++    }
++}
++
++#[cfg(test)]
++pub(crate) fn replace_shared_for_test(cache: Option<Arc<DiskCache>>) {
++    *SHARED.lock().unwrap_or_else(|e| e.into_inner()) = Some(cache);
++}
++
++/// [`DiskCache::load_or_translate`] on this process's cache, or `translate()`
++/// when there is none. `pipeline_ref` is telemetry, as everywhere in
++/// `m2v_cache`.
++pub fn load_or_translate<E>(
++    key: &Key<'_>,
++    pipeline_ref: u32,
++    translate: impl FnOnce() -> Result<Translation, E>,
++) -> Result<Translation, E> {
++    match shared() {
++        Some(cache) => cache.load_or_translate(key, pipeline_ref, translate),
++        None => translate(),
++    }
++}
++
++/// This process's totals, when they have moved since the last summary.
++/// `m2v_cache`'s worker calls it whenever its queue runs dry, so a boot's burst
++/// of translations ends in one line.
++pub fn summarize() {
++    let Some(cache) = shared() else {
++        return;
++    };
++    let counts = cache.counts();
++    {
++        let mut last = cache.summarized.lock().unwrap_or_else(|e| e.into_inner());
++        if *last == counts {
++            return;
++        }
++        *last = counts;
++    }
++    crate::observe::off(format!(
++        "linux_m2v_disk summary {counts} entries_at_open={} dir={}",
++        cache.entries_at_open,
++        cache.dir.display()
++    ));
++}
+diff --git a/crates/reims-vgpu/src/runtime/m2v_disk/sha256.rs b/crates/reims-vgpu/src/runtime/m2v_disk/sha256.rs
+new file mode 100644
+index 00000000..b5a31a4f
+--- /dev/null
++++ b/crates/reims-vgpu/src/runtime/m2v_disk/sha256.rs
+@@ -0,0 +1,125 @@
++// SHA-256 (FIPS 180-4).
++//
++// `build.rs` includes this file to digest metal2vulkan's source, and
++// `runtime::m2v_disk` uses it to name and checksum cache entries, so both halves
++// of the cache key come from one function. No inner doc comment for that reason:
++// `include!` splices this into the middle of the build script.
++
++const SHA256_K: [u32; 64] = [
++    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
++    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
++    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
++    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
++    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
++    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
++    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
++    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
++];
++
++pub struct Sha256 {
++    state: [u32; 8],
++    block: [u8; 64],
++    filled: usize,
++    length: u64,
++}
++
++impl Default for Sha256 {
++    fn default() -> Self {
++        Self {
++            state: [
++                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
++                0x5be0cd19,
++            ],
++            block: [0; 64],
++            filled: 0,
++            length: 0,
++        }
++    }
++}
++
++impl Sha256 {
++    pub fn update(&mut self, mut data: &[u8]) {
++        self.length = self.length.wrapping_add(data.len() as u64);
++        if self.filled > 0 {
++            let take = (64 - self.filled).min(data.len());
++            self.block[self.filled..self.filled + take].copy_from_slice(&data[..take]);
++            self.filled += take;
++            data = &data[take..];
++            if self.filled < 64 {
++                return;
++            }
++            sha256_compress(&mut self.state, &self.block);
++            self.filled = 0;
++        }
++        let (blocks, rest) = data.as_chunks::<64>();
++        for block in blocks {
++            sha256_compress(&mut self.state, block);
++        }
++        self.block[..rest.len()].copy_from_slice(rest);
++        self.filled = rest.len();
++    }
++
++    pub fn finish(mut self) -> [u8; 32] {
++        let bits = self.length.wrapping_mul(8);
++        self.update(&[0x80]);
++        while self.filled != 56 {
++            self.update(&[0]);
++        }
++        self.update(&bits.to_be_bytes());
++        let mut digest = [0u8; 32];
++        for (out, word) in digest.as_chunks_mut::<4>().0.iter_mut().zip(self.state) {
++            *out = word.to_be_bytes();
++        }
++        digest
++    }
++}
++
++#[allow(dead_code)] // the build script digests incrementally
++pub fn sha256(data: &[u8]) -> [u8; 32] {
++    let mut hasher = Sha256::default();
++    hasher.update(data);
++    hasher.finish()
++}
++
++pub fn sha256_hex(bytes: &[u8]) -> String {
++    bytes.iter().map(|b| format!("{b:02x}")).collect()
++}
++
++fn sha256_compress(state: &mut [u32; 8], block: &[u8; 64]) {
++    let mut w = [0u32; 64];
++    for (word, bytes) in w.iter_mut().zip(block.as_chunks::<4>().0) {
++        *word = u32::from_be_bytes(*bytes);
++    }
++    for i in 16..64 {
++        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
++        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
++        w[i] = w[i - 16]
++            .wrapping_add(s0)
++            .wrapping_add(w[i - 7])
++            .wrapping_add(s1);
++    }
++    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
++    for (k, wi) in SHA256_K.iter().zip(w) {
++        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
++        let ch = (e & f) ^ (!e & g);
++        let t1 = h
++            .wrapping_add(s1)
++            .wrapping_add(ch)
++            .wrapping_add(*k)
++            .wrapping_add(wi);
++        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
++        let maj = (a & b) ^ (a & c) ^ (b & c);
++        let t2 = s0.wrapping_add(maj);
++        h = g;
++        g = f;
++        f = e;
++        e = d.wrapping_add(t1);
++        d = c;
++        c = b;
++        b = a;
++        a = t1.wrapping_add(t2);
++    }
++    for (word, add) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
++        *word = word.wrapping_add(add);
++    }
++}
+diff --git a/crates/reims-vgpu/src/runtime/m2v_disk/tests.rs b/crates/reims-vgpu/src/runtime/m2v_disk/tests.rs
+new file mode 100644
+index 00000000..69929414
+--- /dev/null
++++ b/crates/reims-vgpu/src/runtime/m2v_disk/tests.rs
+@@ -0,0 +1,524 @@
++use super::*;
++
++use std::sync::atomic::AtomicBool;
++
++use metal2vulkan::reflect::{
++    DescriptorLocation, ResourceBinding, ResourceKind, SamplerAddressMode, SamplerBorderColor,
++    SamplerCompareFunction, SamplerCoordinates, SamplerFilter, SamplerMipFilter, SamplerReduction,
++    ShaderStage, StaticSamplerState, REFLECTION_VERSION, RESOURCE_DESCRIPTOR_SET,
++    SAMPLER_BINDING_BASE,
++};
++
++// MARK: - Support
++
++/// A directory under the host's temp dir, removed when dropped.
++pub(crate) struct TempRoot(PathBuf);
++
++impl TempRoot {
++    pub(crate) fn new(label: &str) -> Self {
++        static NEXT: AtomicU64 = AtomicU64::new(0);
++        let path = std::env::temp_dir().join(format!(
++            "reims-m2v-disk-test-{label}-{}-{}",
++            std::process::id(),
++            NEXT.fetch_add(1, Ordering::Relaxed)
++        ));
++        let _ = std::fs::remove_dir_all(&path);
++        std::fs::create_dir_all(&path).expect("a test root");
++        Self(path)
++    }
++
++    pub(crate) fn path(&self) -> &Path {
++        &self.0
++    }
++}
++
++impl Drop for TempRoot {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_dir_all(&self.0);
++    }
++}
++
++/// `cache` is this process's [`shared`] cache until the guard drops.
++pub(crate) struct Installed;
++
++impl Installed {
++    pub(crate) fn new(cache: Arc<DiskCache>) -> Self {
++        replace_shared_for_test(Some(cache));
++        Self
++    }
++}
++
++impl Drop for Installed {
++    fn drop(&mut self) {
++        replace_shared_for_test(None);
++    }
++}
++
++/// A module with a valid header and `words` words of body that `tag` makes
++/// distinguishable from any other tag's.
++fn spirv(tag: u32, words: usize) -> Vec<u8> {
++    let mut module = vec![SPIRV_MAGIC, 0x0001_0300, 0, 1, 0];
++    module.extend((0..words as u32).map(|i| i.wrapping_mul(0x9e37_79b9) ^ tag));
++    module.iter().flat_map(|word| word.to_le_bytes()).collect()
++}
++
++/// A fragment reflection with one static sampler whose LOD fields are `lods`.
++fn reflection(lods: [f32; 3]) -> ShaderReflection {
++    let [lod_min_clamp, lod_max_clamp, lod_bias] = lods;
++    ShaderReflection {
++        reflection_version: REFLECTION_VERSION,
++        stage: ShaderStage::Fragment,
++        entry_point: Some("fragment_main".to_owned()),
++        bindings: vec![ResourceBinding {
++            kind: ResourceKind::Sampler,
++            metal_index: 2,
++            descriptor: Some(DescriptorLocation {
++                set: RESOURCE_DESCRIPTOR_SET,
++                binding: SAMPLER_BINDING_BASE + 2,
++                count: 1,
++            }),
++            param_index: None,
++            stage_input_location: None,
++            address_space: None,
++            declared_size: None,
++            extent: None,
++            footprint: None,
++            type_layout: None,
++            type_name: None,
++            texture_shape: None,
++            embedded_source: None,
++            access: None,
++            static_sampler: Some(StaticSamplerState {
++                min_filter: SamplerFilter::Linear,
++                mag_filter: SamplerFilter::Linear,
++                mip_filter: SamplerMipFilter::None,
++                address_mode_s: SamplerAddressMode::ClampToEdge,
++                address_mode_t: SamplerAddressMode::ClampToEdge,
++                address_mode_r: SamplerAddressMode::ClampToEdge,
++                coordinates: SamplerCoordinates::Normalized,
++                compare_function: SamplerCompareFunction::None,
++                max_anisotropy: 1,
++                lod_min_clamp,
++                lod_max_clamp,
++                border_color: SamplerBorderColor::TransparentBlack,
++                reduction: SamplerReduction::WeightedAverage,
++                lod_bias,
++                raw_words: [0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210],
++            }),
++        }],
++        argument_buffer_fields: vec![],
++        vertex_attributes: vec![],
++        varyings: vec![],
++        render_targets: vec![],
++        depth_members: vec![],
++        depth_qualifier: None,
++        stencil_members: vec![],
++        local_size: None,
++        vertex_builtins: None,
++        tessellation: None,
++        imageblock_layouts: vec![],
++        implicit_imageblock_attachments: vec![],
++        fragment_imageblock: None,
++        datalayout: Some("e-p:64:64:64-i64:64:64".to_owned()),
++        function_constants: vec![],
++    }
++}
++
++fn translation(tag: u32) -> Translation {
++    Translation {
++        spirv: spirv(tag, 4096),
++        reflection: reflection([0.0, f32::INFINITY, 0.0]),
++    }
++}
++
++/// `bytes` with its trailing checksum recomputed, so a check behind the
++/// checksum can be reached.
++fn resealed(mut bytes: Vec<u8>) -> Vec<u8> {
++    bytes.truncate(bytes.len() - CHECKSUM_LEN);
++    let checksum = sha256(&bytes);
++    bytes.extend_from_slice(&checksum);
++    bytes
++}
++
++fn refusal(lookup: Lookup) -> Option<&'static str> {
++    match lookup {
++        Lookup::Refused(reason) => Some(reason),
++        Lookup::Hit(_) | Lookup::Miss => None,
++    }
++}
++
++fn is_miss(lookup: Lookup) -> bool {
++    matches!(lookup, Lookup::Miss)
++}
++
++// MARK: - SHA-256
++
++#[test]
++fn sha256_matches_the_published_vectors() {
++    assert_eq!(
++        sha256_hex(&sha256(b"")),
++        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
++    );
++    assert_eq!(
++        sha256_hex(&sha256(b"abc")),
++        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
++    );
++    assert_eq!(
++        sha256_hex(&sha256(
++            b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
++        )),
++        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
++    );
++    // A million `a`, fed in pieces that straddle every block boundary.
++    let mut hasher = Sha256::default();
++    let piece = [b'a'; 997];
++    let mut left = 1_000_000;
++    while left > 0 {
++        let n = left.min(piece.len());
++        hasher.update(&piece[..n]);
++        left -= n;
++    }
++    assert_eq!(
++        sha256_hex(&hasher.finish()),
++        "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
++    );
++}
++
++// MARK: - Fingerprint
++
++/// The fingerprint carries the build's digest of the translator's source and
++/// a line for each tool, and any `METAL2VULKAN_*` variable moves it — which
++/// moves the directory, so nothing translated under the old one is found.
++#[test]
++fn the_fingerprint_names_the_translator_build_and_environment() {
++    const PROBE: &str = "METAL2VULKAN_REIMS_DISK_CACHE_TEST_PROBE";
++    let base = translator_fingerprint();
++    let source = base
++        .lines()
++        .find_map(|line| line.strip_prefix("m2v_source "))
++        .expect("a source line");
++    assert_eq!(source.len(), 64, "{base}");
++    assert!(source.bytes().all(|b| b.is_ascii_hexdigit()), "{base}");
++    for tool in TOOLS {
++        assert!(base.contains(&format!("\ntool {tool} ")), "{base}");
++    }
++
++    // SAFETY: no other test reads or writes this variable, and metal2vulkan
++    // reads only the variables it names.
++    unsafe { std::env::set_var(PROBE, "1") };
++    let changed = translator_fingerprint();
++    unsafe { std::env::remove_var(PROBE) };
++    assert!(changed.contains(&format!("\nenv {PROBE}=1\n")), "{changed}");
++    assert_ne!(base, changed);
++
++    let root = TempRoot::new("fingerprint");
++    let before = DiskCache::open(root.path(), &base).expect("open");
++    let after = DiskCache::open(root.path(), &changed).expect("open");
++    assert_ne!(before.dir(), after.dir());
++    assert_eq!(
++        std::fs::read_to_string(after.dir().join("translator.txt")).expect("the note"),
++        changed
++    );
++}
++
++// MARK: - Across processes
++
++/// What one process publishes, the next loads without translating. Each
++/// "process" is a separately opened cache on the same directory.
++#[test]
++fn an_entry_published_by_one_process_is_a_hit_in_the_next() {
++    let root = TempRoot::new("hit");
++    let options = TransformOptions::default();
++    let air = b"air the first process translated".to_vec();
++    let key = Key::new(Stage::Fragment, &options, &air);
++    // NaN with a payload, infinity and negative zero: every LOD value JSON
++    // would lose or blur.
++    let lods = [f32::from_bits(0x7fc0_1234), f32::INFINITY, -0.0];
++    let made = Translation {
++        spirv: spirv(7, 8192),
++        reflection: reflection(lods),
++    };
++    let translations = AtomicU64::new(0);
++    let translate = || {
++        translations.fetch_add(1, Ordering::Relaxed);
++        Ok::<_, ()>(Translation {
++            spirv: made.spirv.clone(),
++            reflection: made.reflection.clone(),
++        })
++    };
++
++    let first = DiskCache::open(root.path(), "translator A").expect("open");
++    assert_eq!(first.entries_at_open(), 0);
++    first
++        .load_or_translate(&key, 22, translate)
++        .expect("translates");
++    assert_eq!(
++        first.counts(),
++        Counts {
++            misses: 1,
++            stored: 1,
++            ..Counts::default()
++        }
++    );
++    drop(first);
++
++    let second = DiskCache::open(root.path(), "translator A").expect("reopen");
++    assert_eq!(second.entries_at_open(), 1);
++    let loaded = second
++        .load_or_translate(&key, 22, translate)
++        .expect("loads");
++    assert_eq!(
++        translations.load(Ordering::Relaxed),
++        1,
++        "the second process translated"
++    );
++    assert_eq!(
++        second.counts(),
++        Counts {
++            hits: 1,
++            ..Counts::default()
++        }
++    );
++    assert_eq!(loaded.spirv, made.spirv);
++    assert_eq!(
++        format!("{:?}", loaded.reflection),
++        format!("{:?}", made.reflection)
++    );
++    let sampler = loaded.reflection.bindings[0]
++        .static_sampler
++        .expect("the sampler survives");
++    assert_eq!(
++        [
++            sampler.lod_min_clamp.to_bits(),
++            sampler.lod_max_clamp.to_bits(),
++            sampler.lod_bias.to_bits()
++        ],
++        lods.map(f32::to_bits)
++    );
++}
++
++// MARK: - Translator and configuration
++
++/// Nothing published under one translator or one set of inputs is found under
++/// another — and an entry carried to where another key would look for it is
++/// refused by what it says inside, not trusted for where it sits.
++#[test]
++fn a_different_translator_or_input_is_never_a_hit() {
++    let root = TempRoot::new("keys");
++    let air = b"air keyed several ways".to_vec();
++    let other_air = b"air keyed several ways, edited".to_vec();
++    let render = TransformOptions::default();
++    let kernel_16 = TransformOptions {
++        kernel_local_size: [16, 16, 1],
++        ..TransformOptions::default()
++    };
++    let kernel_8 = TransformOptions {
++        kernel_local_size: [8, 16, 1],
++        ..TransformOptions::default()
++    };
++    let multisampled = TransformOptions {
++        raster_sample_count: Some(4),
++        ..TransformOptions::default()
++    };
++
++    let a = DiskCache::open(root.path(), "translator A").expect("open A");
++    let fragment = Key::new(Stage::Fragment, &render, &air);
++    let kernel = Key::new(Stage::Kernel, &kernel_16, &air);
++    for key in [&fragment, &kernel] {
++        let made = translation(1);
++        a.store(key, &made.spirv, &made.reflection).expect("store");
++        assert!(matches!(a.load(key), Lookup::Hit(_)));
++    }
++
++    // Another translator: another directory, and nothing in it.
++    let b = DiskCache::open(root.path(), "translator B").expect("open B");
++    assert_ne!(a.dir(), b.dir());
++    assert!(is_miss(b.load(&fragment)));
++    assert!(is_miss(b.load(&kernel)));
++
++    // Same translator, any other input.
++    for (what, key) in [
++        ("stage", Key::new(Stage::Vertex, &render, &air)),
++        ("air", Key::new(Stage::Fragment, &render, &other_air)),
++        ("local size", Key::new(Stage::Kernel, &kernel_8, &air)),
++        ("options", Key::new(Stage::Fragment, &multisampled, &air)),
++    ] {
++        assert!(is_miss(a.load(&key)), "{what}");
++    }
++
++    // A's entry where B would look for the same key.
++    let entry = std::fs::read(a.dir().join(a.entry_name(&fragment))).expect("A's entry");
++    std::fs::write(b.dir().join(b.entry_name(&fragment)), &entry).expect("plant");
++    assert_eq!(refusal(b.load(&fragment)), Some("translator"));
++
++    // A's fragment entry where A would look for other inputs.
++    for (expected, key) in [
++        ("stage", Key::new(Stage::Vertex, &render, &air)),
++        ("options", Key::new(Stage::Fragment, &multisampled, &air)),
++        ("air", Key::new(Stage::Fragment, &render, &other_air)),
++    ] {
++        std::fs::write(a.dir().join(a.entry_name(&key)), &entry).expect("plant");
++        assert_eq!(refusal(a.load(&key)), Some(expected));
++    }
++}
++
++// MARK: - Damage
++
++/// A short, empty, flipped or padded entry is refused rather than loaded, and
++/// the next translation replaces it with a whole one.
++#[test]
++fn a_damaged_entry_is_refused_and_replaced() {
++    let root = TempRoot::new("damage");
++    let options = TransformOptions::default();
++    let air = b"air whose entry gets damaged".to_vec();
++    let key = Key::new(Stage::Fragment, &options, &air);
++    let cache = DiskCache::open(root.path(), "translator A").expect("open");
++    let made = translation(3);
++    cache
++        .store(&key, &made.spirv, &made.reflection)
++        .expect("store");
++    let path = cache.dir().join(cache.entry_name(&key));
++    let whole = std::fs::read(&path).expect("the entry");
++
++    let flipped = |at: usize| {
++        let mut bytes = whole.clone();
++        bytes[at] ^= 0x10;
++        bytes
++    };
++    let mut padded = whole.clone();
++    padded.push(0);
++    // Behind a checksum that matches, the header still has to.
++    let magic = resealed(flipped(0));
++    let format = resealed(flipped(MAGIC.len()));
++    let damaged = [
++        ("empty", Vec::new(), "truncated"),
++        ("half", whole[..whole.len() / 2].to_vec(), "checksum"),
++        (
++            "one byte short",
++            whole[..whole.len() - 1].to_vec(),
++            "checksum",
++        ),
++        ("a body bit", flipped(whole.len() / 2), "checksum"),
++        ("a checksum bit", flipped(whole.len() - 1), "checksum"),
++        ("a byte past the end", padded, "checksum"),
++        ("resealed magic", magic, "magic"),
++        ("resealed format", format, "format"),
++    ];
++    for (what, bytes, expected) in damaged {
++        std::fs::write(&path, &bytes).expect("damage");
++        assert_eq!(refusal(cache.load(&key)), Some(expected), "{what}");
++    }
++
++    let republished = cache
++        .load_or_translate(&key, 9, || Ok::<_, ()>(translation(3)))
++        .expect("translates again");
++    assert_eq!(republished.spirv, made.spirv);
++    assert_eq!(std::fs::read(&path).expect("republished"), whole);
++    assert!(matches!(cache.load(&key), Lookup::Hit(_)));
++    assert_eq!(cache.counts().refused, 9);
++    assert_eq!(cache.counts().stored, 2);
++}
++
++/// A module that does not start with the SPIR-V magic word is refused even
++/// when everything around it is consistent.
++#[test]
++fn an_entry_that_is_not_spirv_is_refused() {
++    let root = TempRoot::new("spirv");
++    let options = TransformOptions::default();
++    let air = b"air with a bad module".to_vec();
++    let key = Key::new(Stage::Fragment, &options, &air);
++    let cache = DiskCache::open(root.path(), "translator A").expect("open");
++    let mut not_spirv = spirv(4, 64);
++    not_spirv[0] ^= 0xff;
++    cache
++        .store(&key, &not_spirv, &reflection([0.0; 3]))
++        .expect("store");
++    assert_eq!(refusal(cache.load(&key)), Some("spirv"));
++}
++
++// MARK: - Concurrency
++
++/// Two QEMUs translating the same shader publish the same key at once. However
++/// the renames interleave, the directory ends with one whole entry and no
++/// temporary files, and a reader during the race sees either nothing or a
++/// whole entry — never part of one.
++#[test]
++fn writers_racing_on_one_key_leave_one_whole_entry() {
++    const WRITERS: u32 = 6;
++    const ROUNDS: u32 = 12;
++    let root = TempRoot::new("race");
++    let options = TransformOptions::default();
++    let air = b"air two processes translate at once".to_vec();
++    let candidates: Vec<Vec<u8>> = (0..WRITERS)
++        .map(|writer| spirv(writer, 2048 + writer as usize))
++        .collect();
++    let reflection = reflection([0.0, f32::INFINITY, 0.0]);
++    let start = std::sync::Barrier::new(WRITERS as usize + 2);
++    let done = AtomicBool::new(false);
++    let reads = AtomicU64::new(0);
++
++    std::thread::scope(|scope| {
++        let mut writers = Vec::new();
++        for writer in 0..WRITERS {
++            let (start, candidates, reflection, air, options) =
++                (&start, &candidates, &reflection, &air, &options);
++            let root = root.path();
++            writers.push(scope.spawn(move || {
++                let cache = DiskCache::open(root, "translator A").expect("open");
++                let key = Key::new(Stage::Fragment, options, air);
++                start.wait();
++                for _ in 0..ROUNDS {
++                    cache
++                        .store(&key, &candidates[writer as usize], reflection)
++                        .expect("publish");
++                }
++            }));
++        }
++        for _ in 0..2 {
++            let (start, candidates, air, options, done, reads) =
++                (&start, &candidates, &air, &options, &done, &reads);
++            let root = root.path();
++            scope.spawn(move || {
++                let cache = DiskCache::open(root, "translator A").expect("open");
++                let key = Key::new(Stage::Fragment, options, air);
++                start.wait();
++                while !done.load(Ordering::Acquire) {
++                    match cache.load(&key) {
++                        Lookup::Hit(hit) => assert!(candidates.contains(&hit.spirv)),
++                        Lookup::Miss => {}
++                        Lookup::Refused(reason) => {
++                            panic!("a reader saw part of an entry: {reason}")
++                        }
++                    }
++                    reads.fetch_add(1, Ordering::Relaxed);
++                }
++            });
++        }
++        for writer in writers {
++            writer.join().expect("a writer");
++        }
++        done.store(true, Ordering::Release);
++    });
++    assert!(reads.load(Ordering::Relaxed) > 0);
++
++    let cache = DiskCache::open(root.path(), "translator A").expect("reopen");
++    let mut names: Vec<String> = std::fs::read_dir(cache.dir())
++        .expect("the directory")
++        .map(|entry| {
++            entry
++                .expect("an entry")
++                .file_name()
++                .to_string_lossy()
++                .into_owned()
++        })
++        .filter(|name| name != "translator.txt")
++        .collect();
++    names.sort();
++    let key = Key::new(Stage::Fragment, &options, &air);
++    assert_eq!(names, vec![cache.entry_name(&key)]);
++    let Lookup::Hit(hit) = cache.load(&key) else {
++        panic!("the surviving entry does not load");
++    };
++    assert!(candidates.contains(&hit.spirv));
++    assert_eq!(cache.counts().refused, 0);
++}
+diff --git a/crates/reims-vgpu/src/runtime/mod.rs b/crates/reims-vgpu/src/runtime/mod.rs
+index 48271feb..bd8c5bb4 100644
+--- a/crates/reims-vgpu/src/runtime/mod.rs
++++ b/crates/reims-vgpu/src/runtime/mod.rs
+@@ -82,6 +82,8 @@ pub mod draw;
+ pub mod input;
+ /// Process-global metal2vulkan SPIR-V cache (AIR content hash → SPIR-V).
+ pub mod m2v_cache;
++/// metal2vulkan translations kept on disk across boots, under `m2v_cache`.
++pub mod m2v_disk;
+ /// IOSurface mapper capture + page-table resolve.
+ pub mod map_audit;
+ pub mod mapper;
+-- 
+2.43.0
+

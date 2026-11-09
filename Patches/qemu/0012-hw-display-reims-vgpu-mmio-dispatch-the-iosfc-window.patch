@@ -1,0 +1,246 @@
+From e284154f58ac4ab92831ad66660bb8a759e59d02 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 06:07:56 +0800
+Subject: [PATCH 3/7] hw/display/reims-vgpu-mmio: dispatch the iosfc window
+ without the BQL
+
+A vCPU writing the IOSurface mapper producer register calls into Reims,
+which takes the device lock and drains the mapper ring on that vCPU. The
+drain worker holds the same lock for a whole tranche, and one tranche
+held it for 8.2 s compiling a pipeline. The vCPU waited all of it inside
+the MMIO handler, holding the BQL, so the main loop, the action BH that
+delivers completion interrupts, and every other vCPU exit that needed
+the BQL stopped with it.
+
+Mark the iosfc region lockless. Reims serves the five register reads
+from a copy every writer publishes, so a read needs no lock at all. The
+write stays synchronous on the publishing vCPU: it reads that vCPU's
+x19/x21/x22 and walks guest kernel memory through its MMU, and the guest
+finds the request done when the write returns. The two steps around the
+Rust call that need the BQL, the dirty harvest before it and the action
+delivery after it, take it themselves. Neither runs while the device
+lock is held, so the lock order stays BQL, then device lock, and the
+mapper interrupt is still raised before the guest resumes.
+
+The host callbacks the producer path reaches need no BQL: read_xreg and
+read_kva synchronise this vCPU's own state (run_on_cpu runs directly on
+the calling vCPU) and read RAM only; read_gpa, map_pages, the dirty
+tracking calls, schedule_bh and notify_actions are the ones the drain
+worker already calls without it.
+
+Once per ten seconds in which the window was written, an info line
+gives each BQL section's count, longest and total wait for the BQL, and
+longest and total hold.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit ce2ebd5942669745d50d7eb38d5e6c652239097a)
+---
+ hw/display/reims-vgpu-mmio.c | 137 ++++++++++++++++++++++++++++++++---
+ 1 file changed, 127 insertions(+), 10 deletions(-)
+
+diff --git a/hw/display/reims-vgpu-mmio.c b/hw/display/reims-vgpu-mmio.c
+index 11dc917668..fa9fa6df8d 100644
+--- a/hw/display/reims-vgpu-mmio.c
++++ b/hw/display/reims-vgpu-mmio.c
+@@ -20,6 +20,7 @@
+ 
+ #include "qemu/osdep.h"
+ #include "qemu/log.h"
++#include "qemu/error-report.h"
+ #include "qemu/memalign.h"
+ #include "qemu/module.h"
+ #include "qemu/timer.h"
+@@ -84,6 +85,19 @@ typedef struct ReimsVGPUMMIOPageView {
+     size_t len;
+ } ReimsVGPUMMIOPageView;
+ 
++/*
++ * What one of the iosfc write's two BQL sections cost over a report window:
++ * how long the vCPU waited for the BQL and how long it then held it. Updated
++ * only with the BQL held.
++ */
++typedef struct ReimsVGPUMMIOBqlSpan {
++    uint64_t count;
++    int64_t wait_ns_max;
++    int64_t wait_ns_sum;
++    int64_t hold_ns_max;
++    int64_t hold_ns_sum;
++} ReimsVGPUMMIOBqlSpan;
++
+ struct ReimsVGPUMMIOState {
+     SysBusDevice parent_obj;
+ 
+@@ -137,6 +151,13 @@ struct ReimsVGPUMMIOState {
+      * says so.
+      */
+     GArray *page_views;
++    /*
++     * The iosfc write's BQL sections, the dirty harvest before the Rust call
++     * and the action delivery after it, and when their window began. BQL.
++     */
++    ReimsVGPUMMIOBqlSpan iosfc_harvest_bql;
++    ReimsVGPUMMIOBqlSpan iosfc_deliver_bql;
++    int64_t iosfc_bql_since_ns;
+ };
+ 
+ #if defined(CONFIG_DARWIN)
+@@ -1006,6 +1027,10 @@ static void reims_vgpu_mmio_gfx_write(void *opaque, hwaddr offset, uint64_t data
+     reims_vgpu_mmio_deliver_actions(s);
+ }
+ 
++/*
++ * Runs without the BQL, and needs neither it nor the device lock: Reims
++ * serves the five mapper registers from a copy that every writer publishes.
++ */
+ static uint64_t reims_vgpu_mmio_iosfc_read(void *opaque, hwaddr offset,
+                                         unsigned size)
+ {
+@@ -1027,10 +1052,77 @@ static uint64_t reims_vgpu_mmio_iosfc_read(void *opaque, hwaddr offset,
+     return val;
+ }
+ 
++/* Take the BQL; returns when it was asked for. */
++static int64_t reims_vgpu_mmio_iosfc_bql_lock(void)
++{
++    int64_t asked = get_clock();
++
++    bql_lock();
++    return asked;
++}
++
++/* Count one BQL section that began waiting at `asked` and holding at `got`. */
++static void reims_vgpu_mmio_iosfc_bql_note(ReimsVGPUMMIOBqlSpan *span,
++                                           int64_t asked, int64_t got)
++{
++    int64_t wait = got - asked;
++    int64_t hold = get_clock() - got;
++
++    span->count++;
++    span->wait_ns_sum += wait;
++    span->wait_ns_max = MAX(span->wait_ns_max, wait);
++    span->hold_ns_sum += hold;
++    span->hold_ns_max = MAX(span->hold_ns_max, hold);
++}
++
++/*
++ * One line per ten seconds in which a mapper register was written: per BQL
++ * section, count, the longest and total wait for the BQL, and the longest
++ * and total hold, in microseconds. Called with the BQL held.
++ */
++static void reims_vgpu_mmio_iosfc_bql_report(ReimsVGPUMMIOState *s)
++{
++    const ReimsVGPUMMIOBqlSpan *h = &s->iosfc_harvest_bql;
++    const ReimsVGPUMMIOBqlSpan *d = &s->iosfc_deliver_bql;
++    int64_t now = get_clock();
++
++    if (now - s->iosfc_bql_since_ns < 10 * NANOSECONDS_PER_SECOND) {
++        return;
++    }
++    info_report("reims-vgpu-mmio iosfc_bql win_ms=%" PRId64
++                " harvest=%" PRIu64 "/%" PRId64 "/%" PRId64 "/%" PRId64 "/%" PRId64
++                " deliver=%" PRIu64 "/%" PRId64 "/%" PRId64 "/%" PRId64 "/%" PRId64
++                " (per BQL section of an iosfc write: count/wait_max_us/wait_us/"
++                "hold_max_us/hold_us; the device lock is never held in either)",
++                (now - s->iosfc_bql_since_ns) / SCALE_MS,
++                h->count, h->wait_ns_max / SCALE_US, h->wait_ns_sum / SCALE_US,
++                h->hold_ns_max / SCALE_US, h->hold_ns_sum / SCALE_US,
++                d->count, d->wait_ns_max / SCALE_US, d->wait_ns_sum / SCALE_US,
++                d->hold_ns_max / SCALE_US, d->hold_ns_sum / SCALE_US);
++    memset(&s->iosfc_harvest_bql, 0, sizeof(s->iosfc_harvest_bql));
++    memset(&s->iosfc_deliver_bql, 0, sizeof(s->iosfc_deliver_bql));
++    s->iosfc_bql_since_ns = now;
++}
++
++/*
++ * Runs without the BQL: the iosfc window is lockless (reims_vgpu_mmio_init).
++ * The Rust call can wait for the device lock for as long as the drain worker
++ * keeps it, a whole tranche, and a vCPU holding the BQL through that wait
++ * stalled the main loop and every other vCPU exit that needed the BQL with it.
++ * The two steps that do need the BQL take it around themselves, and neither
++ * runs while the device lock is held, so the order stays BQL, then device
++ * lock.
++ *
++ * The write itself stays synchronous on this vCPU: a producer write reads
++ * this vCPU's registers and walks guest kernel memory through its MMU, and
++ * the guest finds the request done when the write returns.
++ */
+ static void reims_vgpu_mmio_iosfc_write(void *opaque, hwaddr offset, uint64_t data,
+                                      unsigned size)
+ {
+     ReimsVGPUMMIOState *s = opaque;
++    int64_t asked;
++    int rc;
+ 
+     if (s->rust_handle == 0) {
+         return;
+@@ -1042,18 +1134,37 @@ static void reims_vgpu_mmio_iosfc_write(void *opaque, hwaddr offset, uint64_t da
+      * the device work. Harvesting on only one would leave the guest-write
+      * witness a whole submission stale on whichever rail the guest happens to
+      * use. Cheap when nothing has read a generation since the last harvest, so
+-     * covering both costs a predicate, not a sync.
++     * covering both costs a predicate, not a sync. The dirty-log sync needs the
++     * BQL.
+      */
+-    reims_vgpu_dirty_harvest(s->dirty);
+-    if (reims_vgpu_qemu_iosfc_write(s->rust_handle, offset, data, size) !=
+-        REIMS_VGPU_QEMU_OK) {
+-        qemu_log_mask(LOG_GUEST_ERROR,
+-                      "%s: iosfc write failed offset=0x%" HWADDR_PRIx
+-                      " data=0x%" PRIx64 " size=%u\n",
+-                      TYPE_REIMS_VGPU_MMIO, offset, data, size);
+-        return;
++    asked = reims_vgpu_mmio_iosfc_bql_lock();
++    {
++        int64_t got = get_clock();
++
++        reims_vgpu_dirty_harvest(s->dirty);
++        reims_vgpu_mmio_iosfc_bql_note(&s->iosfc_harvest_bql, asked, got);
+     }
+-    reims_vgpu_mmio_deliver_actions(s);
++    bql_unlock();
++
++    rc = reims_vgpu_qemu_iosfc_write(s->rust_handle, offset, data, size);
++
++    asked = reims_vgpu_mmio_iosfc_bql_lock();
++    {
++        int64_t got = get_clock();
++
++        if (rc != REIMS_VGPU_QEMU_OK) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "%s: iosfc write failed offset=0x%" HWADDR_PRIx
++                          " data=0x%" PRIx64 " size=%u\n",
++                          TYPE_REIMS_VGPU_MMIO, offset, data, size);
++        } else {
++            /* Raises the mapper interrupt before the guest resumes, as before. */
++            reims_vgpu_mmio_deliver_actions(s);
++        }
++        reims_vgpu_mmio_iosfc_bql_note(&s->iosfc_deliver_bql, asked, got);
++        reims_vgpu_mmio_iosfc_bql_report(s);
++    }
++    bql_unlock();
+ }
+ 
+ static const MemoryRegionOps reims_vgpu_mmio_gfx_ops = {
+@@ -1101,6 +1212,11 @@ static void reims_vgpu_mmio_init(Object *obj)
+     memory_region_init_io(&s->iomem_iosfc, obj, &reims_vgpu_mmio_iosfc_ops, s,
+                           TYPE_REIMS_VGPU_MMIO ".iosfc",
+                           REIMS_VGPU_MMIO_IOSFC_MMIO_SIZE);
++    /*
++     * The mapper window is dispatched without the BQL; its handlers take it
++     * only where they need it. See reims_vgpu_mmio_iosfc_write.
++     */
++    memory_region_enable_lockless_io(&s->iomem_iosfc);
+     sysbus_init_mmio(sbd, &s->iomem_gfx);
+     sysbus_init_mmio(sbd, &s->iomem_iosfc);
+     sysbus_init_irq(sbd, &s->irq_gfx);
+@@ -1114,6 +1230,7 @@ static void reims_vgpu_mmio_init(Object *obj)
+     s->page_views = g_array_new(false, false,
+                                 sizeof(ReimsVGPUMMIOPageView));
+     memset(&s->host_ops, 0, sizeof(s->host_ops));
++    s->iosfc_bql_since_ns = get_clock();
+ }
+ 
+ static void reims_vgpu_mmio_realize(DeviceState *dev, Error **errp)
+-- 
+2.43.0
+

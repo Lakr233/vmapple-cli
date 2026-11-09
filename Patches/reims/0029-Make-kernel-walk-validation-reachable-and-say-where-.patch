@@ -1,0 +1,915 @@
+From 452f33c7969da241ea74bf2943add9b623618300 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 04:13:47 +0800
+Subject: [PATCH 13/24] Make kernel walk validation reachable, and say where it
+ stands
+
+On macOS 27 a captured root never validated: every mapper read a resolve
+sampled came from its first sixteen reads, one object's page, and the
+crossing probe ran once per resolve at the end of that page, so distinct
+pages and a non-zero crossing never came. Strict then refused every
+type-11 resolve for the whole boot.
+
+A reader validating a root now also samples the first read of each new
+kernel page it touches, up to eight, with a crossing probe at the end of
+each while one is still owed. And a capture now reads VBAR_EL1 and, while
+the root has not validated, takes one round of sandwiched probes of
+kernel text from there per mapper publish, up to eight rounds per root.
+VBAR is only an entry point: a probe counts only if every CPU read
+succeeds and the sandwich is stable.
+
+The bar is not lower but stricter. A sample qualifies only if it holds a
+non-zero byte and the walk resolved it through level-3 page descriptors,
+the ones the mapper's objects live under; text mapped by blocks is logged
+and counts for nothing. Of eight qualifying samples, four must be the
+mapper's own reads, over three pages, with one crossing between two
+level-3 leaves.
+
+kva_walk_validation_state reports every condition by name every ten
+seconds while a root validates, kva_walk_validated and kva_walk_cost
+carry the same, and kva_walk_root names VBAR.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 07e1bca22d374be7e3a7c5cf258fd2133cbe8b0e)
+---
+ crates/reims-vgpu/src/runtime/kernel_walk.rs | 475 +++++++++++++++++--
+ crates/reims-vgpu/src/runtime/mapper/mod.rs  |  44 +-
+ 2 files changed, 462 insertions(+), 57 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/kernel_walk.rs b/crates/reims-vgpu/src/runtime/kernel_walk.rs
+index 8e25daf4..c9aa1626 100644
+--- a/crates/reims-vgpu/src/runtime/kernel_walk.rs
++++ b/crates/reims-vgpu/src/runtime/kernel_walk.rs
+@@ -58,6 +58,7 @@ const SYSREG_TTBR1_EL1: u32 = SYSREG_BASE;
+ const SYSREG_TCR_EL1: u32 = SYSREG_BASE + 1;
+ const SYSREG_SCTLR_EL1: u32 = SYSREG_BASE + 2;
+ const SYSREG_CPU_INDEX: u32 = SYSREG_BASE + 3;
++const SYSREG_VBAR_EL1: u32 = SYSREG_BASE + 4;
+ 
+ /// One vCPU's EL1 translation state, read in one MMIO exit.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -70,6 +71,9 @@ pub struct KernelRoot {
+     pub cpu_index: u64,
+     /// [`KernelWalkState::boot`] at the capture.
+     pub boot: u64,
++    /// `VBAR_EL1`, if the shim answers it: an entry into kernel text for the
++    /// active probes. Not part of the translation, and not compared.
++    pub vbar: Option<u64>,
+ }
+ 
+ impl KernelRoot {
+@@ -222,10 +226,19 @@ impl Regime {
+ /// Translate one guest kernel address to the guest physical address it names.
+ pub fn translate<M: HostMemory>(mem: &M, root: &KernelRoot, va: u64) -> Result<u64, WalkRefusal> {
+     let regime = Regime::of(root)?;
+-    translate_in(mem, &regime, va)
++    translate_in(mem, &regime, va).map(|(pa, _)| pa)
+ }
+ 
+-fn translate_in<M: HostMemory>(mem: &M, r: &Regime, va: u64) -> Result<u64, WalkRefusal> {
++/// The descriptor a walk ended at.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Leaf {
++    /// A level-3 page descriptor.
++    Page,
++    /// A block descriptor at this level.
++    Block { level: u32 },
++}
++
++fn translate_in<M: HostMemory>(mem: &M, r: &Regime, va: u64) -> Result<(u64, Leaf), WalkRefusal> {
+     let checked = if r.top_byte_ignored {
+         va | 0xff00_0000_0000_0000
+     } else {
+@@ -254,11 +267,11 @@ fn translate_in<M: HostMemory>(mem: &M, r: &Regime, va: u64) -> Result<u64, Walk
+         }
+         let is_table_or_page = desc & 0b10 != 0;
+         let span = 1u64 << shift;
+-        let pa = if level == 3 {
++        let (pa, leaf) = if level == 3 {
+             if !is_table_or_page {
+                 return Err(WalkRefusal::Reserved { level });
+             }
+-            (desc & oa_mask) | (va & (span - 1))
++            ((desc & oa_mask) | (va & (span - 1)), Leaf::Page)
+         } else if is_table_or_page {
+             table = desc & oa_mask;
+             if table >> r.pa_bits != 0 {
+@@ -274,18 +287,28 @@ fn translate_in<M: HostMemory>(mem: &M, r: &Regime, va: u64) -> Result<u64, Walk
+             if !allowed {
+                 return Err(WalkRefusal::BlockAtLevel { level });
+             }
+-            (desc & oa_mask & !(span - 1)) | (va & (span - 1))
++            (
++                (desc & oa_mask & !(span - 1)) | (va & (span - 1)),
++                Leaf::Block { level },
++            )
+         };
+         if pa >> r.pa_bits != 0 {
+             return Err(WalkRefusal::AddressSize {
+                 level: level as i32,
+             });
+         }
+-        return Ok(pa);
++        return Ok((pa, leaf));
+     }
+     unreachable!("level 3 always returns")
+ }
+ 
++/// What one read through the walk went through: for each granule page it
++/// touched, the descriptor it ended at and the physical page it named.
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct Trace {
++    pub leaves: Vec<(Leaf, u64)>,
++}
++
+ /// Read `buf.len()` bytes at guest kernel address `va` through the walk, one
+ /// granule at a time.
+ pub fn read<M: HostMemory>(
+@@ -294,19 +317,31 @@ pub fn read<M: HostMemory>(
+     va: u64,
+     buf: &mut [u8],
+ ) -> Result<(), WalkRefusal> {
++    read_traced(mem, root, va, buf).map(|_| ())
++}
++
++/// [`read`], saying which descriptors it went through.
++pub fn read_traced<M: HostMemory>(
++    mem: &M,
++    root: &KernelRoot,
++    va: u64,
++    buf: &mut [u8],
++) -> Result<Trace, WalkRefusal> {
+     let regime = Regime::of(root)?;
+     let granule = regime.granule();
++    let mut trace = Trace::default();
+     let mut done = 0usize;
+     while done < buf.len() {
+         let at = va.wrapping_add(done as u64);
+-        let pa = translate_in(mem, &regime, at)?;
++        let (pa, leaf) = translate_in(mem, &regime, at)?;
++        trace.leaves.push((leaf, pa & !(granule - 1)));
+         let in_page = (granule - (at & (granule - 1))) as usize;
+         let n = in_page.min(buf.len() - done);
+         mem.read_gpa(pa, &mut buf[done..done + n])
+             .map_err(|_| WalkRefusal::Read { gpa: pa })?;
+         done += n;
+     }
+-    Ok(())
++    Ok(trace)
+ }
+ 
+ // MARK: - Mode
+@@ -361,22 +396,42 @@ pub(crate) fn with_mode<R>(mode: Mode, f: impl FnOnce() -> R) -> R {
+ // MARK: - Runtime validation
+ 
+ /// How much agreement a root must collect before a thread without a vCPU may
+-/// translate with it: reads with non-zero bytes, from several pages, and one
+-/// that crossed a page boundary. One matching read, all zeros, proves nothing
+-/// about the physical address it came from.
++/// translate with it. Only samples with a non-zero byte that the walk resolved
++/// through level-3 page descriptors count — the descriptors the mapper's own
++/// objects live under; a block mapping exercises a different branch, and one
++/// matching read of zeros proves nothing about the physical page it came from.
++/// Of those: this many in all, this many from the mapper's own reads rather
++/// than the kernel-text probes, over this many pages, and one sample crossing
++/// between two level-3 leaves.
+ const AGREED_SAMPLES: u64 = 8;
++const AGREED_MAPPER_SAMPLES: u64 = 4;
+ const AGREED_PAGES: usize = 3;
+ /// Distinct pages remembered for [`AGREED_PAGES`]; more add nothing.
+ const PAGES_KEPT: usize = 16;
+ 
++/// Where a sample's kernel address came from.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Source {
++    /// A read the mapper made of its own objects on a vCPU.
++    Mapper,
++    /// An active probe of kernel text, from `VBAR_EL1`.
++    Text,
++}
++
+ /// The result of reading the same kernel bytes through the CPU and the walk.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum WalkCompare {
+     Agreed {
+         kva: u64,
+         len: usize,
++        source: Source,
+         nonzero: bool,
++        /// Every page it touched resolved through a level-3 page descriptor.
++        via_pages: bool,
++        /// It touched two pages.
+         crossed: bool,
++        /// ...whose physical pages are not adjacent.
++        noncontiguous: bool,
+     },
+     Mismatch {
+         kva: u64,
+@@ -400,9 +455,17 @@ const CROSSING_HALF: u64 = 128;
+ /// Runtime validation of one root against the CPU.
+ #[derive(Clone, Debug, Default)]
+ struct Validation {
++    /// Qualifying samples: non-zero, agreeing, through level-3 pages.
+     samples: u64,
++    mapper_samples: u64,
+     pages: std::collections::BTreeSet<u64>,
++    /// A qualifying sample crossed between two level-3 leaves.
+     crossed: bool,
++    crossed_noncontiguous: bool,
++    /// Agreeing samples that do not qualify, kept for the log.
++    via_blocks: u64,
++    zeros: u64,
++    inconclusive: u64,
+     mismatches: u32,
+ }
+ 
+@@ -414,9 +477,36 @@ impl Validation {
+     fn validated(&self) -> bool {
+         !self.revoked()
+             && self.samples >= AGREED_SAMPLES
++            && self.mapper_samples >= AGREED_MAPPER_SAMPLES
+             && self.pages.len() >= AGREED_PAGES
+             && self.crossed
+     }
++
++    /// The state the log reports: every condition the gate asks, by name.
++    fn describe(&self) -> String {
++        format!(
++            "l3_samples={}/{AGREED_SAMPLES} mapper_l3_samples={}/{AGREED_MAPPER_SAMPLES} \
++             l3_pages={}/{AGREED_PAGES} l3_crossed={} noncontiguous={} via_blocks={} zeros={} \
++             inconclusive={} mismatches={}",
++            self.samples,
++            self.mapper_samples,
++            self.pages.len(),
++            self.crossed,
++            self.crossed_noncontiguous,
++            self.via_blocks,
++            self.zeros,
++            self.inconclusive,
++            self.mismatches
++        )
++    }
++
++    /// Void what validated the root, keeping its disagreements.
++    fn suspend(&mut self) {
++        *self = Self {
++            mismatches: self.mismatches,
++            ..Self::default()
++        };
++    }
+ }
+ 
+ /// Why a thread without a vCPU has no walk to use.
+@@ -479,6 +569,11 @@ const SAMPLES_PER_READER_VALIDATING: u32 = 16;
+ /// Samples one reader takes once its root has validated: an audit, not a
+ /// comparison of every read.
+ const SAMPLES_PER_READER_VALIDATED: u32 = 1;
++/// While a root validates, a reader also samples the first read of each new
++/// page it touches, up to this many pages, so a resolve contributes the
++/// MappingInternal, its page object and its page table rather than sixteen
++/// reads of one object.
++pub const PAGES_PER_READER_VALIDATING: usize = 8;
+ 
+ impl WalkPolicy {
+     /// A reader that only ever runs on a vCPU and takes no part.
+@@ -522,8 +617,20 @@ pub struct KernelWalkState {
+     refusals_logged: std::collections::BTreeMap<u32, u32>,
+     /// What validation cost this boot, reported at its end.
+     cost: ValidationCost,
++    /// Rounds of kernel-text probes taken for the current root.
++    text_rounds: u32,
++    /// When the validation state was last logged while still validating.
++    state_logged_ms: u64,
+ }
+ 
++/// Rounds of kernel-text probes per root: one per mapper publish while the
++/// root has not validated, so one unreadable round does not end it.
++const TEXT_ROUNDS: u32 = 8;
++/// Kernel-text pages one round samples, from `VBAR_EL1`'s page on.
++const TEXT_PAGES: u64 = 4;
++/// How often the state of a validation still in progress is logged.
++const STATE_LOG_INTERVAL_MS: u64 = 10_000;
++
+ /// Validation work done in one boot: what the A/B pays on the vCPU for it.
+ #[derive(Clone, Copy, Debug, Default)]
+ struct ValidationCost {
+@@ -578,13 +685,16 @@ impl KernelWalkState {
+         if c.samples + c.probes != 0 {
+             crate::observe::off(format!(
+                 "kva_walk_cost boot={} samples={} probes={} inconclusive={} mismatches={} \
+-                 validated={} (runtime validation work on the vCPU this boot)",
++                 text_rounds={} gate={:?} {} (runtime validation work on the vCPU this boot, \
++                 and where the current root's validation stood)",
+                 self.boot,
+                 c.samples,
+                 c.probes,
+                 c.inconclusive,
+                 c.mismatches,
+-                self.gate().is_ok()
++                self.text_rounds,
++                self.gate().map(|_| "validated"),
++                self.validation.describe()
+             ));
+         }
+         let boot = self.boot.wrapping_add(1);
+@@ -611,6 +721,29 @@ impl KernelWalkState {
+             }
+             self.note_compare(compare);
+         }
++        self.log_state_if_due(crate::observe::elapsed_ms() as u64);
++    }
++
++    /// While a root is still validating, say where it stands, at most once
++    /// per [`STATE_LOG_INTERVAL_MS`]: which of the gate's conditions are met.
++    fn log_state_if_due(&mut self, now_ms: u64) {
++        let Some(root) = self.root else {
++            return;
++        };
++        if self.gate().is_ok()
++            || now_ms.saturating_sub(self.state_logged_ms) < STATE_LOG_INTERVAL_MS
++        {
++            return;
++        }
++        self.state_logged_ms = now_ms;
++        crate::observe::off(format!(
++            "kva_walk_validation_state ttbr1={:#x} boot={} gate={:?} text_rounds={} {}",
++            root.ttbr1,
++            root.boot,
++            self.gate().map(|_| "validated"),
++            self.text_rounds,
++            self.validation.describe()
++        ));
+     }
+ 
+     fn note_compare(&mut self, compare: WalkCompare) {
+@@ -622,15 +755,32 @@ impl KernelWalkState {
+             WalkCompare::Agreed {
+                 kva,
+                 len,
++                source,
+                 nonzero,
++                via_pages,
+                 crossed,
++                noncontiguous,
+             } => {
+                 crate::runtime::drain::note_store_route("kva_walk_agree");
+-                if !nonzero || v.revoked() {
++                if v.revoked() {
++                    return;
++                }
++                if !nonzero {
++                    v.zeros += 1;
++                    return;
++                }
++                if !via_pages {
++                    v.via_blocks += 1;
+                     return;
+                 }
+                 v.samples += 1;
+-                v.crossed |= crossed;
++                if source == Source::Mapper {
++                    v.mapper_samples += 1;
++                }
++                if crossed {
++                    v.crossed = true;
++                    v.crossed_noncontiguous |= noncontiguous;
++                }
+                 if v.pages.len() < PAGES_KEPT {
+                     let granule = Regime::of(&root).map_or(1 << 14, |r| r.granule());
+                     v.pages.insert(kva & !(granule - 1));
+@@ -640,14 +790,14 @@ impl KernelWalkState {
+                 if v.validated() && !self.validated_reported {
+                     self.validated_reported = true;
+                     crate::observe::off(format!(
+-                        "kva_walk_validated samples={} pages={} ttbr1={:#x} tcr={:#x} \
+-                         boot={} (runtime validation: the software walk agreed with the CPU; \
+-                         it now serves threads without a vCPU)",
+-                        v.samples,
+-                        v.pages.len(),
++                        "kva_walk_validated ttbr1={:#x} tcr={:#x} boot={} text_rounds={} {} \
++                         (runtime validation: the software walk agreed with the CPU; it now \
++                         serves threads without a vCPU)",
+                         root.ttbr1,
+                         root.tcr,
+-                        root.boot
++                        root.boot,
++                        self.text_rounds,
++                        v.describe()
+                     ));
+                 }
+             }
+@@ -657,9 +807,7 @@ impl KernelWalkState {
+                 v.mismatches += 1;
+                 // Suspended: everything that validated it is void, and it serves
+                 // nothing until a full threshold of fresh samples has agreed.
+-                v.samples = 0;
+-                v.pages.clear();
+-                v.crossed = false;
++                v.suspend();
+                 self.validated_reported = false;
+                 if v.mismatches <= MISMATCHES_TO_REVOKE {
+                     crate::observe::fail(format!(
+@@ -677,6 +825,7 @@ impl KernelWalkState {
+             }
+             WalkCompare::Inconclusive => {
+                 crate::runtime::drain::note_store_route("kva_walk_inconclusive");
++                v.inconclusive += 1;
+             }
+         }
+     }
+@@ -712,25 +861,33 @@ pub fn sample<M: HostMemory>(
+     kva: u64,
+     before: &[u8],
+     cpu_again: impl FnOnce(&mut [u8]) -> bool,
++    source: Source,
+ ) -> WalkCompare {
+     let mut walked = vec![0u8; before.len()];
+-    let walk = read(mem, root, kva, &mut walked);
++    let walk = read_traced(mem, root, kva, &mut walked);
+     let mut after = vec![0u8; before.len()];
+     if !cpu_again(&mut after) || after != before {
+         return WalkCompare::Inconclusive;
+     }
+     match walk {
+-        Ok(()) if walked == before => {
++        Ok(trace) if walked == before => {
+             let granule = Regime::of(root).map_or(1 << 14, |r| r.granule());
+-            let last = kva.wrapping_add(before.len().max(1) as u64 - 1);
++            let crossed = trace.leaves.len() > 1;
+             WalkCompare::Agreed {
+                 kva,
+                 len: before.len(),
++                source,
+                 nonzero: before.iter().any(|&b| b != 0),
+-                crossed: kva & !(granule - 1) != last & !(granule - 1),
++                via_pages: trace.leaves.iter().all(|(leaf, _)| *leaf == Leaf::Page),
++                crossed,
++                noncontiguous: crossed
++                    && trace
++                        .leaves
++                        .windows(2)
++                        .any(|w| w[1].1 != w[0].1.wrapping_add(granule)),
+             }
+         }
+-        Ok(()) => WalkCompare::Mismatch {
++        Ok(_) => WalkCompare::Mismatch {
+             kva,
+             len: before.len(),
+             why: "bytes",
+@@ -752,13 +909,75 @@ pub fn crossing_probe(root: &KernelRoot, kva: u64) -> Option<(u64, usize)> {
+     Some((end - CROSSING_HALF, 2 * CROSSING_HALF as usize))
+ }
+ 
++/// One sandwiched sample of `len` bytes at `kva`, taken on a vCPU: `None` when
++/// the CPU cannot read it at all.
++pub fn sample_on_cpu<H: HostMemory + HostOps>(
++    host: &H,
++    root: &KernelRoot,
++    kva: u64,
++    len: usize,
++    source: Source,
++) -> Option<WalkCompare> {
++    let mut before = vec![0u8; len];
++    host.read_kva(kva, &mut before).ok()?;
++    Some(sample(
++        host,
++        root,
++        kva,
++        &before,
++        |buf| host.read_kva(kva, buf).is_ok(),
++        source,
++    ))
++}
++
++/// One round of active probes of kernel text, entered at `VBAR_EL1`: an
++/// interior sample and a sample across the end of each of a few pages from
++/// there. Nothing about those pages is assumed — not that they are mapped,
++/// contiguous, or unchanging; a sample counts only through the same sandwich
++/// as any other. Text mapped by blocks adds to the log, not to the threshold.
++fn probe_text<H: HostMemory + HostOps>(root: &KernelRoot, host: &H) -> WalkLog {
++    let mut log = WalkLog::default();
++    let (Some(vbar), Ok(regime)) = (root.vbar, Regime::of(root)) else {
++        return log;
++    };
++    let granule = regime.granule();
++    let first = vbar & !(granule - 1);
++    for page in (0..TEXT_PAGES).map(|k| first.wrapping_add(k * granule)) {
++        let spans = [
++            (page + 0x400, 64),
++            (page + granule - CROSSING_HALF, 2 * CROSSING_HALF as usize),
++        ];
++        for (at, len) in spans {
++            log.probes += 1;
++            log.compares
++                .extend(sample_on_cpu(host, root, at, len, Source::Text));
++        }
++    }
++    log
++}
++
+ /// Read the vCPU's EL1 translation state and keep it as the root.
+ ///
+ /// Called on the vCPU thread, in the MMIO exit of a mapper ring publish, before
+ /// anything on that path reads a kernel address. The shim synchronizes the
+-/// state from KVM before answering, and the four reads share one exit, so they
+-/// describe one moment. A changed root starts validation again.
+-pub fn capture<H: HostOps>(state: &mut KernelWalkState, host: &H) {
++/// state from KVM before answering, and the reads share one exit, so they
++/// describe one moment. A changed root starts validation again. While the
++/// root has not validated, each call also takes one round of kernel-text
++/// probes, up to [`TEXT_ROUNDS`] per root.
++pub fn capture<H: HostMemory + HostOps>(state: &mut KernelWalkState, host: &H) {
++    capture_root(state, host);
++    let Some(root) = state.root else {
++        return;
++    };
++    if state.gate().is_ok() || state.text_rounds >= TEXT_ROUNDS || root.vbar.is_none() {
++        return;
++    }
++    state.text_rounds += 1;
++    let log = probe_text(&root, host);
++    state.fold(log);
++}
++
++fn capture_root<H: HostOps>(state: &mut KernelWalkState, host: &H) {
+     let read = |index| host.read_xreg(index);
+     let regs = (|| {
+         Some((
+@@ -797,6 +1016,9 @@ pub fn capture<H: HostOps>(state: &mut KernelWalkState, host: &H) {
+         sctlr,
+         cpu_index,
+         boot: state.boot,
++        // Optional: a shim that answers the translation state but not this
++        // only loses the text probes.
++        vbar: read(SYSREG_VBAR_EL1).ok(),
+     };
+     match state.root {
+         Some(held) if held.same_translation(&root) => return,
+@@ -808,7 +1030,8 @@ pub fn capture<H: HostOps>(state: &mut KernelWalkState, host: &H) {
+         )),
+         None => crate::observe::off(format!(
+             "kva_walk_root ttbr1={ttbr1:#x} tcr={tcr:#x} sctlr={sctlr:#x} cpu={cpu_index} \
+-             boot={} mode={:?} regime={:?}",
++             vbar={:?} boot={} mode={:?} regime={:?}",
++            root.vbar.map(|v| format!("{v:#x}")),
+             state.boot,
+             mode(),
+             Regime::of(&root).map(|r| (r.granule_shift, r.va_bits, r.start_level))
+@@ -817,6 +1040,7 @@ pub fn capture<H: HostOps>(state: &mut KernelWalkState, host: &H) {
+     state.root = Some(root);
+     state.validation = Validation::default();
+     state.validated_reported = false;
++    state.text_rounds = 0;
+ }
+ 
+ #[cfg(test)]
+@@ -841,6 +1065,7 @@ pub(crate) mod tests {
+             sctlr: SCTLR_ON,
+             cpu_index: 0,
+             boot: 0,
++            vbar: None,
+         }
+     }
+ 
+@@ -957,17 +1182,25 @@ pub(crate) mod tests {
+         assert_eq!(&got, b"tailhead");
+     }
+ 
+-    fn agreed(kva: u64, len: usize, crossed: bool) -> WalkCompare {
++    fn agreed_from(source: Source, kva: u64, len: usize, crossed: bool) -> WalkCompare {
+         WalkCompare::Agreed {
+             kva,
+             len,
++            source,
+             nonzero: true,
++            via_pages: true,
+             crossed,
++            noncontiguous: crossed,
+         }
+     }
+ 
+-    /// Runtime validation, as many agreeing non-zero reads over several
+-    /// pages, one of them across a boundary, as it takes and no fewer.
++    fn agreed(kva: u64, len: usize, crossed: bool) -> WalkCompare {
++        agreed_from(Source::Mapper, kva, len, crossed)
++    }
++
++    /// Runtime validation, as many agreeing non-zero reads through level-3
++    /// pages over several pages, one of them across a boundary, as it takes and
++    /// no fewer.
+     fn validate(state: &mut KernelWalkState) {
+         for i in 0..AGREED_SAMPLES {
+             state.note_compare(agreed(kva(i * G), 8, i == 0));
+@@ -1007,12 +1240,15 @@ pub(crate) mod tests {
+         state.note_compare(agreed(kva(0), 8, true));
+         assert_eq!(state.gate(), Err(GateRefusal::Unvalidated), "one read");
+ 
+-        for _ in 0..2 * AGREED_SAMPLES {
++        for i in 0..2 * AGREED_SAMPLES {
+             state.note_compare(WalkCompare::Agreed {
+-                kva: kva(G),
++                kva: kva(i * G),
+                 len: 8,
++                source: Source::Mapper,
+                 nonzero: false,
+-                crossed: false,
++                via_pages: true,
++                crossed: true,
++                noncontiguous: true,
+             });
+         }
+         assert_eq!(
+@@ -1021,6 +1257,40 @@ pub(crate) mod tests {
+             "zeros prove nothing"
+         );
+ 
++        let mut blocks = KernelWalkState::default();
++        capture(&mut blocks, &host);
++        for i in 0..2 * AGREED_SAMPLES {
++            blocks.note_compare(WalkCompare::Agreed {
++                kva: kva(i * G),
++                len: 8,
++                source: Source::Mapper,
++                nonzero: true,
++                via_pages: false,
++                crossed: true,
++                noncontiguous: true,
++            });
++        }
++        assert_eq!(
++            blocks.gate(),
++            Err(GateRefusal::Unvalidated),
++            "samples through block descriptors do not fill the threshold"
++        );
++
++        let mut text_only = KernelWalkState::default();
++        capture(&mut text_only, &host);
++        for i in 0..2 * AGREED_SAMPLES {
++            text_only.note_compare(agreed_from(Source::Text, kva(i * G), 8, true));
++        }
++        assert_eq!(
++            text_only.gate(),
++            Err(GateRefusal::Unvalidated),
++            "kernel text alone cannot vouch for the mapper's own objects"
++        );
++        for i in 0..AGREED_MAPPER_SAMPLES {
++            text_only.note_compare(agreed(kva(i * G), 8, false));
++        }
++        assert!(text_only.gate().is_ok(), "with enough of them it can");
++
+         let mut uncrossed = KernelWalkState::default();
+         capture(&mut uncrossed, &host);
+         for i in 0..AGREED_SAMPLES {
+@@ -1193,11 +1463,18 @@ pub(crate) mod tests {
+             true
+         };
+         assert_eq!(
+-            sample(&host, &r, va, b"before!!", moved),
++            sample(&host, &r, va, b"before!!", moved, Source::Mapper),
+             WalkCompare::Inconclusive
+         );
+         assert_eq!(
+-            sample(&host, &r, va, b"before!!", |_: &mut [u8]| false),
++            sample(
++                &host,
++                &r,
++                va,
++                b"before!!",
++                |_: &mut [u8]| false,
++                Source::Mapper
++            ),
+             WalkCompare::Inconclusive,
+             "a second CPU read that failed proves nothing either"
+         );
+@@ -1212,6 +1489,90 @@ pub(crate) mod tests {
+         assert!(state.gate().is_ok());
+     }
+ 
++    /// Kernel text from `VBAR_EL1`, mapped page by page at scattered physical
++    /// pages, for both the CPU and the guest's tables.
++    fn text_fixture(host: &mut FakeHost) -> u64 {
++        let text = kva(0x40_0000_0000);
++        for k in 0..=TEXT_PAGES {
++            let pa = 0x9_0000_0000 + k * 0x10_0000;
++            map_page(host, text + k * G, pa);
++            host.map_range(pa, G as usize, 0xd5);
++            host.kva_cpu_pages.insert(text + k * G, pa);
++        }
++        give_root(host, L1);
++        host.set_xreg(SYSREG_VBAR_EL1, text + 0x800);
++        text
++    }
++
++    /// The probes taken at capture count toward validation through level-3
++    /// pages, crossings between scattered leaves included, but cannot finish
++    /// it: the mapper's own reads still have to agree. They run once per
++    /// capture while the root validates, and stop after a bounded number.
++    #[test]
++    fn text_probes_help_validation_and_stop() {
++        let mut host = FakeHost::new();
++        text_fixture(&mut host);
++        let mut state = KernelWalkState::default();
++        capture(&mut state, &host);
++        assert_eq!(state.text_rounds, 1);
++        assert_eq!(state.validation.samples, 2 * TEXT_PAGES);
++        assert!(state.validation.crossed && state.validation.crossed_noncontiguous);
++        assert_eq!(state.gate(), Err(GateRefusal::Unvalidated));
++
++        for _ in 0..2 * TEXT_ROUNDS {
++            capture(&mut state, &host);
++        }
++        assert_eq!(state.text_rounds, TEXT_ROUNDS, "bounded per root");
++
++        for i in 0..AGREED_MAPPER_SAMPLES {
++            state.note_compare(agreed(kva(i * G), 8, false));
++        }
++        assert!(state.gate().is_ok());
++        let rounds = state.text_rounds;
++        capture(&mut state, &host);
++        assert_eq!(state.text_rounds, rounds, "no probes once validated");
++    }
++
++    /// Text the guest maps with a block is sampled and logged, and adds
++    /// nothing to the threshold.
++    #[test]
++    fn text_mapped_by_a_block_does_not_fill_the_threshold() {
++        let mut host = FakeHost::new();
++        let text = kva(0x50_0000_0000);
++        let l1 = (text >> 36) & 0x7ff;
++        let l2 = (text >> 25) & 0x7ff;
++        let block = 0x6_0000_0000u64;
++        put_desc(&mut host, L1 + l1 * 8, L2 | 0b11);
++        put_desc(&mut host, L2 + l2 * 8, block | 0b01);
++        host.map_range(block, 8 * G as usize, 0xd5);
++        for k in 0..8 {
++            host.kva_cpu_pages.insert(text + k * G, block + k * G);
++        }
++        give_root(&mut host, L1);
++        host.set_xreg(SYSREG_VBAR_EL1, text);
++        let mut state = KernelWalkState::default();
++        capture(&mut state, &host);
++        assert_eq!(state.validation.samples, 0);
++        assert_eq!(state.validation.via_blocks, 2 * TEXT_PAGES);
++    }
++
++    /// A probe the CPU cannot read is skipped, not counted either way.
++    #[test]
++    fn an_unreadable_text_page_is_skipped() {
++        let mut host = FakeHost::new();
++        let text = text_fixture(&mut host);
++        host.kva_cpu_pages.remove(&(text + G));
++        let mut state = KernelWalkState::default();
++        capture(&mut state, &host);
++        let v = &state.validation;
++        assert_eq!(v.mismatches, 0);
++        assert!(
++            v.samples < 2 * TEXT_PAGES && v.samples > 0,
++            "{}",
++            v.describe()
++        );
++    }
++
+     /// The sample itself, with the CPU reading the same bytes on both sides:
+     /// equal bytes agree, a different translation is a stable disagreement, and
+     /// a read the CPU answered but the walk cannot is one too.
+@@ -1230,20 +1591,44 @@ pub(crate) mod tests {
+             }
+         };
+         assert_eq!(
+-            sample(&host, &r, va, b"kernel!!", steady(b"kernel!!")),
++            sample(
++                &host,
++                &r,
++                va,
++                b"kernel!!",
++                steady(b"kernel!!"),
++                Source::Mapper
++            ),
+             WalkCompare::Agreed {
+                 kva: va,
+                 len: 8,
++                source: Source::Mapper,
+                 nonzero: true,
+-                crossed: false
++                via_pages: true,
++                crossed: false,
++                noncontiguous: false,
+             }
+         );
+         assert!(matches!(
+-            sample(&host, &r, va, b"elsewhre", steady(b"elsewhre")),
++            sample(
++                &host,
++                &r,
++                va,
++                b"elsewhre",
++                steady(b"elsewhre"),
++                Source::Mapper
++            ),
+             WalkCompare::Mismatch { why: "bytes", .. }
+         ));
+         assert!(matches!(
+-            sample(&host, &r, va + G, b"unmapped", steady(b"unmapped")),
++            sample(
++                &host,
++                &r,
++                va + G,
++                b"unmapped",
++                steady(b"unmapped"),
++                Source::Mapper
++            ),
+             WalkCompare::Mismatch {
+                 why: "kva_walk_fault",
+                 ..
+diff --git a/crates/reims-vgpu/src/runtime/mapper/mod.rs b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+index 4c514da6..d3ec5781 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/mod.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+@@ -154,8 +154,8 @@ struct MapperMem<'a, H: HostMemory + HostOps> {
+     log: Option<&'a std::cell::RefCell<crate::runtime::kernel_walk::WalkLog>>,
+     /// Samples taken, against [`crate::runtime::kernel_walk::WalkPolicy::sample_limit`].
+     sampled: std::cell::Cell<u32>,
+-    /// Whether this reader took its one boundary-crossing probe.
+-    probed: std::cell::Cell<bool>,
++    /// Kernel pages this reader has sampled, while its root validates.
++    pages: std::cell::RefCell<Vec<u64>>,
+ }
+ 
+ impl<'a, H: HostMemory + HostOps> MapperMem<'a, H> {
+@@ -176,7 +176,7 @@ impl<'a, H: HostMemory + HostOps> MapperMem<'a, H> {
+             refused: std::cell::Cell::new(None),
+             log,
+             sampled: std::cell::Cell::new(0),
+-            probed: std::cell::Cell::new(false),
++            pages: std::cell::RefCell::new(Vec::new()),
+         }
+     }
+ 
+@@ -214,15 +214,29 @@ impl<'a, H: HostMemory + HostOps> MapperMem<'a, H> {
+     }
+ 
+     /// Runtime validation: the bytes the CPU just read, read through the walk and
+-    /// then through the CPU again (see [`crate::runtime::kernel_walk::sample`]),
+-    /// and while no sample has yet crossed a page, the same for 16 bytes across
+-    /// the end of this one.
++    /// then through the CPU again (see [`crate::runtime::kernel_walk::sample`]).
++    ///
++    /// Up to the policy's sample limit, and — while the root validates — also
++    /// the first read of each new kernel page this reader touches, up to
++    /// [`crate::runtime::kernel_walk::PAGES_PER_READER_VALIDATING`] pages, so one
++    /// resolve samples the MappingInternal, its page object and its page table
++    /// rather than one object many times. While a crossing is still owed, each
++    /// new page also gets one probe across its end.
+     fn validate(&self, address: u64, cpu: &[u8]) {
+-        use crate::runtime::kernel_walk;
++        use crate::runtime::kernel_walk::{self, Source, PAGES_PER_READER_VALIDATING};
+         let (Some(root), Some(log)) = (self.walk.root, self.log) else {
+             return;
+         };
+-        if self.sampled.get() >= self.walk.sample_limit() {
++        let page = address & !((1u64 << 14) - 1);
++        let new_page = !self.walk.validated && {
++            let mut pages = self.pages.borrow_mut();
++            let new = pages.len() < PAGES_PER_READER_VALIDATING && !pages.contains(&page);
++            if new {
++                pages.push(page);
++            }
++            new
++        };
++        if !new_page && self.sampled.get() >= self.walk.sample_limit() {
+             return;
+         }
+         self.sampled.set(self.sampled.get() + 1);
+@@ -234,19 +248,25 @@ impl<'a, H: HostMemory + HostOps> MapperMem<'a, H> {
+             address,
+             cpu,
+             again(address),
++            Source::Mapper,
+         ));
+-        if !self.walk.wants_crossing || self.probed.get() {
++        if !self.walk.wants_crossing || !new_page {
+             return;
+         }
+         let Some((at, len)) = kernel_walk::crossing_probe(&root, address) else {
+             return;
+         };
+-        self.probed.set(true);
+         log.probes += 1;
+         let mut probe = vec![0u8; len];
+         if self.host.read_kva(at, &mut probe).is_ok() {
+-            log.compares
+-                .push(kernel_walk::sample(self.host, &root, at, &probe, again(at)));
++            log.compares.push(kernel_walk::sample(
++                self.host,
++                &root,
++                at,
++                &probe,
++                again(at),
++                Source::Mapper,
++            ));
+         }
+     }
+ }
+-- 
+2.43.0
+

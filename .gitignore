@@ -1,0 +1,8 @@
+.DS_Store
+.build/
+.swiftpm/
+*.ipsw
+*.img
+*.bin
+vms/
+ipsws/

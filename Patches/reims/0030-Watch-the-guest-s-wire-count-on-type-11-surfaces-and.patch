@@ -1,0 +1,3077 @@
+From 77906e4a0427bc885f8dff5690f413ca808eb202 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 07:37:01 +0800
+Subject: [PATCH 14/24] Watch the guest's wire count on type-11 surfaces, and
+ say when it drops
+
+Two macOS 27.2 panics read back out of guest RAM had a mapped display swap
+buffer's surface descriptor at a wire count of zero while it was still in
+the mapper's wired set; its pages were compressed and reused, and the next
+full-frame write into the mapping landed on kernel memory. wire_mapping
+prepares both descriptors before MAP and unwire_mapping completes them only
+after UNMAP succeeds, so something else completed it.
+
+With REIMS_VGPU_WIRE_WATCH on, the device reads _wireCount of the surface
+and page-table descriptors of every type-11 mapping: on MAP, before UNMAP,
+before every host write into the mapping, around every display present
+packet and after the stamp that completes it, and from the worker every
+5 ms for swap buffers and every 100 ms for all. Each change is a
+`wire_watch transition` line naming the last swap, stamp and write. The
+first zero, negative or below-MAP value is `wire_watch first_anomaly`, with
+whether anything else in the descriptor moved, its mixed-data length,
+whether this device ever wrote the descriptor's frame, and the sixteen
+swap, present, stamp, hold and map events before it. Display presents with
+their payload words, translation holds, swaps seen waiting at a held FIFO's
+head, and the stamps that complete swaps are `wire_watch_ev` lines.
+
+Nothing is read on trust. The kernel's Mach-O header is found below
+VBAR_EL1 and its version string must be 27.2's exactly, or the watch is off
+for the boot. A MappingInternal must name its id, size and the page count
+this device resolved, its page-table descriptor's buffer must be the table
+this device reads, the surface descriptor's length must be the mapping's
+size, and both descriptors must be of one kernel class; otherwise
+`wire_watch_layout_unverified` and the mapping is not watched. Off a vCPU it
+reads only through a validated kernel walk.
+
+REIMS_VGPU_WIRE_GUARD, with the watch, refuses a host CPU write into a
+mapping whose checked surface count reads zero or less, and keeps an owed
+frame owed. A positive count is not a permission: the guest can complete
+the descriptor between the read and the write.
+
+Not run on a guest. The tests put a fake 27.2 kernel image and mapping in
+FakeHost memory; one drives a DisplaySwap through drain_pending.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit c293d7eb511c3c58c730e9fc31ddf8aaae402338)
+---
+ crates/reims-vgpu/src/env.rs                  |   15 +-
+ crates/reims-vgpu/src/model/state.rs          |    6 +
+ crates/reims-vgpu/src/runtime/drain/mod.rs    |  120 ++
+ crates/reims-vgpu/src/runtime/mapper/mod.rs   |    5 +
+ .../src/runtime/mapper/wire_watch.rs          | 1843 +++++++++++++++++
+ .../src/runtime/mapper/wire_watch_tests.rs    |  764 +++++++
+ .../src/runtime/mapping_write/mod.rs          |   16 +
+ .../reims-vgpu/src/runtime/writeback_debt.rs  |   23 +-
+ 8 files changed, 2790 insertions(+), 2 deletions(-)
+ create mode 100644 crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
+ create mode 100644 crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs
+
+diff --git a/crates/reims-vgpu/src/env.rs b/crates/reims-vgpu/src/env.rs
+index a8ab260c..0b0727e4 100644
+--- a/crates/reims-vgpu/src/env.rs
++++ b/crates/reims-vgpu/src/env.rs
+@@ -199,6 +199,17 @@ pub const RANGE_COVERAGE: &str = "REIMS_VGPU_RANGE_COVERAGE";
+ /// is `strict`, the side that never writes through an unwitnessed page list.
+ pub const KVA_WALK: &str = "REIMS_VGPU_KVA_WALK";
+ 
++/// `on` samples the guest's wire count on every type-11 surface descriptor and
++/// logs its first wrong value beside the display, stamp and write events around
++/// it. A diagnostic: it reads guest kernel memory and changes nothing the guest
++/// sees. See [`crate::runtime::mapper::wire_watch`].
++pub const WIRE_WATCH: &str = "REIMS_VGPU_WIRE_WATCH";
++
++/// `on`, with [`WIRE_WATCH`] on, refuses a host CPU write into a mapping whose
++/// checked surface wire count reads zero or less right before the write. It only
++/// narrows: a refused write is one this device would have made.
++pub const WIRE_GUARD: &str = "REIMS_VGPU_WIRE_GUARD";
++
+ /// `off` stops narrowing a guest buffer bind to the extent the shader's
+ /// reflection proved it can read, so the bind walks the rest of the allocation
+ /// exactly as it did before that rail existed.
+@@ -1226,7 +1237,7 @@ pub fn switch(name: &str) -> Switch {
+ /// Nothing enforces that a new `pub const` above is added to this list; the rule
+ /// is stated and honestly unenforced. What keeps it small is that the list is
+ /// next to the constants, and [`report_line`] is the only consumer.
+-pub const ALL: [&str; 29] = [
++pub const ALL: [&str; 31] = [
+     COLOR_GENERAL,
+     LAZY_WRITEBACK,
+     SLAB_RETAIN,
+@@ -1246,6 +1257,8 @@ pub const ALL: [&str; 29] = [
+     PAGE_GUARDS,
+     RANGE_COVERAGE,
+     KVA_WALK,
++    WIRE_WATCH,
++    WIRE_GUARD,
+     BUFFER_EXTENT,
+     BATCH_MIXED_TARGETS,
+     BATCH_DEPTH,
+diff --git a/crates/reims-vgpu/src/model/state.rs b/crates/reims-vgpu/src/model/state.rs
+index 6c38274e..a974e0b8 100644
+--- a/crates/reims-vgpu/src/model/state.rs
++++ b/crates/reims-vgpu/src/model/state.rs
+@@ -2466,6 +2466,9 @@ pub struct DeviceState {
+     /// walk over it has passed runtime validation. See
+     /// [`crate::runtime::kernel_walk`].
+     pub kernel_walk: crate::runtime::kernel_walk::KernelWalkState,
++    /// The guest's wire counts on type-11 surfaces, when that diagnostic is on.
++    /// See [`crate::runtime::mapper::wire_watch`].
++    pub wire_watch: crate::runtime::mapper::wire_watch::WireWatch,
+     /// Live object refs per task, as `(task_id, ref)`.
+     ///
+     /// This is membership for host-copy teardown. [`Self::task_resources`]
+@@ -2842,6 +2845,7 @@ impl DeviceState {
+             node_guard: std::collections::BTreeMap::new(),
+             released_pages: crate::runtime::released_pages::ReleasedPages::default(),
+             kernel_walk: crate::runtime::kernel_walk::KernelWalkState::default(),
++            wire_watch: crate::runtime::mapper::wire_watch::WireWatch::default(),
+             objects: std::collections::BTreeSet::new(),
+             task_resources: TaskResources::default(),
+             task_sampler_states: TaskSamplerStates::default(),
+@@ -3218,6 +3222,8 @@ impl DeviceState {
+         // Cleared as well as kept: a reset drops every channel, so a bit rung
+         // before it names a channel that no longer exists.
+         child_rung.store(0, Ordering::Release);
++        // What the wire watch cost this boot; its state goes with the boot.
++        crate::runtime::mapper::wire_watch::on_reset(self);
+         // The mapper registers' read rail, kept the same way and published
+         // as the reset leaves them.
+         let iosfc_live = Arc::clone(&self.iosfc.live);
+diff --git a/crates/reims-vgpu/src/runtime/drain/mod.rs b/crates/reims-vgpu/src/runtime/drain/mod.rs
+index f2c0828f..f9e94582 100644
+--- a/crates/reims-vgpu/src/runtime/drain/mod.rs
++++ b/crates/reims-vgpu/src/runtime/drain/mod.rs
+@@ -82,6 +82,11 @@ fn note_translation_order_hold(state: &mut DeviceState, held_mask: u32) {
+         state.translation_deferred_mask,
+         state.translation_order_holds
+     ));
++    let (held, producer) = (
++        state.translation_order_hold_mask,
++        state.translation_deferred_mask,
++    );
++    crate::runtime::mapper::wire_watch::on_hold(state, held, new_mask, producer);
+ }
+ 
+ /// What the deferred EXEC packets in `translation_deferred_mask` are waiting
+@@ -108,6 +113,7 @@ fn release_translation_order_holds(state: &mut DeviceState) {
+     crate::observe::off(format!(
+         "translation_order_release held_mask={held_mask:#x} producer_mask=0x0"
+     ));
++    crate::runtime::mapper::wire_watch::on_hold_release(state, held_mask);
+ }
+ 
+ /// Install a `DefineTask2` payload and record the page-table identity it
+@@ -649,6 +655,78 @@ fn present_surface_id(opcode: u16, payload: &[u8]) -> Option<u32> {
+     })
+ }
+ 
++/// The three display present commands `process_child_packet` sends to
++/// `present_named_mapping`.
++fn is_display_present(opcode: u16) -> bool {
++    matches!(
++        opcode,
++        CHILD_OP_DISPLAY_SWAP | CHILD_OP_DISPLAY_TRANSACTION2 | CHILD_OP_DISPLAY_TRANSACTION3
++    )
++}
++
++/// The packet at a child FIFO's head, read and left where it is.
++pub(crate) struct HeadPeek {
++    pub head: u32,
++    pub opcode: u16,
++    pub completion_stamp: u32,
++    /// The surface a display present names; `None` for any other command.
++    pub mapping: Option<u32>,
++}
++
++/// Read the packet a held child FIFO would run next, without running it or
++/// moving its head. Only through a ring this device has already set up; an
++/// incomplete or unreadable packet is `None`.
++///
++/// For [`crate::runtime::mapper::wire_watch`], which wants to see a display
++/// swap when it arrives behind a hold and not only when it runs.
++pub(crate) fn peek_child_head<M: HostMemory>(
++    state: &DeviceState,
++    mem: &M,
++    channel_id: u32,
++) -> Option<HeadPeek> {
++    if state.gfx.root_page == 0 {
++        return None;
++    }
++    let regs_gpa = state.pfn_gpa(state.gfx.root_page) + child_reg_block_offset(channel_id)?;
++    let ring = state.child_rings.get(channel_id as usize)?;
++    let base_pfn = crate::runtime::host::read_u32(mem, regs_gpa + CHILD_REG_BASE_PFN).ok()?;
++    if !ring.valid || ring.base_pfn != base_pfn {
++        return None;
++    }
++    let head = crate::runtime::host::read_u32(mem, regs_gpa + CHILD_REG_HEAD).ok()?;
++    let tail = crate::runtime::host::read_u32(mem, regs_gpa + CHILD_REG_TAIL).ok()?;
++    let available = published_byte_count(head, tail, ring.length)?;
++    if available < PACKET_HEADER_LEN {
++        return None;
++    }
++    let read = |len: u32| {
++        read_child_ring_bytes_inner(mem, &ring.page_gpas, ring.length, head, len, state.page_shift)
++            .ok()
++    };
++    let header = read(PACKET_HEADER_LEN)?;
++    let opcode = ld16(&header[PACKET_OPCODE..]);
++    let total_size = ld32(&header[PACKET_TOTAL_SIZE..]);
++    let completion_stamp = ld32(&header[PACKET_COMPLETION_STAMP..]);
++    let payload_off = PACKET_HEADER_LEN
++        .saturating_add(u32::from(ld16(&header[PACKET_STAMP_COUNT..])) * PACKET_STAMP_LEN);
++    let mapping = if is_display_present(opcode)
++        && total_size <= available
++        && total_size <= ring.length
++        && payload_off <= total_size
++    {
++        let bytes = read(total_size)?;
++        present_surface_id(opcode, &bytes[payload_off as usize..])
++    } else {
++        None
++    };
++    Some(HeadPeek {
++        head,
++        opcode,
++        completion_stamp,
++        mapping,
++    })
++}
++
+ /// Alarm for a display-transaction payload longer than its command declares.
+ ///
+ /// # The wire shape, and why there is nothing left to sample here
+@@ -1900,6 +1978,7 @@ pub fn write_stamp<H: HostMemory + HostOps>(
+             // fence — which is what `armed_stamp_seq` is compared against, and
+             // dating it from the completion would call that window punctual.
+             state.completion_stamp_seq = state.completion_stamp_seq.wrapping_add(1);
++            crate::runtime::mapper::wire_watch::on_stamp(state, &*host, index, stamp_value, true);
+             return;
+         }
+         if order.needs_blocking_fallback() {
+@@ -1935,6 +2014,7 @@ pub fn write_stamp<H: HostMemory + HostOps>(
+             .interrupt_status_gpu
+             .fetch_or(1u32 << (index & 0x1f), std::sync::atomic::Ordering::AcqRel);
+         host.enqueue(HostAction::irq_gfx());
++        crate::runtime::mapper::wire_watch::on_stamp(state, &*host, index, stamp_value, false);
+     }
+ }
+ 
+@@ -5031,9 +5111,40 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
+                     state.pending.child_mask |= bit;
+                     break;
+                 }
++                let watched_present = is_display_present(packet.opcode)
++                    && crate::runtime::mapper::wire_watch::enabled();
++                let present_started_us = if watched_present {
++                    crate::runtime::mapper::wire_watch::before_swap(state, &*host);
++                    crate::observe::elapsed_us()
++                } else {
++                    0
++                };
+                 let proc_started = std::time::Instant::now();
+                 let disposition = process_child_packet(state, host, channel_id, &packet);
+                 census::note_drain_proc(packet.opcode, proc_started.elapsed().as_nanos() as u64);
++                if watched_present {
++                    let waits: Vec<(u32, u32)> = packet
++                        .stamp_waits
++                        .iter()
++                        .map(|w| (w.index, w.value))
++                        .collect();
++                    crate::runtime::mapper::wire_watch::after_swap(
++                        state,
++                        &*host,
++                        crate::runtime::mapper::wire_watch::SwapPacket {
++                            channel: channel_id,
++                            head,
++                            slot: stamp_index_slot,
++                            opcode: packet.opcode,
++                            stamp: packet.completion_stamp,
++                            waits: &waits,
++                            payload: &packet.payload,
++                            mapping: present_surface_id(packet.opcode, &packet.payload),
++                        },
++                        present_started_us,
++                        disposition == ChildPacketDisposition::Deferred,
++                    );
++                }
+                 if disposition == ChildPacketDisposition::Deferred {
+                     // Translation owns only immutable AIR bytes. Keep head and
+                     // stamp untouched so retry cannot duplicate any packet
+@@ -5203,6 +5314,7 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut
+                             let _ = crate::runtime::mapper::resolve_mapping_backing(
+                                 state, host, mapping_id,
+                             );
++                            crate::runtime::mapper::wire_watch::on_map(state, &*host, mapping_id);
+                         } else {
+                             // Mismatched capture — put back for a later entry.
+                             state.mapper_capture = Some(c);
+@@ -5210,6 +5322,7 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut
+                     }
+                 }
+                 MAPPER_REQUEST_UNMAP => {
++                    crate::runtime::mapper::wire_watch::on_unmap(state, &*host, mapping_id);
+                     // Deferred-writeback: DROP, never write — same recycled-page
+                     // hazard as DeleteIOSurfaceBacking2 (the unmap request
+                     // trails the guest release; writing risks PTE corruption).
+@@ -5343,6 +5456,7 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
+     let gpa = state.display.shared_gpa;
+     if gpa == 0 {
+         note_display_present_signal(DISPLAY_PRESENT_NO_GPA);
++        crate::runtime::mapper::wire_watch::on_present(state, "no_gpa");
+         return;
+     }
+     // The mask gates the pending write and not just the interrupt. It used to
+@@ -5351,9 +5465,11 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
+     // [`display_event_enabled`] for why that residue is not inert.
+     if !display_event_enabled(host, gpa, DISPLAY_PRESENT_EVENT_MASK) {
+         note_display_present_signal(DISPLAY_PRESENT_NOT_ENABLED);
++        crate::runtime::mapper::wire_watch::on_present(state, "not_enabled");
+         return;
+     }
+     note_display_present_signal(DISPLAY_PRESENT_DELIVERED);
++    crate::runtime::mapper::wire_watch::on_present(state, "delivered");
+     // Pending word is atomic read-and-clear (ldclral) on the guest side; OR
+     // the present bit so a not-yet-consumed ONLINE event is preserved.
+     let mut pending_le = [0u8; 4];
+@@ -5831,6 +5947,7 @@ pub(crate) fn signal_display_refresh_classes<H: HostMemory + HostOps>(
+     note_vbl(if vbl { VBL_DELIVERED } else { VBL_NOT_ENABLED }, now_ms);
+     if transaction {
+         note_display_present_signal(DISPLAY_PRESENT_REFRESH);
++        crate::runtime::mapper::wire_watch::note_refresh_signal();
+     }
+ 
+     let mut pending_le = [0u8; 4];
+@@ -6167,6 +6284,7 @@ fn note_present_backpressure_hold(state: &mut DeviceState, channel: u32, head: u
+         "THRASH present_action_starvation reason=pending_frames_cap ch={channel} head={head} tail={tail} unpainted={} episode={}",
+         state.present.unpainted_presents, state.present.backpressure_hold_count
+     ));
++    crate::runtime::mapper::wire_watch::swap_held(state, "backpressure", channel, head);
+ }
+ 
+ /// Publish the poll-tick/Dekker rescue to the asynchronous drain owner.
+@@ -6365,6 +6483,8 @@ fn retry_stamp_held_timelines<H: HostMemory + HostOps>(state: &mut DeviceState,
+ }
+ 
+ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
++    // Ahead of the yield below: a held present is exactly when it must look.
++    crate::runtime::mapper::wire_watch::tick(state, &*host);
+     // A queued present action is part of the ordered device timeline. QEMU
+     // cannot paint it while this worker owns the device lock, so later worker
+     // wakeups must leave guest work queued until scanout consumes the action.
+diff --git a/crates/reims-vgpu/src/runtime/mapper/mod.rs b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+index d3ec5781..a1da9cb8 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/mod.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+@@ -2462,6 +2462,9 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
+     site: &str,
+ ) -> bool {
+     if copy.is_write() {
++        if !wire_watch::before_write(state, &*host, mapping_id, site, wire_watch::WriteKind::Cpu) {
++            return false;
++        }
+         // Puts bytes into guest pages the hypervisor's dirty bitmap cannot
+         // witness. The read direction shares this walk and writes nothing.
+         state.note_host_wrote_mapping(mapping_id);
+@@ -2721,6 +2724,8 @@ fn mapping_run_import_is_slow(elapsed_us: u64) -> bool {
+     elapsed_us >= MAPPING_RUN_IMPORT_SLOW_US
+ }
+ 
++pub mod wire_watch;
++
+ #[cfg(test)]
+ mod revalidate_tests;
+ 
+diff --git a/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs b/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
+new file mode 100644
+index 00000000..063b1a39
+--- /dev/null
++++ b/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
+@@ -0,0 +1,1843 @@
++//! The guest's wire count on every type-11 surface this device maps, sampled
++//! where this device acts, with the first time it goes wrong said out loud.
++//!
++//! Off unless `REIMS_VGPU_WIRE_WATCH` is on. Nothing here changes what the guest
++//! sees, except the optional guard below.
++//!
++//! # Why
++//!
++//! Two macOS 27.2 panics were read back out of guest RAM. In both, a mapped
++//! display swap buffer (1920×1080 RGBA16F, `MAP`ped once, never `UNMAP`ped,
++//! still in the mapper's wired set) had its surface descriptor at a wire count
++//! of zero while every other mapping stood at one. Its pages were then
++//! compressed and reused by the kernel, and this device's next full-frame write
++//! into the mapping's page list landed on kernel memory.
++//!
++//! `IOSurfaceParavirtMappingInternal::wire_mapping` prepares the surface
++//! descriptor and the page-table descriptor before it sends `MAP`, and
++//! `unwire_mapping` completes both only after `UNMAP` succeeds. So between those
++//! two requests the guest's own driver keeps both counts at or above their
++//! `MAP`-time values. Something else completed the surface once too often; the
++//! static reading points at the display swap path. This module records the
++//! first moment the count moves, beside the swap, present, stamp, hold and
++//! write events this device produced around it.
++//!
++//! # What it reads, and why it believes it
++//!
++//! The offsets below are 27.2's (26B123), inferred from the driver's code and
++//! checked against both dumps. Nothing here is trusted before it is checked:
++//!
++//! 1. The kernel. The Mach-O header of the kernel is found by stepping down
++//!    page by page from `VBAR_EL1` (captured with the kernel root, see
++//!    [`crate::runtime::kernel_walk`]); its `__TEXT` must start at the header
++//!    itself, `VBAR_EL1` must lie in one of its segments, and `__TEXT,__const`
++//!    must hold exactly [`EXPECTED_KERNEL_VERSION`]. Any other kernel turns the
++//!    watch off for the boot.
++//! 2. Each mapping. The `MappingInternal` must name the mapping's id, the
++//!    `0x200` descriptor size and the page count this device resolved; the
++//!    page-table descriptor's buffer must be the page table this device reads;
++//!    the surface descriptor's length must be the mapping's size; both
++//!    descriptors must be initialised and of one kernel class. A mapping that
++//!    fails any of these is not watched.
++//!
++//! A failed check is `wire_watch_layout_unverified`. A read that could not be
++//! made — off a vCPU before the kernel walk validated — is not a failure and is
++//! tried again; it is counted as `unreadable`.
++//!
++//! # When it samples
++//!
++//! On `MAP` (on the publishing vCPU, after the resolve), before `UNMAP`, before
++//! every host write into a watched mapping (a write within
++//! [`WRITE_RESAMPLE_US`] of the last read uses it, so a frame landed row by row
++//! is not read a thousand times), around every display swap packet, after every
++//! stamp that completes one, and from the drain worker: the swap buffers every
++//! [`DISPLAY_SAMPLE_US`] and every mapping every [`ALL_SAMPLE_US`]. A queued
++//! stamp reaches the guest later than it is sampled here; the worker's next
++//! pass is what sees the guest's answer to it.
++//!
++//! While a FIFO is held, its head packet is read without consuming it every
++//! [`PEEK_US`], so a display swap waiting behind the hold is seen when it
++//! arrives and not only when it runs.
++//!
++//! # The guard, and what it is not
++//!
++//! With `REIMS_VGPU_WIRE_GUARD` on as well, a host CPU write into a mapping
++//! whose validated surface count reads zero or less right before the write is
++//! refused (`wire_guard_refused`), and an owed frame stays owed. A positive count
++//! is not a permission: it is read, then the write happens, and the guest can
++//! complete the descriptor in between. GPU-direct writes into guest pages are
++//! sampled but not refused, and a render target the GPU writes in guest memory
++//! (`REIMS_VGPU_SHARED_TARGET`) is not seen at all. A reader of the mapping
++//! that settles an owed frame the guard kept reads the older guest bytes.
++
++use std::collections::{BTreeMap, BTreeSet, VecDeque};
++
++use super::MapperMem;
++use crate::contract::iosurface_pages::{
++    self, guest_kernel_va, PagesMemory, MAPPING_INTERNAL_EXPECTED_SIZE,
++};
++use crate::model::DeviceState;
++use crate::runtime::host::{HostMemory, HostOps};
++use crate::runtime::kernel_walk::{self, KernelRoot};
++
++// MARK: - Switches
++
++/// Whether the watch is on for this process. `REIMS_VGPU_WIRE_WATCH`, read once.
++pub fn enabled() -> bool {
++    #[cfg(test)]
++    if let Some((watch, _)) = TEST_SWITCHES.with(std::cell::Cell::get) {
++        return watch;
++    }
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| {
++        let (state, value) = crate::env::read(crate::env::WIRE_WATCH);
++        let on = state == crate::env::Switch::On;
++        if value.is_some() {
++            crate::observe::off(format!(
++                "wire_watch_mode on={on} guard={} value={}",
++                guard_switch(),
++                value.unwrap_or_default()
++            ));
++        }
++        on
++    })
++}
++
++fn guard_switch() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| crate::env::switch(crate::env::WIRE_GUARD) == crate::env::Switch::On)
++}
++
++/// Whether a zero count refuses a host CPU write. Needs the watch as well.
++fn guard_enabled() -> bool {
++    #[cfg(test)]
++    if let Some((watch, guard)) = TEST_SWITCHES.with(std::cell::Cell::get) {
++        return watch && guard;
++    }
++    enabled() && guard_switch()
++}
++
++#[cfg(test)]
++thread_local! {
++    static TEST_SWITCHES: std::cell::Cell<Option<(bool, bool)>> = const { std::cell::Cell::new(None) };
++}
++
++/// Run `f` with the watch and the guard switched as given on this thread.
++#[cfg(test)]
++pub(crate) fn with_switches<R>(watch: bool, guard: bool, f: impl FnOnce() -> R) -> R {
++    TEST_SWITCHES.with(|s| s.set(Some((watch, guard))));
++    let out = f();
++    TEST_SWITCHES.with(|s| s.set(None));
++    out
++}
++
++// MARK: - Layout
++
++/// `version[]` of the kernel the offsets below were read from.
++pub const EXPECTED_KERNEL_VERSION: &str = "Darwin Kernel Version 27.2.0: Wed Oct 14 23:44:09 PDT \
++     2026; root:xnu-13432.41.4~25/RELEASE_ARM64_VMAPPLE";
++const VERSION_PREFIX: &[u8] = b"Darwin Kernel Version ";
++/// Longest version string read back for the log.
++const VERSION_MAX: usize = 256;
++
++const MH_MAGIC_64: u32 = 0xfeed_facf;
++const CPU_TYPE_ARM64: u32 = 0x0100_000c;
++const MH_EXECUTE: u32 = 2;
++const LC_SEGMENT_64: u32 = 0x19;
++const MACH_HEADER_64_LEN: usize = 32;
++const SEGMENT_COMMAND_64_LEN: usize = 72;
++const SECTION_64_LEN: usize = 80;
++/// Load commands larger than this are not a kernel header.
++const LOAD_COMMANDS_MAX: usize = 0x10000;
++/// `__TEXT,__const` larger than this is not read.
++const TEXT_CONST_MAX: u64 = 8 << 20;
++/// How far below `VBAR_EL1` the kernel header is looked for. On 27.2 it is
++/// 0x2ec0000 below; this is a bound on the search, not a guess at the answer.
++const KERNEL_SCAN_BYTES: u64 = 256 << 20;
++
++/// `IOSurfaceParavirtMappingInternal`, 27.2. `+0x10` is the driver's own
++/// `refs * 4 | wired` word, `+0x20` the surface descriptor, `+0x58` the
++/// page-table descriptor (macOS 14 and later moved the page fields by
++/// [`iosurface_pages::MAPPING_INTERNAL_SONOMA_SHIFT`]).
++const MI_STATE: u64 = 0x10;
++const MI_SURFACE_IOMD: u64 = 0x20;
++const MI_ID: u64 = iosurface_pages::MAPPING_INTERNAL_ID;
++const MI_SIZE: u64 = iosurface_pages::MAPPING_INTERNAL_SIZE;
++const MI_FIELD_48: u64 = iosurface_pages::MAPPING_INTERNAL_PAGE_FIELD_48;
++const MI_FIELD_50: u64 = iosurface_pages::MAPPING_INTERNAL_PAGE_FIELD_50;
++const MI_TABLE_IOMD: u64 = iosurface_pages::MAPPING_INTERNAL_PAGE_FIELD_48
++    + iosurface_pages::MAPPING_INTERNAL_SONOMA_SHIFT;
++const MI_PAGE_COUNT: u64 =
++    iosurface_pages::MAPPING_INTERNAL_PAGE_COUNT + iosurface_pages::MAPPING_INTERNAL_SONOMA_SHIFT;
++/// One read covers every field above.
++const MI_WINDOW: std::ops::Range<u64> = MI_STATE..MI_PAGE_COUNT + 8;
++
++/// `IOBufferMemoryDescriptor` on 27.2's xnu: `IOMemoryDescriptor::_length`,
++/// `IOGeneralMemoryDescriptor::_task`, `_wireCount`, `_initialized`,
++/// `_memoryEntries`, `_pages`, and `IOBufferMemoryDescriptor::_buffer`.
++const IOMD_LENGTH: u64 = 0x50;
++const IOMD_TASK: u64 = 0x70;
++const IOMD_WIRE_COUNT: u64 = 0x88;
++const IOMD_INITIALIZED: u64 = 0x8c;
++const IOMD_MEMORY_ENTRIES: u64 = 0x90;
++const IOMD_PAGES: u64 = 0x98;
++const IOBMD_BUFFER: u64 = iosurface_pages::MAPPING_PAGE_TABLE_FROM_F48;
++const IOMD_WINDOW: u64 = IOBMD_BUFFER + 8;
++/// The length word of `_memoryEntries`. `0x30` once `complete()` has dropped
++/// the page list, larger while wired.
++const MIXED_DATA_LENGTH: u64 = 0x18;
++/// Bytes per page-table entry, as [`iosurface_pages`] reads them.
++const TABLE_ENTRY_LEN: u64 = iosurface_pages::U32_SIZE as u64;
++
++// MARK: - Cadence
++
++/// Swap buffers are sampled from the worker at most this often.
++pub const DISPLAY_SAMPLE_US: u64 = 5_000;
++/// Every watched mapping is sampled from the worker at most this often.
++pub const ALL_SAMPLE_US: u64 = 100_000;
++/// A held FIFO's head is read at most this often.
++pub const PEEK_US: u64 = 20_000;
++/// The cost line.
++const COST_US: u64 = 10_000_000;
++/// The history a first anomaly prints. A window over the most recent events
++/// for the log, not a store anything is looked up in.
++const RING: usize = 16;
++/// Lines one mapping may log of each repeating kind, at its 1st, 2nd, 4th, 8th...
++/// occurrence; the count carries on.
++const LINES_PER_MAPPING: u32 = 24;
++/// A write this soon after the counts were read uses that read. A writer that
++/// lands a frame a row at a time calls once per row.
++pub const WRITE_RESAMPLE_US: u64 = 250;
++/// Completed swaps waiting for their stamp, oldest dropped past this (counted).
++const UNSTAMPED_MAX: usize = 64;
++
++fn now_us() -> u64 {
++    crate::observe::elapsed_us()
++}
++
++// MARK: - Events
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++enum Ev {
++    Swap {
++        channel: u32,
++        head: u32,
++        opcode: u16,
++        stamp: u32,
++        slot: u32,
++        mapping: u32,
++        deferred: bool,
++        present: &'static str,
++    },
++    SwapHeld {
++        cause: &'static str,
++        channel: u32,
++        head: u32,
++        opcode: u16,
++        stamp: u32,
++        mapping: u32,
++    },
++    Stamp {
++        slot: u32,
++        value: u32,
++        queued: bool,
++        swaps: Vec<(u64, u32)>,
++    },
++    Present {
++        kind: &'static str,
++    },
++    Hold {
++        held: u32,
++        new: u32,
++        producer: u32,
++    },
++    HoldRelease {
++        held: u32,
++        held_us: u64,
++    },
++    Map {
++        mapping: u32,
++        surface: u32,
++        table: u32,
++    },
++    Unmap {
++        mapping: u32,
++    },
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++struct Event {
++    seq: u64,
++    t_us: u64,
++    /// Display refresh-class present signals raised so far; see
++    /// [`note_refresh_signal`].
++    refresh: u64,
++    ev: Ev,
++}
++
++impl std::fmt::Display for Event {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(
++            f,
++            "seq={} t_us={} refresh={} ",
++            self.seq, self.t_us, self.refresh
++        )?;
++        match &self.ev {
++            Ev::Swap {
++                channel,
++                head,
++                opcode,
++                stamp,
++                slot,
++                mapping,
++                deferred,
++                present,
++            } => write!(
++                f,
++                "ev=swap ch={channel} head={head:#x} op={opcode:#x} stamp={stamp:#x} slot={slot} \
++                 mapping={mapping} how={} present={present}",
++                if *deferred { "deferred" } else { "exec" }
++            ),
++            Ev::SwapHeld {
++                cause,
++                channel,
++                head,
++                opcode,
++                stamp,
++                mapping,
++            } => write!(
++                f,
++                "ev=swap_held cause={cause} ch={channel} head={head:#x} op={opcode:#x} \
++                 stamp={stamp:#x} mapping={mapping}"
++            ),
++            Ev::Stamp {
++                slot,
++                value,
++                queued,
++                swaps,
++            } => {
++                write!(
++                    f,
++                    "ev=stamp slot={slot} value={value:#x} route={} swaps=[",
++                    if *queued { "queued" } else { "direct" }
++                )?;
++                for (i, (seq, mapping)) in swaps.iter().enumerate() {
++                    let sep = if i == 0 { "" } else { "," };
++                    write!(f, "{sep}{seq}:{mapping}")?;
++                }
++                write!(f, "]")
++            }
++            Ev::Present { kind } => write!(f, "ev=present kind={kind}"),
++            Ev::Hold {
++                held,
++                new,
++                producer,
++            } => write!(
++                f,
++                "ev=hold held_mask={held:#x} new_mask={new:#x} producer_mask={producer:#x}"
++            ),
++            Ev::HoldRelease { held, held_us } => {
++                write!(f, "ev=hold_release held_mask={held:#x} held_us={held_us}")
++            }
++            Ev::Map {
++                mapping,
++                surface,
++                table,
++            } => write!(
++                f,
++                "ev=map mapping={mapping} surface={surface} table={table}"
++            ),
++            Ev::Unmap { mapping } => write!(f, "ev=unmap mapping={mapping}"),
++        }
++    }
++}
++
++/// One display swap the device completed, waiting for the stamp that tells the
++/// guest so.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++struct Unstamped {
++    seq: u64,
++    slot: u32,
++    stamp: u32,
++    mapping: u32,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++struct WriteNote {
++    mapping: u32,
++    site: String,
++    t_us: u64,
++}
++
++impl std::fmt::Display for WriteNote {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(
++            f,
++            "{{mapping={},site={},t_us={}}}",
++            self.mapping, self.site, self.t_us
++        )
++    }
++}
++
++// MARK: - State
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++struct KernelImage {
++    header: u64,
++    data_const: (u64, u64),
++    va_bits: u32,
++}
++
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++enum KernelCheck {
++    #[default]
++    Unchecked,
++    Verified(KernelImage),
++    /// Read, and not the kernel these offsets belong to. Off for the boot.
++    Unverified,
++}
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++struct Counts {
++    surface: u32,
++    table: u32,
++    /// `MappingInternal +0x10`.
++    mi_state: u32,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Field {
++    Surface,
++    Table,
++    MiState,
++}
++
++impl Field {
++    fn name(self) -> &'static str {
++        match self {
++            Self::Surface => "surface",
++            Self::Table => "table",
++            Self::MiState => "mi_state",
++        }
++    }
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Phase {
++    /// The `MappingInternal` is known and its layout has not been checked yet.
++    Pending,
++    Active,
++}
++
++/// What the descriptor held when it was checked, for a later comparison that
++/// says whether anything besides the count moved.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++struct IomdFields {
++    vtable: u64,
++    length: u64,
++    task: u64,
++    wire: u32,
++    initialized: u8,
++    memory_entries: u64,
++    pages: u32,
++    buffer: u64,
++}
++
++impl IomdFields {
++    fn decode(b: &[u8]) -> Self {
++        let u64_at = |o: u64| u64::from_le_bytes(b[o as usize..o as usize + 8].try_into().unwrap());
++        let u32_at = |o: u64| u32::from_le_bytes(b[o as usize..o as usize + 4].try_into().unwrap());
++        Self {
++            vtable: u64_at(0),
++            length: u64_at(IOMD_LENGTH),
++            task: u64_at(IOMD_TASK),
++            wire: u32_at(IOMD_WIRE_COUNT),
++            initialized: b[IOMD_INITIALIZED as usize],
++            memory_entries: u64_at(IOMD_MEMORY_ENTRIES),
++            pages: u32_at(IOMD_PAGES),
++            buffer: u64_at(IOBMD_BUFFER),
++        }
++    }
++
++    /// Every field but the count and the mixed-data object, which `prepare()`
++    /// and `complete()` are allowed to move.
++    fn differs_besides_wiring(&self, other: &Self) -> Vec<&'static str> {
++        let mut out = Vec::new();
++        for (name, a, b) in [
++            ("vtable", self.vtable, other.vtable),
++            ("length", self.length, other.length),
++            ("task", self.task, other.task),
++            ("pages", u64::from(self.pages), u64::from(other.pages)),
++            ("buffer", self.buffer, other.buffer),
++            ("memory_entries", self.memory_entries, other.memory_entries),
++            (
++                "initialized",
++                u64::from(self.initialized),
++                u64::from(other.initialized),
++            ),
++        ] {
++            if a != b {
++                out.push(name);
++            }
++        }
++        out
++    }
++}
++
++#[derive(Clone, Debug)]
++struct Watched {
++    internal: u64,
++    phase: Phase,
++    surface_iomd: u64,
++    table_iomd: u64,
++    pages: u64,
++    surface_fields: IomdFields,
++    table_fields: IomdFields,
++    /// `None` when the layout was checked after `MAP`, so the `MAP`-time value
++    /// was never seen.
++    at_map: Option<Counts>,
++    last: Counts,
++    /// Named by a display swap.
++    display: bool,
++    anomalous: BTreeSet<&'static str>,
++    writes: u64,
++    writes_after_anomaly: u64,
++    lines_after_anomaly: u32,
++    guard_lines: u32,
++    refused: u64,
++    last_write: Option<WriteNote>,
++    /// When the counts were last read.
++    sampled_us: Option<u64>,
++}
++
++#[derive(Clone, Copy, Debug, Default)]
++struct Cost {
++    samples: u64,
++    reads: u64,
++    unreadable: u64,
++    us: u64,
++    transitions: u64,
++    anomalies: u64,
++    guard_refused: u64,
++    unstamped_dropped: u64,
++    peeks: u64,
++}
++
++/// The watch's state for one boot. Lives in [`DeviceState`] and is replaced
++/// with it at a reset.
++#[derive(Clone, Debug, Default)]
++pub struct WireWatch {
++    kernel: KernelCheck,
++    watched: BTreeMap<u32, Watched>,
++    /// Mappings whose layout failed, by `MappingInternal`: said once.
++    unverified: BTreeSet<(u32, u64)>,
++    ring: VecDeque<Event>,
++    seq: u64,
++    last_swap: Option<Event>,
++    last_stamp: Option<Event>,
++    last_write: Option<WriteNote>,
++    unstamped: VecDeque<Unstamped>,
++    /// The present signal raised while the swap being executed ran.
++    present_in_swap: Option<&'static str>,
++    hold_since_us: Option<u64>,
++    /// Held swaps already reported, by `(channel, head, stamp)`.
++    held_seen: BTreeSet<(u32, u32, u32)>,
++    first_anomaly_seen: bool,
++    /// When each cadence last ran; `None` runs it on the next tick.
++    display_sampled_us: Option<u64>,
++    all_sampled_us: Option<u64>,
++    peeked_us: Option<u64>,
++    cost_logged_us: Option<u64>,
++    cost: Cost,
++}
++
++impl WireWatch {
++    fn push(&mut self, ev: Ev) -> Event {
++        self.seq += 1;
++        let event = Event {
++            seq: self.seq,
++            t_us: now_us(),
++            refresh: REFRESH_SIGNALS.load(std::sync::atomic::Ordering::Relaxed),
++            ev,
++        };
++        if self.ring.len() == RING {
++            self.ring.pop_front();
++        }
++        self.ring.push_back(event.clone());
++        event
++    }
++
++    fn context(&self) -> String {
++        let brace = |e: &Option<Event>| match e {
++            Some(e) => format!("{{{e}}}"),
++            None => "-".to_string(),
++        };
++        format!(
++            "last_swap={} last_stamp={} last_write={}",
++            brace(&self.last_swap),
++            brace(&self.last_stamp),
++            self.last_write
++                .as_ref()
++                .map_or_else(|| "-".to_string(), WriteNote::to_string)
++        )
++    }
++
++    fn off(&self) -> bool {
++        self.kernel == KernelCheck::Unverified
++    }
++
++    fn cost_line(&self, boot: u64) -> String {
++        let c = self.cost;
++        format!(
++            "wire_watch_cost boot={boot} watched={} samples={} reads={} unreadable={} us={} \
++             transitions={} anomalies={} guard_refused={} peeks={} unstamped_dropped={} kernel={}",
++            self.watched.len(),
++            c.samples,
++            c.reads,
++            c.unreadable,
++            c.us,
++            c.transitions,
++            c.anomalies,
++            c.guard_refused,
++            c.peeks,
++            c.unstamped_dropped,
++            match self.kernel {
++                KernelCheck::Unchecked => "unchecked",
++                KernelCheck::Verified(_) => "verified",
++                KernelCheck::Unverified => "unverified",
++            }
++        )
++    }
++}
++
++// MARK: - Reading
++
++/// Kernel reads for the watch: through the CPU on a vCPU, through the kernel
++/// walk elsewhere once it has validated, and nothing otherwise.
++struct Reader<'a, H: HostMemory + HostOps> {
++    mem: MapperMem<'a, H>,
++    reads: std::cell::Cell<u64>,
++    failed: std::cell::Cell<u64>,
++}
++
++impl<'a, H: HostMemory + HostOps> Reader<'a, H> {
++    fn new(state: &DeviceState, host: &'a H) -> Self {
++        // The strict policy whatever the mode: compat only says what a write
++        // falls back to, and the watch never writes.
++        let walk = state.kernel_walk.policy(kernel_walk::Mode::Strict);
++        Self {
++            mem: MapperMem::with_walk(host, walk, None),
++            reads: std::cell::Cell::new(0),
++            failed: std::cell::Cell::new(0),
++        }
++    }
++
++    fn bytes(&self, kva: u64, buf: &mut [u8]) -> bool {
++        self.reads.set(self.reads.get() + 1);
++        let ok = guest_kernel_va(kva) && self.mem.read(kva, buf);
++        if !ok {
++            self.failed.set(self.failed.get() + 1);
++        }
++        ok
++    }
++
++    fn u32(&self, kva: u64) -> Option<u32> {
++        let mut b = [0u8; 4];
++        self.bytes(kva, &mut b).then(|| u32::from_le_bytes(b))
++    }
++
++    fn u64(&self, kva: u64) -> Option<u64> {
++        let mut b = [0u8; 8];
++        self.bytes(kva, &mut b).then(|| u64::from_le_bytes(b))
++    }
++
++    fn fold(&self, cost: &mut Cost, started: std::time::Instant) {
++        cost.reads += self.reads.get();
++        cost.unreadable += self.failed.get();
++        cost.us += started.elapsed().as_micros() as u64;
++    }
++}
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++struct MiFields {
++    state: u32,
++    surface: u64,
++    id: u32,
++    size: u32,
++    field_48: u64,
++    field_50: u64,
++    table: u64,
++    pages: u64,
++}
++
++fn read_mi<H: HostMemory + HostOps>(rd: &Reader<'_, H>, internal: u64) -> Option<MiFields> {
++    let mut b = [0u8; (MI_WINDOW.end - MI_WINDOW.start) as usize];
++    if !rd.bytes(internal.checked_add(MI_WINDOW.start)?, &mut b) {
++        return None;
++    }
++    let at = |o: u64| (o - MI_WINDOW.start) as usize;
++    let u64_at = |o: u64| u64::from_le_bytes(b[at(o)..at(o) + 8].try_into().unwrap());
++    let u32_at = |o: u64| u32::from_le_bytes(b[at(o)..at(o) + 4].try_into().unwrap());
++    Some(MiFields {
++        state: u32_at(MI_STATE),
++        surface: u64_at(MI_SURFACE_IOMD),
++        id: u32_at(MI_ID),
++        size: u32_at(MI_SIZE),
++        field_48: u64_at(MI_FIELD_48),
++        field_50: u64_at(MI_FIELD_50),
++        table: u64_at(MI_TABLE_IOMD),
++        pages: u64_at(MI_PAGE_COUNT),
++    })
++}
++
++fn read_iomd<H: HostMemory + HostOps>(rd: &Reader<'_, H>, iomd: u64) -> Option<IomdFields> {
++    let mut b = [0u8; IOMD_WINDOW as usize];
++    rd.bytes(iomd, &mut b).then(|| IomdFields::decode(&b))
++}
++
++/// The length word of a descriptor's mixed-data object, for the log.
++fn mixed_data_len<H: HostMemory + HostOps>(rd: &Reader<'_, H>, iomd: u64) -> String {
++    rd.u64(iomd + IOMD_MEMORY_ENTRIES)
++        .filter(|&p| guest_kernel_va(p))
++        .and_then(|p| rd.u64(p + MIXED_DATA_LENGTH))
++        .map_or_else(|| "?".to_string(), |v| format!("{v:#x}"))
++}
++
++/// A kernel pointer with its pointer authentication code taken off.
++fn strip(pointer: u64, va_bits: u32) -> u64 {
++    pointer | 1u64.checked_shl(va_bits).map_or(0, |bit| !(bit - 1))
++}
++
++// MARK: - Kernel
++
++enum KernelVerdict {
++    Verified(KernelImage, String, u64),
++    /// Not this kernel, or not a kernel at all, with what was seen.
++    Wrong(&'static str, String),
++    /// Reads failed; try again later.
++    Unreadable,
++}
++
++fn find_section(
++    cmds: &[u8],
++    ncmds: u32,
++    want_segment: &[u8],
++    want_section: &[u8],
++) -> Option<(u64, u64)> {
++    let mut off = 0usize;
++    for _ in 0..ncmds {
++        let cmd = u32::from_le_bytes(cmds.get(off..off + 4)?.try_into().ok()?);
++        let size = u32::from_le_bytes(cmds.get(off + 4..off + 8)?.try_into().ok()?) as usize;
++        if size < 8 || off + size > cmds.len() {
++            return None;
++        }
++        if cmd == LC_SEGMENT_64 && size >= SEGMENT_COMMAND_64_LEN {
++            let name = &cmds[off + 8..off + 24];
++            let nsects = u32::from_le_bytes(cmds[off + 64..off + 68].try_into().ok()?) as usize;
++            if name_is(name, want_segment) {
++                for s in 0..nsects {
++                    let at = off + SEGMENT_COMMAND_64_LEN + s * SECTION_64_LEN;
++                    let sect = cmds.get(at..at + SECTION_64_LEN)?;
++                    if name_is(&sect[0..16], want_section) {
++                        let addr = u64::from_le_bytes(sect[32..40].try_into().ok()?);
++                        let len = u64::from_le_bytes(sect[40..48].try_into().ok()?);
++                        return Some((addr, len));
++                    }
++                }
++            }
++        }
++        off += size;
++    }
++    None
++}
++
++/// Every `LC_SEGMENT_64` as `(name, vmaddr, vmsize)`.
++fn segments(cmds: &[u8], ncmds: u32) -> Vec<(Vec<u8>, u64, u64)> {
++    let mut out = Vec::new();
++    let mut off = 0usize;
++    for _ in 0..ncmds {
++        let (Some(cmd), Some(size)) = (cmds.get(off..off + 4), cmds.get(off + 4..off + 8)) else {
++            break;
++        };
++        let cmd = u32::from_le_bytes(cmd.try_into().unwrap());
++        let size = u32::from_le_bytes(size.try_into().unwrap()) as usize;
++        if size < 8 || off + size > cmds.len() {
++            break;
++        }
++        if cmd == LC_SEGMENT_64 && size >= SEGMENT_COMMAND_64_LEN {
++            let name = cmds[off + 8..off + 24]
++                .iter()
++                .copied()
++                .take_while(|&c| c != 0)
++                .collect();
++            let addr = u64::from_le_bytes(cmds[off + 24..off + 32].try_into().unwrap());
++            let len = u64::from_le_bytes(cmds[off + 32..off + 40].try_into().unwrap());
++            out.push((name, addr, len));
++        }
++        off += size;
++    }
++    out
++}
++
++fn name_is(field: &[u8], want: &[u8]) -> bool {
++    field.len() >= want.len()
++        && &field[..want.len()] == want
++        && field[want.len()..].iter().all(|&c| c == 0)
++}
++
++fn check_kernel<H: HostMemory + HostOps>(
++    rd: &Reader<'_, H>,
++    root: &KernelRoot,
++    page_size: u64,
++) -> KernelVerdict {
++    let Some(vbar) = root.vbar else {
++        return KernelVerdict::Wrong("no_vbar", String::new());
++    };
++    let va_bits = 64 - ((root.tcr >> 16) & 0x3f) as u32;
++    let top = vbar & !(page_size - 1);
++    if rd.u32(top).is_none() {
++        return KernelVerdict::Unreadable;
++    }
++    let mut header = None;
++    let mut scanned = 0u64;
++    let mut at = top;
++    while top - at < KERNEL_SCAN_BYTES {
++        scanned += 1;
++        let mut b = [0u8; 16];
++        if rd.bytes(at, &mut b) {
++            let word = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
++            if word(0) == MH_MAGIC_64 && word(1) == CPU_TYPE_ARM64 && word(3) == MH_EXECUTE {
++                header = Some(at);
++                break;
++            }
++        }
++        let Some(next) = at.checked_sub(page_size).filter(|&a| guest_kernel_va(a)) else {
++            break;
++        };
++        at = next;
++    }
++    let vbar_text = format!("vbar={vbar:#x} scanned_pages={scanned}");
++    let Some(header) = header else {
++        return KernelVerdict::Wrong("kernel_header_not_found", vbar_text);
++    };
++    let mut head = [0u8; MACH_HEADER_64_LEN];
++    if !rd.bytes(header, &mut head) {
++        return KernelVerdict::Unreadable;
++    }
++    let ncmds = u32::from_le_bytes(head[16..20].try_into().unwrap());
++    let sizeofcmds = u32::from_le_bytes(head[20..24].try_into().unwrap()) as usize;
++    let at_header = format!("header={header:#x} {vbar_text}");
++    if sizeofcmds > LOAD_COMMANDS_MAX {
++        return KernelVerdict::Wrong("load_commands_oversized", at_header);
++    }
++    let mut cmds = vec![0u8; sizeofcmds];
++    if !rd.bytes(header + MACH_HEADER_64_LEN as u64, &mut cmds) {
++        return KernelVerdict::Unreadable;
++    }
++    let segs = segments(&cmds, ncmds);
++    let seg = |want: &[u8]| {
++        segs.iter()
++            .find(|(n, _, _)| n == want)
++            .map(|&(_, a, l)| (a, l))
++    };
++    // The booter rebases the load commands in place, so `__TEXT` names the
++    // header's own address. A header that does not is not the one running.
++    if seg(b"__TEXT").map(|(a, _)| a) != Some(header) {
++        return KernelVerdict::Wrong("text_not_at_header", at_header);
++    }
++    if !segs.iter().any(|&(_, a, l)| vbar >= a && vbar - a < l) {
++        return KernelVerdict::Wrong("vbar_outside_kernel", at_header);
++    }
++    let Some((dc, dc_len)) = seg(b"__DATA_CONST") else {
++        return KernelVerdict::Wrong("no_data_const", at_header);
++    };
++    let Some((sect, sect_len)) = find_section(&cmds, ncmds, b"__TEXT", b"__const") else {
++        return KernelVerdict::Wrong("no_text_const", at_header);
++    };
++    if sect_len > TEXT_CONST_MAX {
++        return KernelVerdict::Wrong("text_const_oversized", at_header);
++    }
++    let mut text = vec![0u8; sect_len as usize];
++    if !rd.bytes(sect, &mut text) {
++        return KernelVerdict::Unreadable;
++    }
++    let Some(start) = text
++        .windows(VERSION_PREFIX.len())
++        .position(|w| w == VERSION_PREFIX)
++    else {
++        return KernelVerdict::Wrong("no_version_string", at_header);
++    };
++    let version: String = text[start..]
++        .iter()
++        .take(VERSION_MAX)
++        .take_while(|&&c| c != 0)
++        .map(|&c| {
++            if c.is_ascii_graphic() || c == b' ' {
++                c as char
++            } else {
++                '?'
++            }
++        })
++        .collect();
++    if version != EXPECTED_KERNEL_VERSION {
++        return KernelVerdict::Wrong(
++            "kernel_version_mismatch",
++            format!("version=\"{version}\" {at_header}"),
++        );
++    }
++    let image = KernelImage {
++        header,
++        data_const: (dc, dc.saturating_add(dc_len)),
++        va_bits,
++    };
++    KernelVerdict::Verified(image, version, scanned)
++}
++
++/// The kernel check, once a boot. `None` while it cannot be made yet.
++fn kernel_image<H: HostMemory + HostOps>(
++    ww: &mut WireWatch,
++    state: &DeviceState,
++    rd: &Reader<'_, H>,
++) -> Option<KernelImage> {
++    match ww.kernel {
++        KernelCheck::Verified(image) => return Some(image),
++        KernelCheck::Unverified => return None,
++        KernelCheck::Unchecked => {}
++    }
++    let root = state.kernel_walk.root?;
++    let started = std::time::Instant::now();
++    match check_kernel(rd, &root, state.page_size()) {
++        KernelVerdict::Verified(image, version, scanned) => {
++            crate::observe::off(format!(
++                "wire_watch_kernel verified version=\"{version}\" header={:#x} vbar={:#x} \
++                 data_const={:#x}..{:#x} va_bits={} scanned_pages={scanned} us={}",
++                image.header,
++                root.vbar.unwrap_or(0),
++                image.data_const.0,
++                image.data_const.1,
++                image.va_bits,
++                started.elapsed().as_micros()
++            ));
++            ww.kernel = KernelCheck::Verified(image);
++            Some(image)
++        }
++        KernelVerdict::Wrong(reason, seen) => {
++            crate::observe::fail(format!(
++                "wire_watch_layout_unverified scope=kernel reason={reason} {seen} expected=\"{}\" \
++                 (the watch is off for this boot)",
++                EXPECTED_KERNEL_VERSION
++            ));
++            ww.kernel = KernelCheck::Unverified;
++            None
++        }
++        KernelVerdict::Unreadable => None,
++    }
++}
++
++// MARK: - Mapping layout
++
++/// A `MappingInternal` and its surface and page-table descriptors, checked.
++type Checked = (MiFields, IomdFields, IomdFields);
++
++/// The checks of the module doc, on one mapping. `Err` names the first that
++/// failed; `Ok(None)` is a read that could not be made yet.
++fn check_mapping<H: HostMemory + HostOps>(
++    rd: &Reader<'_, H>,
++    state: &DeviceState,
++    image: &KernelImage,
++    mapping_id: u32,
++    internal: u64,
++    at_map: bool,
++) -> Result<Option<Checked>, (&'static str, String)> {
++    let Some(m) = state.mappings.get(&mapping_id) else {
++        return Ok(None);
++    };
++    if m.page_entries.is_empty() || m.page_table_kva == 0 {
++        return Ok(None);
++    }
++    let Some(mi) = read_mi(rd, internal) else {
++        return Ok(None);
++    };
++    let pages = m.page_entries.len() as u64;
++    let seen = |what: String| format!("internal={internal:#x} {what}");
++    if mi.id != mapping_id {
++        return Err(("mi_id", seen(format!("id={}", mi.id))));
++    }
++    if mi.size != MAPPING_INTERNAL_EXPECTED_SIZE {
++        return Err(("mi_size", seen(format!("size={:#x}", mi.size))));
++    }
++    if mi.field_48 != 0 || mi.field_50 != 0 {
++        return Err((
++            "mi_unshifted_layout",
++            seen(format!("f48={:#x} f50={:#x}", mi.field_48, mi.field_50)),
++        ));
++    }
++    if mi.pages != pages {
++        return Err((
++            "mi_page_count",
++            seen(format!("mi_pages={} device_pages={pages}", mi.pages)),
++        ));
++    }
++    if !guest_kernel_va(mi.surface) || !guest_kernel_va(mi.table) || mi.surface == mi.table {
++        return Err((
++            "iomd_pointer",
++            seen(format!("surface={:#x} table={:#x}", mi.surface, mi.table)),
++        ));
++    }
++    let (Some(surface), Some(table)) = (read_iomd(rd, mi.surface), read_iomd(rd, mi.table)) else {
++        return Ok(None);
++    };
++    let iomds = |what: String| {
++        seen(format!(
++            "surface_iomd={:#x} table_iomd={:#x} {what}",
++            mi.surface, mi.table
++        ))
++    };
++    if table.buffer != m.page_table_kva {
++        return Err((
++            "table_buffer",
++            iomds(format!(
++                "buffer={:#x} page_table={:#x}",
++                table.buffer, m.page_table_kva
++            )),
++        ));
++    }
++    let page_size = state.page_size();
++    if surface.length != pages.saturating_mul(page_size) || u64::from(surface.pages) != pages {
++        return Err((
++            "surface_length",
++            iomds(format!(
++                "length={:#x} iomd_pages={} mapping_size={:#x}",
++                surface.length,
++                surface.pages,
++                pages.saturating_mul(page_size)
++            )),
++        ));
++    }
++    let table_len = (pages * TABLE_ENTRY_LEN).div_ceil(page_size) * page_size;
++    if table.length != table_len || u64::from(table.pages) != table_len / page_size {
++        return Err((
++            "table_length",
++            iomds(format!(
++                "length={:#x} iomd_pages={} expected={table_len:#x}",
++                table.length, table.pages
++            )),
++        ));
++    }
++    if surface.initialized != 1 || table.initialized != 1 {
++        return Err(("iomd_initialized", iomds(String::new())));
++    }
++    let (sv, tv) = (
++        strip(surface.vtable, image.va_bits),
++        strip(table.vtable, image.va_bits),
++    );
++    if sv != tv || sv < image.data_const.0 || sv >= image.data_const.1 {
++        return Err((
++            "iomd_class",
++            iomds(format!(
++                "surface_vtable={sv:#x} table_vtable={tv:#x} data_const={:#x}..{:#x}",
++                image.data_const.0, image.data_const.1
++            )),
++        ));
++    }
++    // At `MAP` both were prepared by `wire_mapping` before the request went out.
++    if at_map && ((surface.wire as i32) <= 0 || (table.wire as i32) <= 0) {
++        return Err((
++            "map_wire_not_positive",
++            iomds(format!(
++                "surface_wire={} table_wire={}",
++                surface.wire as i32, table.wire as i32
++            )),
++        ));
++    }
++    Ok(Some((mi, surface, table)))
++}
++
++/// Check a pending mapping's layout, and start watching it when it passes.
++fn activate<H: HostMemory + HostOps>(
++    ww: &mut WireWatch,
++    rd: &Reader<'_, H>,
++    state: &DeviceState,
++    mapping_id: u32,
++    at_map: bool,
++) {
++    let Some(image) = kernel_image(ww, state, rd) else {
++        if ww.off() {
++            ww.watched.clear();
++        }
++        return;
++    };
++    let Some(w) = ww.watched.get(&mapping_id) else {
++        return;
++    };
++    let internal = w.internal;
++    match check_mapping(rd, state, &image, mapping_id, internal, at_map) {
++        Ok(None) => {}
++        Err((reason, seen)) => {
++            ww.watched.remove(&mapping_id);
++            if ww.unverified.insert((mapping_id, internal)) {
++                crate::observe::fail(format!(
++                    "wire_watch_layout_unverified scope=mapping mapping={mapping_id} \
++                     reason={reason} {seen} (this mapping is not watched)"
++                ));
++            }
++        }
++        Ok(Some((mi, surface, table))) => {
++            let counts = Counts {
++                surface: surface.wire,
++                table: table.wire,
++                mi_state: mi.state,
++            };
++            let gen = state
++                .mappings
++                .get(&mapping_id)
++                .map_or(0, |m| m.map_generation);
++            let event = ww.push(Ev::Map {
++                mapping: mapping_id,
++                surface: surface.wire,
++                table: table.wire,
++            });
++            crate::observe::off(format!(
++                "wire_watch map mapping={mapping_id} internal={internal:#x} surface_iomd={:#x} \
++                 table_iomd={:#x} surface_wire={} table_wire={} mi_state={:#x} pages={} \
++                 length={:#x} md_len={} gen={gen} at={} seq={} t_us={}",
++                mi.surface,
++                mi.table,
++                surface.wire as i32,
++                table.wire as i32,
++                mi.state,
++                mi.pages,
++                surface.length,
++                mixed_data_len(rd, mi.surface),
++                if at_map { "map" } else { "late" },
++                event.seq,
++                event.t_us
++            ));
++            let w = ww.watched.get_mut(&mapping_id).expect("looked up above");
++            w.phase = Phase::Active;
++            w.surface_iomd = mi.surface;
++            w.table_iomd = mi.table;
++            w.pages = mi.pages;
++            w.surface_fields = surface;
++            w.table_fields = table;
++            w.at_map = at_map.then_some(counts);
++            w.last = counts;
++            w.sampled_us = Some(now_us());
++            // Checked after `MAP`, a count can already be wrong.
++            if !at_map {
++                for field in [Field::Surface, Field::Table] {
++                    let value = match field {
++                        Field::Surface => counts.surface,
++                        _ => counts.table,
++                    };
++                    if (value as i32) <= 0 {
++                        first_anomaly(ww, rd, mapping_id, field, value, "late_check");
++                    }
++                }
++            }
++        }
++    }
++}
++
++// MARK: - Sampling
++
++/// Read one watched mapping's counts and report what moved. `false` when the
++/// counts could not be read now.
++fn sample_one<H: HostMemory + HostOps>(
++    ww: &mut WireWatch,
++    rd: &Reader<'_, H>,
++    state: &DeviceState,
++    mapping_id: u32,
++    at: &str,
++) -> bool {
++    let Some(w) = ww.watched.get(&mapping_id) else {
++        return false;
++    };
++    let retire = |ww: &mut WireWatch, reason: &str| {
++        ww.watched.remove(&mapping_id);
++        crate::observe::off(format!(
++            "wire_watch retired mapping={mapping_id} reason={reason} at={at}"
++        ));
++    };
++    match state.mappings.get(&mapping_id) {
++        None => {
++            retire(ww, "mapping_gone");
++            return false;
++        }
++        Some(m) if m.mapping_internal != w.internal => {
++            retire(ww, "internal_reattached");
++            return false;
++        }
++        Some(_) => {}
++    }
++    if w.phase == Phase::Pending {
++        activate(ww, rd, state, mapping_id, false);
++        return false;
++    }
++    let (internal, surface_iomd, table_iomd) = (w.internal, w.surface_iomd, w.table_iomd);
++    ww.cost.samples += 1;
++    let Some(mi) = read_mi(rd, internal) else {
++        return false;
++    };
++    if mi.id != mapping_id || mi.surface != surface_iomd || mi.table != table_iomd {
++        retire(
++            ww,
++            &format!(
++                "internal_changed id={} surface={:#x} table={:#x}",
++                mi.id, mi.surface, mi.table
++            ),
++        );
++        return false;
++    }
++    let (Some(surface), Some(table)) = (
++        rd.u32(surface_iomd + IOMD_WIRE_COUNT),
++        rd.u32(table_iomd + IOMD_WIRE_COUNT),
++    ) else {
++        return false;
++    };
++    let now = Counts {
++        surface,
++        table,
++        mi_state: mi.state,
++    };
++    let w = ww.watched.get_mut(&mapping_id).expect("checked above");
++    w.sampled_us = Some(now_us());
++    let (last, at_map) = (w.last, w.at_map);
++    if now == last {
++        return true;
++    }
++    for (field, old, new, iomd) in [
++        (Field::Surface, last.surface, now.surface, surface_iomd),
++        (Field::Table, last.table, now.table, table_iomd),
++        (Field::MiState, last.mi_state, now.mi_state, internal),
++    ] {
++        if old == new {
++            continue;
++        }
++        ww.cost.transitions += 1;
++        let map = at_map.map_or_else(
++            || "?".to_string(),
++            |c| match field {
++                Field::Surface => (c.surface as i32).to_string(),
++                Field::Table => (c.table as i32).to_string(),
++                Field::MiState => format!("{:#x}", c.mi_state),
++            },
++        );
++        let (old_s, new_s) = match field {
++            Field::MiState => (format!("{old:#x}"), format!("{new:#x}")),
++            _ => ((old as i32).to_string(), (new as i32).to_string()),
++        };
++        crate::observe::off(format!(
++            "wire_watch transition mapping={mapping_id} iomd={iomd:#x} field={} old={old_s} \
++             new={new_s} map={map} t_us={} at={at} {}",
++            field.name(),
++            now_us(),
++            ww.context()
++        ));
++        let below_map = match (field, at_map) {
++            (Field::Surface, Some(c)) => (new as i32) < (c.surface as i32),
++            (Field::Table, Some(c)) => (new as i32) < (c.table as i32),
++            _ => false,
++        };
++        if field != Field::MiState && ((new as i32) <= 0 || below_map) {
++            first_anomaly(ww, rd, mapping_id, field, new, at);
++        }
++    }
++    if let Some(w) = ww.watched.get_mut(&mapping_id) {
++        w.last = now;
++    }
++    true
++}
++
++/// The first time one count of one mapping reads zero, below zero, or below
++/// its `MAP`-time value: what else is true of the descriptor, and what this
++/// device did just before.
++fn first_anomaly<H: HostMemory + HostOps>(
++    ww: &mut WireWatch,
++    rd: &Reader<'_, H>,
++    mapping_id: u32,
++    field: Field,
++    value: u32,
++    at: &str,
++) {
++    let Some(w) = ww.watched.get_mut(&mapping_id) else {
++        return;
++    };
++    if !w.anomalous.insert(field.name()) {
++        return;
++    }
++    ww.cost.anomalies += 1;
++    let (iomd, recorded) = match field {
++        Field::Surface => (w.surface_iomd, w.surface_fields),
++        _ => (w.table_iomd, w.table_fields),
++    };
++    let (internal, writes, at_map) = (w.internal, w.writes, w.at_map);
++    let own_write = w
++        .last_write
++        .as_ref()
++        .map_or_else(|| "-".to_string(), WriteNote::to_string);
++    let boot_first = !std::mem::replace(&mut ww.first_anomaly_seen, true);
++    // Whether anything but the wiring moved: a corrupted descriptor would show
++    // it, a `complete()` would not.
++    let fields = match read_iomd(rd, iomd) {
++        Some(now) => {
++            let moved = recorded.differs_besides_wiring(&now);
++            if moved.is_empty() {
++                "unchanged".to_string()
++            } else {
++                format!("changed:{}", moved.join(","))
++            }
++        }
++        None => "unreadable".to_string(),
++    };
++    let md_len = mixed_data_len(rd, iomd);
++    let map = at_map.map_or_else(
++        || "?".to_string(),
++        |c| match field {
++            Field::Surface => (c.surface as i32).to_string(),
++            _ => (c.table as i32).to_string(),
++        },
++    );
++    crate::observe::fail(format!(
++        "wire_watch first_anomaly mapping={mapping_id} field={} value={} map={map} iomd={iomd:#x} \
++         internal={internal:#x} boot_first={} iomd_fields={fields} md_len={md_len} \
++         device_wrote_iomd_frame={} device_writes_to_mapping={writes} own_last_write={own_write} \
++         t_us={} at={at} {} ring={}",
++        field.name(),
++        value as i32,
++        boot_first as u8,
++        rd.device_wrote(iomd),
++        now_us(),
++        ww.context(),
++        ww.ring.len()
++    ));
++    for (i, event) in ww.ring.iter().enumerate() {
++        crate::observe::fail(format!(
++            "wire_watch first_anomaly_ring mapping={mapping_id} field={} i={i} {event}",
++            field.name()
++        ));
++    }
++}
++
++impl<H: HostMemory + HostOps> Reader<'_, H> {
++    /// Whether this device ever wrote the frame a kernel object lives in:
++    /// `0` exonerates its write rails, `1` does not convict them.
++    fn device_wrote(&self, kva: u64) -> &'static str {
++        let kernel_walk::Serve::Walk(root) = self.mem.walk.serve else {
++            return "unknown";
++        };
++        match kernel_walk::translate(self.mem.host, &root, kva) {
++            Ok(gpa) => match crate::observe::footprint::wrote_gpa(gpa) {
++                true => "1",
++                false => "0",
++            },
++            Err(_) => "unknown",
++        }
++    }
++}
++
++fn sample_where<H: HostMemory + HostOps>(
++    ww: &mut WireWatch,
++    rd: &Reader<'_, H>,
++    state: &DeviceState,
++    at: &str,
++    which: impl Fn(&Watched) -> bool,
++) {
++    let ids: Vec<u32> = ww
++        .watched
++        .iter()
++        .filter(|(_, w)| which(w))
++        .map(|(&id, _)| id)
++        .collect();
++    for id in ids {
++        sample_one(ww, rd, state, id, at);
++    }
++}
++
++/// Run `f` over the watch with a reader, putting the watch back afterwards.
++fn with_watch<H: HostMemory + HostOps, R>(
++    state: &mut DeviceState,
++    host: &H,
++    f: impl FnOnce(&mut WireWatch, &Reader<'_, H>, &DeviceState) -> R,
++) -> R {
++    let started = std::time::Instant::now();
++    let mut ww = std::mem::take(&mut state.wire_watch);
++    let rd = Reader::new(state, host);
++    let out = f(&mut ww, &rd, state);
++    rd.fold(&mut ww.cost, started);
++    state.wire_watch = ww;
++    out
++}
++
++// MARK: - Hooks: mapper ring
++
++/// After a `MAP` was applied and resolved, on the publishing vCPU.
++pub fn on_map<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H, mapping_id: u32) {
++    if !enabled() || state.wire_watch.off() {
++        return;
++    }
++    let Some(internal) = state
++        .mappings
++        .get(&mapping_id)
++        .map(|m| m.mapping_internal)
++        .filter(|&i| i != 0)
++    else {
++        return;
++    };
++    with_watch(state, host, |ww, rd, state| {
++        if let Some(old) = ww.watched.get(&mapping_id) {
++            if old.internal != internal {
++                crate::observe::off(format!(
++                    "wire_watch retired mapping={mapping_id} reason=remapped internal={:#x}",
++                    old.internal
++                ));
++            }
++        }
++        ww.watched.insert(
++            mapping_id,
++            Watched {
++                internal,
++                phase: Phase::Pending,
++                surface_iomd: 0,
++                table_iomd: 0,
++                pages: 0,
++                surface_fields: IomdFields::default(),
++                table_fields: IomdFields::default(),
++                at_map: None,
++                last: Counts::default(),
++                display: false,
++                anomalous: BTreeSet::new(),
++                writes: 0,
++                writes_after_anomaly: 0,
++                lines_after_anomaly: 0,
++                guard_lines: 0,
++                refused: 0,
++                last_write: None,
++                sampled_us: None,
++            },
++        );
++        activate(ww, rd, state, mapping_id, true);
++    });
++}
++
++/// Before an `UNMAP` is applied: the last sample, then the mapping leaves the
++/// watch. The guest completes both descriptors only after this request.
++pub fn on_unmap<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H, mapping_id: u32) {
++    if !enabled() || !state.wire_watch.watched.contains_key(&mapping_id) {
++        return;
++    }
++    with_watch(state, host, |ww, rd, state| {
++        sample_one(ww, rd, state, mapping_id, "unmap");
++        let event = ww.push(Ev::Unmap {
++            mapping: mapping_id,
++        });
++        if let Some(w) = ww.watched.remove(&mapping_id) {
++            crate::observe::off(format!(
++                "wire_watch unmap mapping={mapping_id} surface_wire={} table_wire={} pages={} \
++                 writes={} writes_after_anomaly={} anomalous={:?} seq={}",
++                w.last.surface as i32,
++                w.last.table as i32,
++                w.pages,
++                w.writes,
++                w.writes_after_anomaly,
++                w.anomalous,
++                event.seq
++            ));
++        }
++    });
++}
++
++// MARK: - Hooks: writes
++
++/// Which rail is about to put bytes into a mapping's guest pages.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum WriteKind {
++    /// The host CPU copies into the pages; the guard may refuse it.
++    Cpu,
++    /// The GPU copies into the pages; sampled, never refused.
++    Gpu,
++}
++
++/// Right before a write into `mapping_id`'s guest pages. `false` only when the
++/// guard is on and refuses it, having said so.
++pub fn before_write<H: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &H,
++    mapping_id: u32,
++    site: &str,
++    kind: WriteKind,
++) -> bool {
++    if !enabled() {
++        return true;
++    }
++    let t_us = now_us();
++    let note = WriteNote {
++        mapping: mapping_id,
++        site: site.to_string(),
++        t_us,
++    };
++    state.wire_watch.last_write = Some(note.clone());
++    if !state.wire_watch.watched.contains_key(&mapping_id) {
++        return true;
++    }
++    with_watch(state, host, |ww, rd, state| {
++        // A row-at-a-time writer calls this per row; one read serves a burst.
++        let recent = ww
++            .watched
++            .get(&mapping_id)
++            .and_then(|w| w.sampled_us)
++            .is_some_and(|s| t_us.saturating_sub(s) < WRITE_RESAMPLE_US);
++        let fresh = recent || sample_one(ww, rd, state, mapping_id, site);
++        let ctx = ww.context();
++        let Some(w) = ww.watched.get_mut(&mapping_id) else {
++            return true;
++        };
++        w.writes += 1;
++        w.last_write = Some(note);
++        let surface = w.last.surface as i32;
++        if !w.anomalous.is_empty() {
++            w.writes_after_anomaly += 1;
++            if w.writes_after_anomaly.is_power_of_two() && w.lines_after_anomaly < LINES_PER_MAPPING
++            {
++                w.lines_after_anomaly += 1;
++                crate::observe::fail(format!(
++                    "wire_watch write_after_anomaly mapping={mapping_id} site={site} kind={kind:?} \
++                     n={} surface_wire={surface} table_wire={} fresh={} t_us={t_us} {ctx}",
++                    w.writes_after_anomaly,
++                    w.last.table as i32,
++                    fresh as u8
++                ));
++            }
++        }
++        let refuse = kind == WriteKind::Cpu
++            && guard_enabled()
++            && fresh
++            && w.phase == Phase::Active
++            && surface <= 0;
++        if refuse {
++            ww.cost.guard_refused += 1;
++            let w = ww.watched.get_mut(&mapping_id).expect("checked above");
++            w.refused += 1;
++            if w.refused.is_power_of_two() && w.guard_lines < LINES_PER_MAPPING {
++                w.guard_lines += 1;
++                crate::observe::fail(format!(
++                    "wire_guard_refused mapping={mapping_id} site={site} surface_wire={surface} \
++                     n={} t_us={t_us} (the guest no longer holds this surface wired; the write \
++                     is refused and an owed frame stays owed)",
++                    w.refused
++                ));
++            }
++            crate::runtime::drain::note_store_route("wire_guard_refused");
++        }
++        !refuse
++    })
++}
++
++// MARK: - Hooks: display
++
++/// What a display present packet named, as the drain decoded it.
++pub struct SwapPacket<'a> {
++    pub channel: u32,
++    pub head: u32,
++    /// The stamp slot this channel's completions are written to.
++    pub slot: u32,
++    pub opcode: u16,
++    pub stamp: u32,
++    pub waits: &'a [(u32, u32)],
++    pub payload: &'a [u8],
++    pub mapping: Option<u32>,
++}
++
++/// Before a display present packet runs: a sample of the swap buffers.
++pub fn before_swap<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H) {
++    if !enabled() || state.wire_watch.off() {
++        return;
++    }
++    state.wire_watch.present_in_swap = None;
++    with_watch(state, host, |ww, rd, state| {
++        sample_where(ww, rd, state, "swap_begin", |w| w.display);
++    });
++}
++
++/// After a display present packet ran (`deferred` when it will run again).
++pub fn after_swap<H: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &H,
++    packet: SwapPacket<'_>,
++    started_us: u64,
++    deferred: bool,
++) {
++    if !enabled() || state.wire_watch.off() {
++        return;
++    }
++    let mapping = packet.mapping.unwrap_or(0);
++    let present = state.wire_watch.present_in_swap.take().unwrap_or("-");
++    with_watch(state, host, |ww, rd, state| {
++        ww.held_seen
++            .retain(|&(ch, head, _)| (ch, head) != (packet.channel, packet.head));
++        let event = ww.push(Ev::Swap {
++            channel: packet.channel,
++            head: packet.head,
++            opcode: packet.opcode,
++            stamp: packet.stamp,
++            slot: packet.slot,
++            mapping,
++            deferred,
++            present,
++        });
++        let words: Vec<String> = packet
++            .payload
++            .as_chunks::<4>()
++            .0
++            .iter()
++            .map(|w| format!("{:x}", u32::from_le_bytes(*w)))
++            .collect();
++        let waits: Vec<String> = packet
++            .waits
++            .iter()
++            .map(|(i, v)| format!("{i}:{v:#x}"))
++            .collect();
++        crate::observe::off(format!(
++            "wire_watch_ev {event} waits=[{}] words=[{}] dur_us={} hold_active={}",
++            waits.join(","),
++            words.join(","),
++            event.t_us.saturating_sub(started_us),
++            ww.hold_since_us.is_some() as u8
++        ));
++        ww.last_swap = Some(event.clone());
++        if !deferred {
++            if ww.unstamped.len() == UNSTAMPED_MAX {
++                ww.unstamped.pop_front();
++                ww.cost.unstamped_dropped += 1;
++            }
++            ww.unstamped.push_back(Unstamped {
++                seq: event.seq,
++                slot: packet.slot,
++                stamp: packet.stamp,
++                mapping,
++            });
++        }
++        if let Some(w) = ww.watched.get_mut(&mapping) {
++            w.display = true;
++        }
++        sample_where(ww, rd, state, "swap_end", |w| w.display);
++    });
++}
++
++/// A display present packet the drain will not run yet, seen at its FIFO's head.
++pub fn swap_held(state: &mut DeviceState, cause: &'static str, channel: u32, head: u32) {
++    swap_held_packet(state, cause, channel, head, 0, 0, 0);
++}
++
++fn swap_held_packet(
++    state: &mut DeviceState,
++    cause: &'static str,
++    channel: u32,
++    head: u32,
++    opcode: u16,
++    stamp: u32,
++    mapping: u32,
++) {
++    if !enabled() || state.wire_watch.off() {
++        return;
++    }
++    let ww = &mut state.wire_watch;
++    if !ww.held_seen.insert((channel, head, stamp)) {
++        return;
++    }
++    let event = ww.push(Ev::SwapHeld {
++        cause,
++        channel,
++        head,
++        opcode,
++        stamp,
++        mapping,
++    });
++    crate::observe::off(format!("wire_watch_ev {event}"));
++    ww.last_swap = Some(event);
++}
++
++/// Refresh-class present signals the VBL path raised. That path can run
++/// without the device state, so it is a count every event carries rather than
++/// an event of its own: at the display's refresh rate it would push everything
++/// else out of the history.
++static REFRESH_SIGNALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++/// The VBL path set the present bit for the transaction class.
++pub fn note_refresh_signal() {
++    REFRESH_SIGNALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++}
++
++/// The display pipe's present signal, raised inside a swap.
++pub fn on_present(state: &mut DeviceState, kind: &'static str) {
++    if !enabled() || state.wire_watch.off() {
++        return;
++    }
++    let ww = &mut state.wire_watch;
++    ww.present_in_swap = Some(kind);
++    ww.push(Ev::Present { kind });
++}
++
++/// A completion stamp written (or queued to be written) to `slot`. One that
++/// completes display swaps is logged, and the swap buffers are sampled right
++/// after it.
++pub fn on_stamp<H: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &H,
++    slot: u32,
++    value: u32,
++    queued: bool,
++) {
++    if !enabled() || state.wire_watch.off() {
++        return;
++    }
++    let ww = &mut state.wire_watch;
++    if !ww.unstamped.iter().any(|u| u.slot == slot) {
++        return;
++    }
++    let mut swaps = Vec::new();
++    ww.unstamped.retain(|u| {
++        let done = u.slot == slot && value.wrapping_sub(u.stamp) as i32 >= 0;
++        if done {
++            swaps.push((u.seq, u.mapping));
++        }
++        !done
++    });
++    if swaps.is_empty() {
++        return;
++    }
++    let event = ww.push(Ev::Stamp {
++        slot,
++        value,
++        queued,
++        swaps,
++    });
++    crate::observe::off(format!("wire_watch_ev {event}"));
++    ww.last_stamp = Some(event);
++    with_watch(state, host, |ww, rd, state| {
++        sample_where(ww, rd, state, "swap_stamped", |w| w.display);
++    });
++}
++
++// MARK: - Hooks: holds
++
++/// A FIFO newly held behind a translation.
++pub fn on_hold(state: &mut DeviceState, held: u32, new: u32, producer: u32) {
++    if !enabled() || state.wire_watch.off() {
++        return;
++    }
++    let ww = &mut state.wire_watch;
++    ww.hold_since_us.get_or_insert_with(now_us);
++    let event = ww.push(Ev::Hold {
++        held,
++        new,
++        producer,
++    });
++    crate::observe::off(format!("wire_watch_ev {event}"));
++    // Read the held heads on the next tick rather than in a minute.
++    ww.peeked_us = None;
++}
++
++/// Every translation hold released.
++pub fn on_hold_release(state: &mut DeviceState, held: u32) {
++    if !enabled() || state.wire_watch.off() {
++        return;
++    }
++    let ww = &mut state.wire_watch;
++    let since = ww.hold_since_us.take();
++    let event = ww.push(Ev::HoldRelease {
++        held,
++        held_us: since.map_or(0, |s| now_us().saturating_sub(s)),
++    });
++    crate::observe::off(format!("wire_watch_ev {event}"));
++}
++
++// MARK: - Hooks: worker
++
++/// The worker's periodic pass: swap buffers, every mapping, held FIFO heads,
++/// and the cost line, each at its own cadence.
++pub fn tick<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H) {
++    if !enabled() || state.wire_watch.off() {
++        return;
++    }
++    let now = now_us();
++    let ww = &state.wire_watch;
++    let display = due(ww.display_sampled_us, now, DISPLAY_SAMPLE_US);
++    let all = due(ww.all_sampled_us, now, ALL_SAMPLE_US);
++    let backpressure = if state.present.backpressure_hold_active {
++        1u32.checked_shl(state.present.backpressure_hold_channel)
++            .unwrap_or(0)
++    } else {
++        0
++    };
++    // Bit 0 is the root FIFO, which carries no display present.
++    let held =
++        (state.translation_order_hold_mask | state.translation_deferred_mask | backpressure) & !1;
++    let peek = held != 0 && due(ww.peeked_us, now, PEEK_US);
++    // The first cost line one interval after the first tick, not at it.
++    let cost = ww.cost_logged_us.is_some() && due(ww.cost_logged_us, now, COST_US);
++    state.wire_watch.cost_logged_us.get_or_insert(now);
++    if peek {
++        state.wire_watch.peeked_us = Some(now);
++        for channel in 1..crate::model::MAX_CHANNELS as u32 {
++            if held & (1 << channel) == 0 {
++                continue;
++            }
++            state.wire_watch.cost.peeks += 1;
++            let Some(p) = crate::runtime::drain::peek_child_head(state, host, channel) else {
++                continue;
++            };
++            if p.mapping.is_some() {
++                let cause = if state.present.backpressure_hold_active
++                    && state.present.backpressure_hold_channel == channel
++                {
++                    "backpressure"
++                } else {
++                    "translation_hold"
++                };
++                swap_held_packet(
++                    state,
++                    cause,
++                    channel,
++                    p.head,
++                    p.opcode,
++                    p.completion_stamp,
++                    p.mapping.unwrap_or(0),
++                );
++            }
++        }
++    }
++    if display || all {
++        with_watch(state, host, |ww, rd, state| {
++            if all {
++                ww.all_sampled_us = Some(now);
++                ww.display_sampled_us = Some(now);
++                sample_where(ww, rd, state, "tick", |_| true);
++            } else {
++                ww.display_sampled_us = Some(now);
++                sample_where(ww, rd, state, "tick", |w| w.display);
++            }
++        });
++    }
++    if cost {
++        state.wire_watch.cost_logged_us = Some(now);
++        crate::observe::off(state.wire_watch.cost_line(state.kernel_walk.boot));
++    }
++}
++
++/// Whether a cadence last run at `last` is due again at `now`.
++fn due(last: Option<u64>, now: u64, every: u64) -> bool {
++    last.is_none_or(|last| now.saturating_sub(last) >= every)
++}
++
++/// At a device reset, before the state is replaced: what the watch cost.
++pub fn on_reset(state: &DeviceState) {
++    if !enabled() {
++        return;
++    }
++    crate::observe::off(state.wire_watch.cost_line(state.kernel_walk.boot));
++}
++
++#[cfg(test)]
++#[path = "wire_watch_tests.rs"]
++mod tests;
+diff --git a/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs b/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs
+new file mode 100644
+index 00000000..b5ba66bd
+--- /dev/null
++++ b/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs
+@@ -0,0 +1,764 @@
++//! A fake 27.2 kernel and mapping in guest memory: the counts it reports, the
++//! layouts it refuses, and the guard.
++//!
++//! `FakeHost` reads a kernel address from its sparse store at the address
++//! itself when no CPU translation is scripted, which is what a vCPU read is
++//! here. `kva_no_cpu` models the worker before the kernel walk validates.
++
++use super::*;
++use crate::model::{DeviceId, DeviceState, PAGE_SHIFT_ARM64E};
++use crate::runtime::host::FakeHost;
++use crate::runtime::kernel_walk::tests::{root, SCTLR_ON, TCR_16K_47};
++
++const PAGE: u64 = 1 << 14;
++/// The kernel's Mach-O header, and its segments after it.
++const KERNEL: u64 = 0xffff_fe00_1000_0000;
++const TEXT_CONST: u64 = KERNEL + 0x1000;
++const DATA_CONST: u64 = KERNEL + 2 * PAGE;
++const TEXT_EXEC: u64 = KERNEL + 3 * PAGE;
++/// `VBAR_EL1`, at the start of `__TEXT_EXEC` as on 27.2, several pages up.
++const VBAR: u64 = TEXT_EXEC;
++/// The descriptors' class, inside `__DATA_CONST`, signed.
++const VTABLE_SIGNED: u64 = 0x5b95_7e00_1000_8638;
++
++const MID: u32 = 2;
++const PAGES: u64 = 3;
++const MI: u64 = 0xffff_fe1e_47e6_4c20;
++const SURFACE: u64 = 0xffff_fe24_13d7_1398;
++const TABLE: u64 = 0xffff_fe24_13d7_2048;
++const MIXED: u64 = 0xffff_fe1e_47da_8100;
++const PAGE_TABLE: u64 = 0xffff_fe9a_f64f_c000;
++const KERNEL_TASK: u64 = 0xffff_fe1f_4a04_9c70;
++
++fn put64(host: &mut FakeHost, at: u64, v: u64) {
++    host.write_gpa(at, &v.to_le_bytes()).unwrap();
++}
++
++fn put32(host: &mut FakeHost, at: u64, v: u32) {
++    host.write_gpa(at, &v.to_le_bytes()).unwrap();
++}
++
++fn segment(name: &[u8], addr: u64, len: u64, sections: &[(&[u8], u64, u64)]) -> Vec<u8> {
++    let mut b = Vec::new();
++    let size = SEGMENT_COMMAND_64_LEN + sections.len() * SECTION_64_LEN;
++    b.extend_from_slice(&LC_SEGMENT_64.to_le_bytes());
++    b.extend_from_slice(&(size as u32).to_le_bytes());
++    let mut n = [0u8; 16];
++    n[..name.len()].copy_from_slice(name);
++    b.extend_from_slice(&n);
++    b.extend_from_slice(&addr.to_le_bytes());
++    b.extend_from_slice(&len.to_le_bytes());
++    b.extend_from_slice(&[0u8; 24]);
++    b.extend_from_slice(&(sections.len() as u32).to_le_bytes());
++    b.extend_from_slice(&0u32.to_le_bytes());
++    for (sect, sa, sl) in sections {
++        let mut s = [0u8; SECTION_64_LEN];
++        s[..sect.len()].copy_from_slice(sect);
++        s[16..16 + name.len()].copy_from_slice(name);
++        s[32..40].copy_from_slice(&sa.to_le_bytes());
++        s[40..48].copy_from_slice(&sl.to_le_bytes());
++        b.extend_from_slice(&s);
++    }
++    b
++}
++
++/// A kernel image whose `__TEXT,__const` holds `version`.
++fn put_kernel(host: &mut FakeHost, version: &str) {
++    let mut cmds = segment(
++        b"__TEXT",
++        KERNEL,
++        2 * PAGE,
++        &[(b"__const", TEXT_CONST, 0x200)],
++    );
++    cmds.extend(segment(b"__DATA_CONST", DATA_CONST, PAGE, &[]));
++    cmds.extend(segment(b"__TEXT_EXEC", TEXT_EXEC, PAGE, &[]));
++    let mut head = Vec::new();
++    for word in [
++        MH_MAGIC_64,
++        CPU_TYPE_ARM64,
++        0xc000_0002,
++        MH_EXECUTE,
++        3,
++        cmds.len() as u32,
++        0,
++        0,
++    ] {
++        head.extend_from_slice(&word.to_le_bytes());
++    }
++    host.write_gpa(KERNEL, &head).unwrap();
++    host.write_gpa(KERNEL + MACH_HEADER_64_LEN as u64, &cmds)
++        .unwrap();
++    let mut text = b"unrelated\0".to_vec();
++    text.extend_from_slice(version.as_bytes());
++    text.push(0);
++    host.write_gpa(TEXT_CONST + 0x100, &text).unwrap();
++}
++
++fn put_iomd(host: &mut FakeHost, at: u64, length: u64, wire: u32, pages: u32, buffer: u64) {
++    put64(host, at, VTABLE_SIGNED);
++    put64(host, at + IOMD_LENGTH, length);
++    put64(host, at + IOMD_TASK, KERNEL_TASK);
++    put32(host, at + IOMD_WIRE_COUNT, wire);
++    host.write_gpa(at + IOMD_INITIALIZED, &[1]).unwrap();
++    put64(host, at + IOMD_MEMORY_ENTRIES, MIXED);
++    put32(host, at + IOMD_PAGES, pages);
++    put64(host, at + IOBMD_BUFFER, buffer);
++}
++
++/// Mapping 2 as 27.2 lays it out: three pages, surface wired once, page table
++/// twice (it is wired at creation as well).
++fn put_mapping(host: &mut FakeHost) {
++    put32(host, MI + MI_STATE, 5);
++    put64(host, MI + MI_SURFACE_IOMD, SURFACE);
++    put32(host, MI + MI_ID, MID);
++    put32(host, MI + MI_SIZE, MAPPING_INTERNAL_EXPECTED_SIZE);
++    put64(host, MI + MI_TABLE_IOMD, TABLE);
++    put64(host, MI + MI_PAGE_COUNT, PAGES);
++    put_iomd(host, SURFACE, PAGES * PAGE, 1, PAGES as u32, 0);
++    put_iomd(host, TABLE, PAGE, 2, 1, PAGE_TABLE);
++    put64(host, MIXED + MIXED_DATA_LENGTH, 0x2000);
++}
++
++fn set_surface_wire(host: &mut FakeHost, wire: i32) {
++    put32(host, SURFACE + IOMD_WIRE_COUNT, wire as u32);
++}
++
++fn fixture(version: &str) -> (DeviceState, FakeHost) {
++    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
++    let mut host = FakeHost::new();
++    put_kernel(&mut host, version);
++    put_mapping(&mut host);
++    state.kernel_walk.root = Some(KernelRoot {
++        tcr: TCR_16K_47,
++        sctlr: SCTLR_ON,
++        vbar: Some(VBAR),
++        ..root(0)
++    });
++    assert!(state.map_surface(MID));
++    let m = state.mappings.get_mut(&MID).unwrap();
++    m.mapping_internal = MI;
++    m.page_table_kva = PAGE_TABLE;
++    m.page_entries = vec![0x1; PAGES as usize];
++    (state, host)
++}
++
++fn lines_with(cap: &crate::observe::FailCapture, needle: &str) -> Vec<String> {
++    cap.lines()
++        .into_iter()
++        .filter(|l| l.contains(needle))
++        .collect()
++}
++
++/// The event lines of one kind, not the history lines that repeat them.
++fn ev_lines(cap: &crate::observe::FailCapture, kind: &str) -> Vec<String> {
++    let needle = format!(" ev={kind} ");
++    cap.lines()
++        .into_iter()
++        .filter(|l| l.starts_with("OFF wire_watch_ev ") && l.contains(&needle))
++        .collect()
++}
++
++/// [`before_write`] as a writer that starts a new frame: no read in the last
++/// [`WRITE_RESAMPLE_US`] to lean on.
++fn write_now(
++    state: &mut DeviceState,
++    host: &FakeHost,
++    mapping_id: u32,
++    site: &str,
++    kind: WriteKind,
++) -> bool {
++    for w in state.wire_watch.watched.values_mut() {
++        w.sampled_us = None;
++    }
++    before_write(state, host, mapping_id, site, kind)
++}
++
++/// The swap the display channel would carry, as the drain hands it over.
++fn swap(state: &mut DeviceState, host: &FakeHost, stamp: u32) {
++    let mut payload = vec![0u8; 40];
++    payload[8..12].copy_from_slice(&MID.to_le_bytes());
++    before_swap(state, host);
++    on_present(state, "delivered");
++    after_swap(
++        state,
++        host,
++        SwapPacket {
++            channel: 4,
++            head: 0x40,
++            slot: 4,
++            opcode: crate::model::CHILD_OP_DISPLAY_SWAP,
++            stamp,
++            waits: &[],
++            payload: &payload,
++            mapping: Some(MID),
++        },
++        now_us(),
++        false,
++    );
++}
++
++#[test]
++fn a_checked_mapping_reports_every_count_change_and_its_first_drop_once() {
++    with_switches(true, false, || {
++        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let cap = crate::observe::FailCapture::start();
++        on_map(&mut state, &host, MID);
++        let kernel = lines_with(&cap, "wire_watch_kernel verified");
++        assert_eq!(kernel.len(), 1, "{:?}", cap.lines());
++        assert!(
++            kernel[0].contains(&format!("header={KERNEL:#x}"))
++                && kernel[0].contains(&format!("version=\"{EXPECTED_KERNEL_VERSION}\"")),
++            "{}",
++            kernel[0]
++        );
++        let map = lines_with(&cap, "wire_watch map ");
++        assert_eq!(map.len(), 1, "{:?}", cap.lines());
++        assert!(
++            map[0].contains("surface_wire=1 table_wire=2") && map[0].contains("at=map"),
++            "{}",
++            map[0]
++        );
++
++        // The hold that parks the display channel, then the first swap after it.
++        on_hold(&mut state, 0x1c, 0x1c, 0x2);
++        on_hold_release(&mut state, 0x1c);
++        swap(&mut state, &host, 0x11);
++        on_stamp(&mut state, &host, 4, 0x11, false);
++        let stamp = ev_lines(&cap, "stamp");
++        assert_eq!(stamp.len(), 1);
++        assert!(
++            stamp[0].contains("swaps=[") && stamp[0].contains(":2]"),
++            "{}",
++            stamp[0]
++        );
++
++        // The guest completes the surface once too often.
++        set_surface_wire(&mut host, 0);
++        assert!(write_now(
++            &mut state,
++            &host,
++            MID,
++            "render_store",
++            WriteKind::Cpu
++        ));
++        let transition = lines_with(&cap, "wire_watch transition");
++        assert_eq!(transition.len(), 1, "{:?}", cap.lines());
++        assert!(
++            transition[0].contains("field=surface old=1 new=0 map=1")
++                && transition[0].contains("at=render_store")
++                && transition[0].contains("last_swap={seq=")
++                && transition[0].contains("last_stamp={seq="),
++            "{}",
++            transition[0]
++        );
++        let anomaly = lines_with(&cap, "wire_watch first_anomaly ");
++        assert_eq!(anomaly.len(), 1);
++        assert!(
++            anomaly[0].contains("field=surface value=0 map=1")
++                && anomaly[0].contains("boot_first=1")
++                && anomaly[0].contains("iomd_fields=unchanged")
++                && anomaly[0].contains("md_len=0x2000"),
++            "{}",
++            anomaly[0]
++        );
++        let ring = lines_with(&cap, "wire_watch first_anomaly_ring");
++        let events: Vec<&str> = ring
++            .iter()
++            .map(|l| l.split(" ev=").nth(1).unwrap().split(' ').next().unwrap())
++            .collect();
++        assert_eq!(
++            events,
++            ["map", "hold", "hold_release", "present", "swap", "stamp"]
++        );
++        let after = lines_with(&cap, "wire_watch write_after_anomaly");
++        assert_eq!(
++            after.len(),
++            1,
++            "the write that found the drop is the first after it"
++        );
++
++        // Further moves are transitions; the anomaly is said once per field.
++        set_surface_wire(&mut host, -1);
++        write_now(&mut state, &host, MID, "render_store", WriteKind::Cpu);
++        set_surface_wire(&mut host, 1);
++        write_now(&mut state, &host, MID, "render_store", WriteKind::Cpu);
++        assert_eq!(lines_with(&cap, "wire_watch transition").len(), 3);
++        assert_eq!(lines_with(&cap, "wire_watch first_anomaly ").len(), 1);
++        assert!(lines_with(&cap, "wire_watch transition")
++            .iter()
++            .any(|l| l.contains("old=0 new=-1")));
++
++        on_unmap(&mut state, &host, MID);
++        assert_eq!(lines_with(&cap, "wire_watch unmap").len(), 1);
++        assert!(state.wire_watch.watched.is_empty());
++    });
++}
++
++#[test]
++fn a_table_count_below_its_map_value_is_an_anomaly_even_above_zero() {
++    with_switches(true, false, || {
++        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let cap = crate::observe::FailCapture::start();
++        on_map(&mut state, &host, MID);
++        put32(&mut host, TABLE + IOMD_WIRE_COUNT, 1);
++        write_now(&mut state, &host, MID, "mapping_write", WriteKind::Cpu);
++        let anomaly = lines_with(&cap, "wire_watch first_anomaly ");
++        assert_eq!(anomaly.len(), 1, "{:?}", cap.lines());
++        assert!(
++            anomaly[0].contains("field=table value=1 map=2"),
++            "{}",
++            anomaly[0]
++        );
++    });
++}
++
++#[test]
++fn another_kernel_turns_the_watch_off_and_nothing_else_is_said() {
++    with_switches(true, true, || {
++        let (mut state, mut host) = fixture(
++            "Darwin Kernel Version 26.6.0: Mon Jul 6 00:00:00 PDT 2026; \
++             root:xnu-12377.1.1~1/RELEASE_ARM64_VMAPPLE",
++        );
++        let cap = crate::observe::FailCapture::start();
++        on_map(&mut state, &host, MID);
++        let off = cap.one("wire_watch_layout_unverified");
++        assert!(
++            off.contains("scope=kernel reason=kernel_version_mismatch") && off.contains("26.6.0"),
++            "{off}"
++        );
++        set_surface_wire(&mut host, 0);
++        assert!(write_now(
++            &mut state,
++            &host,
++            MID,
++            "mapping_write",
++            WriteKind::Cpu
++        ));
++        swap(&mut state, &host, 1);
++        tick(&mut state, &host);
++        assert_eq!(cap.lines().len(), 1, "{:?}", cap.lines());
++    });
++}
++
++#[test]
++fn a_kernel_without_its_header_below_vbar_is_not_believed() {
++    with_switches(true, false, || {
++        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        // `__TEXT` that does not start at the header is a header for some other
++        // image than the one running.
++        let mut cmds = segment(b"__TEXT", KERNEL + PAGE, PAGE, &[]);
++        cmds.extend(segment(b"__TEXT_EXEC", TEXT_EXEC, PAGE, &[]));
++        host.write_gpa(KERNEL + MACH_HEADER_64_LEN as u64, &cmds)
++            .unwrap();
++        put32(&mut host, KERNEL + 16, 2);
++        let cap = crate::observe::FailCapture::start();
++        on_map(&mut state, &host, MID);
++        assert!(cap
++            .one("wire_watch_layout_unverified")
++            .contains("reason=text_not_at_header"));
++        assert!(state.wire_watch.off());
++    });
++}
++
++/// The check a broken fixture should fail, and how to break it.
++type Breakage = (&'static str, fn(&mut FakeHost));
++
++#[test]
++fn a_mapping_whose_layout_disagrees_is_not_watched() {
++    with_switches(true, true, || {
++        let cases: [Breakage; 4] = [
++            ("surface_length", |h| {
++                put64(h, SURFACE + IOMD_LENGTH, 2 * PAGE)
++            }),
++            ("mi_page_count", |h| put64(h, MI + MI_PAGE_COUNT, 4)),
++            ("table_buffer", |h| {
++                put64(h, TABLE + IOBMD_BUFFER, PAGE_TABLE + PAGE)
++            }),
++            ("iomd_class", |h| put64(h, TABLE, 0x5b95_7e00_2000_0638)),
++        ];
++        for (reason, break_it) in cases {
++            let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++            break_it(&mut host);
++            let cap = crate::observe::FailCapture::start();
++            on_map(&mut state, &host, MID);
++            let refused = cap.one("wire_watch_layout_unverified");
++            assert!(
++                refused.contains("scope=mapping mapping=2")
++                    && refused.contains(&format!("reason={reason} ")),
++                "{reason}: {refused}"
++            );
++            assert!(lines_with(&cap, "wire_watch map ").is_empty());
++            set_surface_wire(&mut host, 0);
++            assert!(
++                write_now(&mut state, &host, MID, "mapping_write", WriteKind::Cpu),
++                "{reason}: an unchecked count must never refuse a write"
++            );
++            on_map(&mut state, &host, MID);
++            assert!(lines_with(&cap, "wire_watch transition").is_empty());
++            assert_eq!(
++                lines_with(&cap, "wire_watch_layout_unverified").len(),
++                1,
++                "said once"
++            );
++        }
++    });
++}
++
++#[test]
++fn a_count_that_cannot_be_read_is_neither_a_transition_nor_a_refusal() {
++    with_switches(true, true, || {
++        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let cap = crate::observe::FailCapture::start();
++        on_map(&mut state, &host, MID);
++        // The worker, with no validated walk to read through.
++        host.kva_no_cpu = true;
++        set_surface_wire(&mut host, 0);
++        assert!(write_now(
++            &mut state,
++            &host,
++            MID,
++            "mapping_write",
++            WriteKind::Cpu
++        ));
++        assert!(lines_with(&cap, "wire_watch transition").is_empty());
++        assert!(state.wire_watch.cost.unreadable > 0);
++        host.kva_no_cpu = false;
++        assert!(!write_now(
++            &mut state,
++            &host,
++            MID,
++            "mapping_write",
++            WriteKind::Cpu
++        ));
++        assert_eq!(lines_with(&cap, "wire_watch transition").len(), 1);
++    });
++}
++
++#[test]
++fn the_guard_refuses_a_cpu_write_only_while_the_checked_count_is_not_positive() {
++    with_switches(true, true, || {
++        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let cap = crate::observe::FailCapture::start();
++        on_map(&mut state, &host, MID);
++        assert!(write_now(
++            &mut state,
++            &host,
++            MID,
++            "mapping_write",
++            WriteKind::Cpu
++        ));
++        set_surface_wire(&mut host, 0);
++        assert!(!write_now(
++            &mut state,
++            &host,
++            MID,
++            "mapping_write",
++            WriteKind::Cpu
++        ));
++        let refused = cap.one("wire_guard_refused");
++        assert!(
++            refused.contains("mapping=2 site=mapping_write surface_wire=0"),
++            "{refused}"
++        );
++        assert!(
++            write_now(&mut state, &host, MID, "gpu_writeback", WriteKind::Gpu),
++            "a GPU copy is sampled, not refused"
++        );
++        set_surface_wire(&mut host, -1);
++        assert!(!write_now(
++            &mut state,
++            &host,
++            MID,
++            "wbdebt_pay",
++            WriteKind::Cpu
++        ));
++        set_surface_wire(&mut host, 1);
++        assert!(write_now(
++            &mut state,
++            &host,
++            MID,
++            "mapping_write",
++            WriteKind::Cpu
++        ));
++        assert_eq!(state.wire_watch.cost.guard_refused, 2);
++        // Another mapping is none of the guard's business.
++        assert!(write_now(
++            &mut state,
++            &host,
++            7,
++            "mapping_write",
++            WriteKind::Cpu
++        ));
++    });
++    with_switches(true, false, || {
++        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        on_map(&mut state, &host, MID);
++        set_surface_wire(&mut host, 0);
++        assert!(
++            write_now(&mut state, &host, MID, "mapping_write", WriteKind::Cpu),
++            "the watch alone never refuses"
++        );
++    });
++}
++
++#[test]
++fn a_mapping_checked_after_map_reports_a_count_already_at_zero() {
++    with_switches(true, false, || {
++        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        // `MAP` arrived before the page list resolved.
++        let entries = std::mem::take(&mut state.mappings.get_mut(&MID).unwrap().page_entries);
++        let cap = crate::observe::FailCapture::start();
++        on_map(&mut state, &host, MID);
++        assert!(lines_with(&cap, "wire_watch map ").is_empty());
++        set_surface_wire(&mut host, 0);
++        state.mappings.get_mut(&MID).unwrap().page_entries = entries;
++        tick(&mut state, &host);
++        let map = lines_with(&cap, "wire_watch map ");
++        assert_eq!(map.len(), 1, "{:?}", cap.lines());
++        assert!(map[0].contains("at=late"), "{}", map[0]);
++        let anomaly = lines_with(&cap, "wire_watch first_anomaly ");
++        assert_eq!(anomaly.len(), 1, "{:?}", cap.lines());
++        assert!(anomaly[0].contains("value=0 map=?") && anomaly[0].contains("at=late_check"));
++    });
++}
++
++#[test]
++fn a_reattached_internal_retires_the_watch() {
++    with_switches(true, false, || {
++        let (mut state, host) = fixture(EXPECTED_KERNEL_VERSION);
++        let cap = crate::observe::FailCapture::start();
++        on_map(&mut state, &host, MID);
++        state.mappings.get_mut(&MID).unwrap().mapping_internal = MI + 0x200;
++        write_now(&mut state, &host, MID, "mapping_write", WriteKind::Cpu);
++        assert_eq!(
++            lines_with(
++                &cap,
++                "wire_watch retired mapping=2 reason=internal_reattached"
++            )
++            .len(),
++            1
++        );
++        assert!(state.wire_watch.watched.is_empty());
++    });
++}
++
++#[test]
++fn off_by_default_it_reads_nothing_and_says_nothing() {
++    with_switches(false, true, || {
++        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let cap = crate::observe::FailCapture::start();
++        on_map(&mut state, &host, MID);
++        set_surface_wire(&mut host, 0);
++        swap(&mut state, &host, 1);
++        on_stamp(&mut state, &host, 4, 1, false);
++        tick(&mut state, &host);
++        assert!(write_now(
++            &mut state,
++            &host,
++            MID,
++            "mapping_write",
++            WriteKind::Cpu
++        ));
++        assert!(cap.lines().is_empty(), "{:?}", cap.lines());
++        assert!(state.wire_watch.watched.is_empty());
++    });
++}
++
++/// A stamp that has not reached a swap's value does not complete it, and
++/// one past it completes every earlier swap on that slot.
++#[test]
++fn a_stamp_completes_only_the_swaps_it_reaches() {
++    with_switches(true, false, || {
++        let (mut state, host) = fixture(EXPECTED_KERNEL_VERSION);
++        let cap = crate::observe::FailCapture::start();
++        on_map(&mut state, &host, MID);
++        swap(&mut state, &host, 0x20);
++        swap(&mut state, &host, 0x21);
++        on_stamp(&mut state, &host, 4, 0x1f, false);
++        on_stamp(&mut state, &host, 3, 0x30, false);
++        assert!(ev_lines(&cap, "stamp").is_empty());
++        on_stamp(&mut state, &host, 4, 0x21, true);
++        let stamp = ev_lines(&cap, "stamp").remove(0);
++        assert!(
++            stamp.contains("route=queued") && stamp.matches(":2").count() == 2,
++            "{stamp}"
++        );
++        assert!(state.wire_watch.unstamped.is_empty());
++    });
++}
++
++// MARK: - Through the FIFO
++
++const CHANNEL: u32 = 4;
++const SWAP_STAMP: u32 = 0x55;
++
++/// The display channel's FIFO holding one `CmdDisplaySwapMapping` for mapping
++/// 2, as the guest publishes it.
++fn put_display_fifo(state: &mut DeviceState, host: &mut FakeHost) -> (u64, Vec<u8>) {
++    use crate::model::{
++        child_reg_block_offset, CHILD_OP_DISPLAY_SWAP, CHILD_REG_BASE_PFN, CHILD_REG_HEAD,
++        CHILD_REG_STAMP_INDEX, CHILD_REG_TAIL,
++    };
++    let page = state.page_size() as usize;
++    let (root_pfn, list_pfn, ring_pfn, stamp_pfn) = (0x10u32, 0x20u32, 0x30u32, 0x40u32);
++    for pfn in [root_pfn, list_pfn, ring_pfn, stamp_pfn] {
++        host.map_range(state.pfn_gpa(pfn), page, 0);
++    }
++    let mut payload = vec![0u8; 40];
++    payload[8..12].copy_from_slice(&MID.to_le_bytes());
++    payload[16..20].copy_from_slice(&0x0010_4000u32.to_le_bytes());
++    let mut packet = Vec::new();
++    packet.extend_from_slice(&CHILD_OP_DISPLAY_SWAP.to_le_bytes());
++    packet.extend_from_slice(&0u16.to_le_bytes());
++    packet.extend_from_slice(&(12 + payload.len() as u32).to_le_bytes());
++    packet.extend_from_slice(&SWAP_STAMP.to_le_bytes());
++    packet.extend_from_slice(&payload);
++    let ring_gpa = state.pfn_gpa(ring_pfn);
++    host.write_gpa(ring_gpa, &packet).unwrap();
++    host.put_u32(state.pfn_gpa(list_pfn), ring_pfn);
++    let regs = state.pfn_gpa(root_pfn) + child_reg_block_offset(CHANNEL).unwrap();
++    host.put_u32(regs + CHILD_REG_TAIL, packet.len() as u32);
++    host.put_u32(regs + CHILD_REG_HEAD, 0);
++    host.put_u32(regs + CHILD_REG_STAMP_INDEX, CHANNEL);
++    host.put_u32(regs + CHILD_REG_BASE_PFN, list_pfn);
++    state.gfx.root_page = root_pfn;
++    state.gfx.fifo_base_page = stamp_pfn;
++    state.child_rings[CHANNEL as usize] = crate::model::ChannelRing {
++        valid: true,
++        base_pfn: list_pfn,
++        length: page as u32,
++        page_gpas: vec![ring_gpa],
++    };
++    (regs, packet)
++}
++
++/// The drop found right after the swap that caused it, with that swap first
++/// in the history, and the stamp that completed it named after.
++#[test]
++fn a_drop_after_a_display_swap_is_aligned_with_that_swap_and_its_stamp() {
++    with_switches(true, false, || {
++        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (regs, packet) = put_display_fifo(&mut state, &mut host);
++        on_map(&mut state, &host, MID);
++        // Past the kernel check, the root is not needed; without it the
++        // present path's resolve does not try to validate a fixture walk.
++        state.kernel_walk.root = None;
++        // Keep the worker's own cadence out of the way, so the drop is found by
++        // the swap and not by a tick that happens to come first.
++        state.wire_watch.all_sampled_us = Some(u64::MAX);
++        state.wire_watch.display_sampled_us = Some(u64::MAX);
++        state.active_child_mask = 1 << CHANNEL;
++        state.pending.child_mask = 1 << CHANNEL;
++        set_surface_wire(&mut host, 0);
++        let cap = crate::observe::FailCapture::start();
++        crate::runtime::drain::drain_pending(&mut state, &mut host);
++        assert_eq!(
++            host.get_u32(regs + crate::model::CHILD_REG_HEAD),
++            packet.len() as u32,
++            "{:?}",
++            cap.lines()
++        );
++        let swap = ev_lines(&cap, "swap");
++        assert_eq!(swap.len(), 1, "{:?}", cap.lines());
++        assert!(
++            swap[0].contains(&format!(
++                "ch={CHANNEL} head=0x0 op=0x8 stamp={SWAP_STAMP:#x} slot={CHANNEL} mapping=2 how=exec"
++            )) && swap[0].contains("words=[0,0,2,0,104000,0,0,0,0,0]"),
++            "{}",
++            swap[0]
++        );
++        let anomaly = lines_with(&cap, "wire_watch first_anomaly ");
++        assert_eq!(anomaly.len(), 1, "{:?}", cap.lines());
++        assert!(
++            anomaly[0].contains("at=swap_end") && anomaly[0].contains("ev=swap ch=4"),
++            "{}",
++            anomaly[0]
++        );
++        let stamp = ev_lines(&cap, "stamp");
++        assert_eq!(stamp.len(), 1, "{:?}", cap.lines());
++        assert!(
++            stamp[0].contains(&format!(
++                "slot={CHANNEL} value={SWAP_STAMP:#x} route=direct swaps=["
++            )),
++            "{}",
++            stamp[0]
++        );
++    });
++}
++
++/// A swap parked behind a translation hold is seen at its FIFO's head when
++/// the worker looks, once, with the mapping and stamp it will carry.
++#[test]
++fn a_display_swap_held_behind_a_translation_is_seen_before_it_runs() {
++    with_switches(true, false, || {
++        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        put_display_fifo(&mut state, &mut host);
++        on_map(&mut state, &host, MID);
++        let peeked = crate::runtime::drain::peek_child_head(&state, &host, CHANNEL).unwrap();
++        assert_eq!(
++            (peeked.head, peeked.completion_stamp, peeked.mapping),
++            (0, SWAP_STAMP, Some(MID))
++        );
++        let cap = crate::observe::FailCapture::start();
++        let held = 1 << CHANNEL | 1 << 2;
++        state.translation_order_hold_mask = held;
++        on_hold(&mut state, held, held, 1 << 3);
++        tick(&mut state, &host);
++        state.wire_watch.peeked_us = None;
++        tick(&mut state, &host);
++        let held = ev_lines(&cap, "swap_held");
++        assert_eq!(held.len(), 1, "{:?}", cap.lines());
++        assert!(
++            held[0].contains(&format!(
++                "cause=translation_hold ch={CHANNEL} head=0x0 op=0x8 stamp={SWAP_STAMP:#x} mapping=2"
++            )),
++            "{}",
++            held[0]
++        );
++        assert_eq!(ev_lines(&cap, "hold").len(), 1);
++    });
++}
++
++/// A frame the guard would not let land stays owed.
++#[test]
++fn a_kept_debt_does_not_replace_a_newer_one() {
++    use crate::runtime::writeback_debt::{test_resident_identity, PendingWritebacks};
++    let mut ledger = PendingWritebacks::default();
++    let _ = ledger.arm(MID, test_resident_identity(MID, 4, 4, 1), 4, 4, 1);
++    let old = ledger.take(MID).unwrap();
++    ledger.keep(MID, old.clone());
++    assert_eq!(ledger.get(MID), Some(old.clone()));
++    let _ = ledger.take(MID);
++    let _ = ledger.arm(MID, test_resident_identity(MID, 8, 8, 2), 8, 8, 2);
++    ledger.keep(MID, old);
++    assert_eq!(ledger.get(MID).map(|d| d.width), Some(8));
++}
++
++/// A frame landed a row at a time reads the counts once for the burst, and
++/// the guard decides on that read.
++#[test]
++fn a_burst_of_row_writes_reads_the_counts_once() {
++    with_switches(true, true, || {
++        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        on_map(&mut state, &host, MID);
++        set_surface_wire(&mut host, 0);
++        assert!(!write_now(
++            &mut state,
++            &host,
++            MID,
++            "mapping_write",
++            WriteKind::Cpu
++        ));
++        let reads = state.wire_watch.cost.reads;
++        let rows = (0..64)
++            .filter(|_| !before_write(&mut state, &host, MID, "mapping_write", WriteKind::Cpu))
++            .count();
++        assert_eq!(rows, 64, "every row of the burst is refused");
++        assert!(
++            state.wire_watch.cost.reads - reads < 64 * 3,
++            "a row reuses a read taken within the window: {} reads",
++            state.wire_watch.cost.reads - reads
++        );
++        assert_eq!(state.wire_watch.watched[&MID].refused, 65);
++    });
++}
+diff --git a/crates/reims-vgpu/src/runtime/mapping_write/mod.rs b/crates/reims-vgpu/src/runtime/mapping_write/mod.rs
+index 7572012f..62f12c4a 100644
+--- a/crates/reims-vgpu/src/runtime/mapping_write/mod.rs
++++ b/crates/reims-vgpu/src/runtime/mapping_write/mod.rs
+@@ -371,6 +371,15 @@ fn contig_for_write<H: HostMemory + HostOps>(
+         return None;
+     }
+     let view = contig_for_span(state, host, mapping_id, span_end)?;
++    if !mapper::wire_watch::before_write(
++        state,
++        &*host,
++        mapping_id,
++        "mapping_write_contig",
++        mapper::wire_watch::WriteKind::Cpu,
++    ) {
++        return None;
++    }
+     // Every raw-pointer write in this file goes through here, and none of them
+     // goes through `mapper::write_mapping_bytes` — they poke rows straight into
+     // the view. So this is where those writes enter `observe::footprint`, and
+@@ -1104,6 +1113,13 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
+     // than from zero, because unlike the contig view this rail knows its own
+     // rows and has no pointer whose coverage it is restating.
+     mapper::note_mapping_write_footprint(state, mapping_id, base_off, span_end - base_off);
++    mapper::wire_watch::before_write(
++        state,
++        &*host,
++        mapping_id,
++        "gpu_writeback",
++        mapper::wire_watch::WriteKind::Gpu,
++    );
+     state.note_host_wrote_mapping(mapping_id);
+     note_readback_phase(
+         ReadbackPhase::Resolve,
+diff --git a/crates/reims-vgpu/src/runtime/writeback_debt.rs b/crates/reims-vgpu/src/runtime/writeback_debt.rs
+index 189ecd71..d40b32dd 100644
+--- a/crates/reims-vgpu/src/runtime/writeback_debt.rs
++++ b/crates/reims-vgpu/src/runtime/writeback_debt.rs
+@@ -302,6 +302,13 @@ impl PendingWritebacks {
+         self.debts.insert(mapping_id, debt);
+     }
+ 
++    /// Put back a debt that was taken and not paid, unless a newer one was
++    /// armed for the mapping meanwhile.
++    pub fn keep(&mut self, mapping_id: u32, debt: WritebackDebt) {
++        self.debts.entry(mapping_id).or_insert(debt);
++        crate::runtime::drain::note_store_route("wbdebt_kept");
++    }
++
+     /// Every mapping owed a frame, oldest arm first.
+     pub fn mappings_by_age(&self) -> Vec<u32> {
+         let mut all: Vec<(u64, u32)> = self.debts.iter().map(|(id, d)| (d.seq, *id)).collect();
+@@ -1458,7 +1465,9 @@ fn pay<M: HostMemory + HostOps>(
+         return;
+     }
+     // The resident the draw registered, not the one a fresh derivation would
+-    // name today. See `WritebackDebt::identity`.
++    // name today. See `WritebackDebt::identity`. Cloned, because a debt that
++    // cannot be paid goes back into the ledger whole: a quarantined store, or
++    // one the wire guard will not let land.
+     let identity = debt.identity.clone();
+     if crate::runtime::resource_validity::licence_of(validity)
+         == crate::runtime::resource_validity::WritebackLicence::Superseded
+@@ -1467,6 +1476,18 @@ fn pay<M: HostMemory + HostOps>(
+         crate::backend::vulkan::engine::note_resident_content_copied_out(&identity);
+         return;
+     }
++    // Asked before the readback the Store would start with. A refusal is the
++    // wire guard's diagnostic, and the frame stays owed rather than lost.
++    if !crate::runtime::mapper::wire_watch::before_write(
++        state,
++        &*host,
++        mapping_id,
++        "wbdebt_pay",
++        crate::runtime::mapper::wire_watch::WriteKind::Cpu,
++    ) {
++        state.pending_writebacks.keep(mapping_id, debt);
++        return;
++    }
+     crate::runtime::drain::note_store_route(route);
+     if !crate::runtime::render_writeback::store_render_frame(
+         state,
+-- 
+2.43.0
+

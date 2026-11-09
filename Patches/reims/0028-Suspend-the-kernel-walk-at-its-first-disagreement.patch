@@ -1,0 +1,159 @@
+From f73c364f0ed3377923a017bb55fc8e8d8fb35044 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 03:56:16 +0800
+Subject: [PATCH 12/24] Suspend the kernel walk at its first disagreement
+
+A stable disagreement used to count toward revocation while the root went
+on serving, so strict kept writing through a root that had already
+diverged once. The first stable disagreement now suspends the root at
+once: everything that validated it is void, strict refuses with
+kva_walk_suspended, and it serves again only after a full threshold of
+fresh agreeing samples. A second stable disagreement in the root's life
+revokes it until the root changes. The count is cumulative per root;
+agreements in between do not reset it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 3ff7250c11bd57c7a8065e2b1fbd187a9bf01260)
+---
+ crates/reims-vgpu/src/runtime/kernel_walk.rs | 67 ++++++++++++++------
+ 1 file changed, 49 insertions(+), 18 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/kernel_walk.rs b/crates/reims-vgpu/src/runtime/kernel_walk.rs
+index 2c2c7754..8e25daf4 100644
+--- a/crates/reims-vgpu/src/runtime/kernel_walk.rs
++++ b/crates/reims-vgpu/src/runtime/kernel_walk.rs
+@@ -29,14 +29,15 @@
+ //! # Runtime validation, and what happens without it
+ //!
+ //! Every time a vCPU path reads a kernel address through the CPU, the same bytes
+-//! are read through this walk and compared ([`compare`]). A root serves a thread
++//! are read through this walk and compared ([`sample`]). A root serves a thread
+ //! without a vCPU only after it has collected several agreeing non-zero reads
+-//! over several pages, one of them across a page boundary, and no disagreement.
++//! over several pages, one of them across a page boundary.
+ //! Validation belongs to one root in one boot: a changed root or a reset starts
+-//! it again, and one disagreement retires the root until it changes.
++//! it again. A stable disagreement suspends the root until it validates again
++//! from zero; a second in the same root's life revokes it until it changes.
+ //!
+ //! Without a validated root — a QEMU without the matching shim, a root still
+-//! validating, a disagreement — [`Mode::Strict`] (the default) refuses the
++//! validating, suspended or revoked — [`Mode::Strict`] (the default) refuses the
+ //! write and logs it with its time, and [`Mode::Compat`] writes through the
+ //! cached page list as before. `REIMS_VGPU_KVA_WALK` selects the mode.
+ //!
+@@ -387,8 +388,10 @@ pub enum WalkCompare {
+     Inconclusive,
+ }
+ 
+-/// Disagreements that retire a root. One can be noise the sandwich did not
+-/// catch; two are a pattern.
++/// Stable disagreements that retire a root, counted over the root's whole life
++/// and not reset by agreements in between. The first suspends it at once — it
++/// serves nothing until it has validated again from zero, a full threshold of
++/// fresh samples — and this many revoke it until the root changes.
+ const MISMATCHES_TO_REVOKE: u32 = 2;
+ 
+ /// Bytes a crossing probe reads on each side of a page boundary.
+@@ -421,6 +424,8 @@ impl Validation {
+ pub enum GateRefusal {
+     NoRoot,
+     Unvalidated,
++    /// One stable disagreement: not serving until validated again from zero.
++    Suspended,
+     Mismatched,
+ }
+ 
+@@ -436,6 +441,7 @@ impl Refused {
+         match self {
+             Self::Gate(GateRefusal::NoRoot) => "kva_walk_no_root",
+             Self::Gate(GateRefusal::Unvalidated) => "kva_walk_unvalidated",
++            Self::Gate(GateRefusal::Suspended) => "kva_walk_suspended",
+             Self::Gate(GateRefusal::Mismatched) => "kva_walk_mismatched",
+             Self::Walk(why) => why.slug(),
+         }
+@@ -540,7 +546,10 @@ impl KernelWalkState {
+             return Err(GateRefusal::Mismatched);
+         }
+         if !self.validation.validated() {
+-            return Err(GateRefusal::Unvalidated);
++            return Err(match self.validation.mismatches {
++                0 => GateRefusal::Unvalidated,
++                _ => GateRefusal::Suspended,
++            });
+         }
+         Ok(root)
+     }
+@@ -644,18 +653,25 @@ impl KernelWalkState {
+             }
+             WalkCompare::Mismatch { kva, len, why } => {
+                 crate::runtime::drain::note_store_route("kva_walk_mismatch");
++                let samples = v.samples;
+                 v.mismatches += 1;
++                // Suspended: everything that validated it is void, and it serves
++                // nothing until a full threshold of fresh samples has agreed.
++                v.samples = 0;
++                v.pages.clear();
++                v.crossed = false;
++                self.validated_reported = false;
+                 if v.mismatches <= MISMATCHES_TO_REVOKE {
+                     crate::observe::fail(format!(
+-                        "kva_walk_mismatch kva={kva:#x} len={len} detail={why} samples={} \
+-                         mismatches={} ttbr1={:#x} revoked={} (runtime validation: the CPU \
+-                         read the same bytes before and after, and the software walk read \
+-                         others; at {MISMATCHES_TO_REVOKE} the walk serves nothing until the \
+-                         root changes)",
+-                        v.samples,
++                        "kva_walk_mismatch kva={kva:#x} len={len} detail={why} samples={samples} \
++                         mismatches={} ttbr1={:#x} state={} (runtime validation: the CPU read \
++                         the same bytes before and after, and the software walk read others; \
++                         the first suspends the walk until it validates again from zero, \
++                         {MISMATCHES_TO_REVOKE} in this root's life revoke it until the root \
++                         changes)",
+                         v.mismatches,
+                         root.ttbr1,
+-                        v.revoked()
++                        if v.revoked() { "revoked" } else { "suspended" },
+                     ));
+                 }
+             }
+@@ -1057,17 +1073,32 @@ pub(crate) mod tests {
+         }
+     }
+ 
+-    /// One stable disagreement is logged and tolerated as possible noise; the
+-    /// second retires the root until it changes.
++    /// The first stable disagreement suspends the walk at once; it serves again
++    /// only after a full threshold of fresh samples, and a second disagreement in
++    /// the root's life — agreements in between notwithstanding — revokes it until
++    /// the root changes.
+     #[test]
+-    fn two_stable_disagreements_retire_the_walk_until_the_root_changes() {
++    fn a_disagreement_suspends_the_walk_and_a_second_revokes_it() {
+         let mut host = FakeHost::new();
+         give_root(&mut host, L1);
+         let mut state = KernelWalkState::default();
+         capture(&mut state, &host);
+         validate(&mut state);
+         state.note_compare(stable_mismatch());
+-        assert!(state.gate().is_ok(), "one disagreement does not revoke");
++        assert_eq!(state.gate(), Err(GateRefusal::Suspended));
++        assert_eq!(
++            state.policy(Mode::Strict).serve,
++            Serve::Refuse(GateRefusal::Suspended)
++        );
++        state.note_compare(agreed(kva(0), 8, true));
++        assert_eq!(
++            state.gate(),
++            Err(GateRefusal::Suspended),
++            "one agreement does not lift it"
++        );
++        validate(&mut state);
++        assert!(state.gate().is_ok(), "a full fresh threshold does");
++
+         state.note_compare(stable_mismatch());
+         validate(&mut state);
+         assert_eq!(state.gate(), Err(GateRefusal::Mismatched));
+-- 
+2.43.0
+

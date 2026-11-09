@@ -1,0 +1,800 @@
+From ea9ea70ab014dc5d30a8d0850cf5a15e31a53aed Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 06:24:52 +0800
+Subject: [PATCH 4/7] hw/display/reims-vgpu-shim: reach guest RAM only, the
+ page walk included
+
+Reims calls read_gpa, write_gpa and read_kva from its drain worker, and
+now from vCPUs running the iosfc window without the BQL, while holding
+its device lock. An access in there that reached a device would take
+the BQL in prepare_mmio_access: device lock, then BQL, while the main
+loop takes the BQL, then the device lock. Guest addresses Reims follows
+can be stale or corrupt, so that cycle is reachable.
+
+MemTxAttrs.memory did not close it. It still let a write through to
+read-only RAM and any access through to a RAM device, both of which
+are then dispatched; it is checked a piece at a time, so a write that
+ran from RAM into a device wrote the RAM half before failing; and the
+ld/st helpers a page-table walk uses never look at it, so read_kva's
+walk dispatched a table read that hit a device even though its final
+read was checked.
+
+Copy guest memory through reims_vgpu_ram_copy() instead
+(include/hw/display/reims-vgpu-ram.h). Every piece of the range must be
+RAM the CPU could access directly, writable for a write; a range that
+wraps is refused; the whole range is checked against one flat view
+before any byte moves; a refusal returns an error with nothing copied,
+never a zero-filled success. Writes mark the bytes dirty as
+address_space_write() did.
+
+And add a no-dispatch section to the memory API: between
+memory_no_dispatch_begin() and memory_no_dispatch_end(), an access that
+would be dispatched to a device fails with MEMTX_ACCESS_ERROR before the
+BQL is taken, in the read and write paths and in the ld/st helpers.
+read_kva runs its translation inside one, so a table read that would
+reach a device fails the walk, on any target.
+
+tests/unit/test-reims-vgpu-ram covers the copy: RAM across two pieces,
+a device refused with the buffer untouched, a write running into a
+device refused before any byte is written, read-only RAM, wrapping and
+empty ranges, and a worker holding the device lock while the main loop
+holds the BQL and waits for it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit f9d0b9bf248f5d6b50971bf891b3aedc89c42c84)
+---
+ hw/display/reims-vgpu-mmio.c        |   7 +-
+ hw/display/reims-vgpu-shim.c        | 128 ++++++++++----
+ include/hw/display/reims-vgpu-ram.h | 118 +++++++++++++
+ include/system/memory.h             |  25 +++
+ system/memory_ldst.c.inc            |  21 ++-
+ system/physmem.c                    |  33 +++-
+ tests/unit/meson.build              |   2 +
+ tests/unit/test-reims-vgpu-ram.c    | 261 ++++++++++++++++++++++++++++
+ 8 files changed, 551 insertions(+), 44 deletions(-)
+ create mode 100644 include/hw/display/reims-vgpu-ram.h
+ create mode 100644 tests/unit/test-reims-vgpu-ram.c
+
+diff --git a/hw/display/reims-vgpu-mmio.c b/hw/display/reims-vgpu-mmio.c
+index fa9fa6df8d..59f100713f 100644
+--- a/hw/display/reims-vgpu-mmio.c
++++ b/hw/display/reims-vgpu-mmio.c
+@@ -847,9 +847,10 @@ static void *reims_vgpu_mmio_drain_thread(void *opaque)
+     ReimsVGPUMMIOState *s = opaque;
+ 
+     /*
+-     * The drain reads and writes guest memory through address_space_read/
+-     * write, which take the RCU read lock; an unregistered reader is invisible
+-     * to synchronize_rcu, so a flatview could be reclaimed under it.
++     * The drain reads and writes guest memory through the shim's RAM-only
++     * copy, which holds the RCU read lock over the flat view it uses; an
++     * unregistered reader is invisible to synchronize_rcu, so that view could
++     * be reclaimed under it.
+      */
+     rcu_register_thread();
+     for (;;) {
+diff --git a/hw/display/reims-vgpu-shim.c b/hw/display/reims-vgpu-shim.c
+index 31aadd6619..efef2065c5 100644
+--- a/hw/display/reims-vgpu-shim.c
++++ b/hw/display/reims-vgpu-shim.c
+@@ -15,6 +15,7 @@
+ #include "ui/console.h"
+ #include "ui/input.h"
+ #include "reims_vgpu_qemu_abi.h"
++#include "hw/display/reims-vgpu-ram.h"
+ #include "reims-vgpu-shim.h"
+ 
+ uint64_t reims_vgpu_shim_mono_ns(void *ctx)
+@@ -35,31 +36,89 @@ static const MemTxAttrs reims_vgpu_shim_ram_attrs = {
+     .memory = true,
+ };
+ 
+-int reims_vgpu_shim_read_gpa(void *ctx, uint64_t gpa, uint8_t *buf, size_t len)
++/*
++ * Guest memory as reims_vgpu_ram_copy() sees it: one flat view, taken once,
++ * so the check of a range and its copy see the same map.
++ */
++typedef struct ReimsVgpuShimRam {
++    FlatView *fv;
++    MemTxAttrs attrs;
++} ReimsVgpuShimRam;
++
++/*
++ * `memory = 1` alone is not enough here. It still lets a write through to
++ * read-only RAM and any access through to a RAM device, and both are then
++ * dispatched, taking the BQL inside a Rust call that holds the device lock;
++ * and it is checked a piece at a time, after earlier pieces were written.
++ * So a piece must be RAM that the CPU could access directly.
++ */
++static bool reims_vgpu_shim_ram_lookup(void *opaque, uint64_t gpa,
++                                       uint64_t want, bool is_write,
++                                       ReimsVgpuRamPiece *piece)
+ {
+-    MemTxResult r;
++    ReimsVgpuShimRam *ram = opaque;
++    hwaddr xlat, plen = want;
++    MemoryRegion *mr = flatview_translate(ram->fv, gpa, &xlat, &plen, is_write,
++                                          ram->attrs);
+ 
+-    (void)ctx;
+-    if (!buf || len == 0) {
+-        return 0;
++    if (!mr || !memory_region_is_ram(mr) || memory_region_is_ram_device(mr) ||
++        !memory_access_is_direct(mr, is_write, ram->attrs) || plen == 0) {
++        return false;
++    }
++    piece->host = qemu_map_ram_ptr(mr->ram_block, xlat);
++    piece->len = plen;
++    piece->region = mr;
++    piece->offset = xlat;
++    return true;
++}
++
++/* What address_space_write() would have marked for the same bytes. */
++static void reims_vgpu_shim_ram_dirty(void *opaque,
++                                      const ReimsVgpuRamPiece *piece)
++{
++    (void)opaque;
++    memory_region_set_dirty(piece->region, piece->offset, piece->len);
++}
++
++/*
++ * Copy between @buf and @as at @addr, RAM only, never through a device and
++ * never with the BQL: see reims-vgpu-ram.h. The section makes any access
++ * this might grow that would reach a device fail rather than dispatch.
++ */
++static int reims_vgpu_shim_ram_copy(AddressSpace *as, MemTxAttrs attrs,
++                                    uint64_t addr, void *buf, size_t len,
++                                    bool is_write)
++{
++    ReimsVgpuShimRam ram = { .attrs = attrs };
++    int rc;
++
++    memory_no_dispatch_begin();
++    {
++        RCU_READ_LOCK_GUARD();
++        ram.fv = address_space_to_flatview(as);
++        rc = reims_vgpu_ram_copy(reims_vgpu_shim_ram_lookup,
++                                 reims_vgpu_shim_ram_dirty, &ram, addr, buf,
++                                 len, is_write);
+     }
+-    r = address_space_read(&address_space_memory, gpa,
+-                           reims_vgpu_shim_ram_attrs, buf, len);
+-    return r == MEMTX_OK ? 0 : -1;
++    memory_no_dispatch_end();
++    return rc;
++}
++
++int reims_vgpu_shim_read_gpa(void *ctx, uint64_t gpa, uint8_t *buf, size_t len)
++{
++    (void)ctx;
++    return reims_vgpu_shim_ram_copy(&address_space_memory,
++                                    reims_vgpu_shim_ram_attrs, gpa, buf, len,
++                                    false);
+ }
+ 
+ int reims_vgpu_shim_write_gpa(void *ctx, uint64_t gpa, const uint8_t *buf,
+                               size_t len)
+ {
+-    MemTxResult r;
+-
+     (void)ctx;
+-    if (!buf || len == 0) {
+-        return 0;
+-    }
+-    r = address_space_write(&address_space_memory, gpa,
+-                            reims_vgpu_shim_ram_attrs, buf, len);
+-    return r == MEMTX_OK ? 0 : -1;
++    return reims_vgpu_shim_ram_copy(&address_space_memory,
++                                    reims_vgpu_shim_ram_attrs, gpa,
++                                    (void *)buf, len, true);
+ }
+ 
+ int reims_vgpu_shim_is_ram_gpa(void *ctx, uint64_t gpa)
+@@ -203,6 +262,7 @@ int reims_vgpu_shim_guest_ram_regions(void *ctx, ReimsVgpuGuestRamRegion *out,
+ int reims_vgpu_shim_read_kva(void *ctx, uint64_t kva, uint8_t *buf, size_t len)
+ {
+     CPUState *cs = current_cpu;
++    int rc = 0;
+ 
+     (void)ctx;
+     if (!buf || len == 0) {
+@@ -213,39 +273,39 @@ int reims_vgpu_shim_read_kva(void *ctx, uint64_t kva, uint8_t *buf, size_t len)
+     }
+     cpu_synchronize_state(cs);
+     /*
+-     * RAM only. Reims tries guest registers as pointers, and one may name
+-     * device MMIO: reading a device register has the device's side effects.
++     * RAM only, all the way down. Reims tries guest registers as pointers,
++     * and one may name device MMIO: reading a device register has the
++     * device's side effects, and dispatching it would take the BQL inside a
++     * Rust call that holds the device lock. The leaf is copied through the
++     * RAM-only path, and the translation itself runs in a no-dispatch
++     * section, so a page-table read that would reach a device fails the walk
++     * instead of being performed. Checking the leaf alone would not cover the
++     * tables above it.
+      */
++    memory_no_dispatch_begin();
+     while (len > 0) {
+         TranslateForDebugResult tres;
+         hwaddr page = qemu_target_page_size();
+-        hwaddr chunk, xlat, plen;
++        hwaddr chunk;
+         AddressSpace *as;
+-        MemoryRegion *mr;
+ 
+         if (!cpu_translate_for_debug(cs, kva, &tres)) {
+-            return -1;
++            rc = -1;
++            break;
+         }
+         chunk = MIN(len, page - (tres.physaddr & (page - 1)));
+         as = cpu_get_address_space(cs, cpu_asidx_from_attrs(cs, tres.attrs));
+-        plen = chunk;
+-        {
+-            RCU_READ_LOCK_GUARD();
+-            mr = address_space_translate(as, tres.physaddr, &xlat, &plen,
+-                                         false, tres.attrs);
+-            if (!memory_region_is_ram(mr) || plen < chunk) {
+-                return -1;
+-            }
+-        }
+-        if (address_space_read(as, tres.physaddr, tres.attrs, buf, chunk) !=
+-            MEMTX_OK) {
+-            return -1;
++        rc = reims_vgpu_shim_ram_copy(as, tres.attrs, tres.physaddr, buf, chunk,
++                                      false);
++        if (rc != REIMS_VGPU_RAM_OK) {
++            break;
+         }
+         kva += chunk;
+         buf += chunk;
+         len -= chunk;
+     }
+-    return 0;
++    memory_no_dispatch_end();
++    return rc;
+ }
+ 
+ static InputButton reims_vgpu_shim_button(uint32_t code, bool *ok)
+diff --git a/include/hw/display/reims-vgpu-ram.h b/include/hw/display/reims-vgpu-ram.h
+new file mode 100644
+index 0000000000..33ea6161e9
+--- /dev/null
++++ b/include/hw/display/reims-vgpu-ram.h
+@@ -0,0 +1,118 @@
++/*
++ * reims-vgpu: copy to and from guest RAM, and only RAM.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Reims reads and writes guest memory from its drain worker and from vCPUs
++ * that run without the BQL, while holding its device lock. An access that
++ * reached a device would take the BQL there, the reverse of the main loop's
++ * order (BQL, then device lock), and would have the device's side effects.
++ * So every guest-memory callback copies through reims_vgpu_ram_copy():
++ *
++ * - each piece of the range must be ordinary, directly accessible RAM, and
++ *   writable RAM for a write; nothing is ever dispatched to a device;
++ * - a range that wraps past the top of the address space is refused;
++ * - the whole range is checked before any byte moves, so a write never
++ *   lands in the RAM half of a range whose other half is a device;
++ * - a refusal is an error, never a zero-filled success.
++ *
++ * QEMU's memory API comes in through the lookup, which keeps this testable
++ * on its own (tests/unit/test-reims-vgpu-ram.c).
++ */
++
++#ifndef HW_DISPLAY_REIMS_VGPU_RAM_H
++#define HW_DISPLAY_REIMS_VGPU_RAM_H
++
++/* One piece of a range: its host bytes, and what the lookup knows it by. */
++typedef struct ReimsVgpuRamPiece {
++    uint8_t *host;
++    uint64_t len;
++    void *region;
++    uint64_t offset;
++} ReimsVgpuRamPiece;
++
++/*
++ * Resolve the piece of guest memory that starts at @gpa, at most @want bytes
++ * of it. False when it is not ordinary RAM, or not writable RAM for a write.
++ * Must answer the same for the same arguments within one copy.
++ */
++typedef bool (*ReimsVgpuRamLookup)(void *opaque, uint64_t gpa, uint64_t want,
++                                   bool is_write, ReimsVgpuRamPiece *piece);
++
++/* Record that the first @piece->len bytes of @piece were written. */
++typedef void (*ReimsVgpuRamDirty)(void *opaque, const ReimsVgpuRamPiece *piece);
++
++enum {
++    REIMS_VGPU_RAM_OK = 0,
++    /* Some piece is not (writable) RAM. Nothing was copied. */
++    REIMS_VGPU_RAM_REFUSED = -1,
++    /* -2 is the callbacks' "no current CPU". */
++    /* The range wraps past the top of the address space, or has no buffer. */
++    REIMS_VGPU_RAM_BAD_RANGE = -3,
++};
++
++/* Walk [gpa, gpa + len): check every piece, or copy every piece. */
++static inline bool reims_vgpu_ram_walk(ReimsVgpuRamLookup lookup,
++                                       ReimsVgpuRamDirty dirty, void *opaque,
++                                       uint64_t gpa, uint8_t *buf, size_t len,
++                                       bool is_write, bool copy)
++{
++    uint64_t left = len;
++
++    while (left > 0) {
++        ReimsVgpuRamPiece piece;
++
++        if (!lookup(opaque, gpa, left, is_write, &piece) ||
++            !piece.host || piece.len == 0) {
++            return false;
++        }
++        if (piece.len > left) {
++            piece.len = left;
++        }
++        if (copy) {
++            if (is_write) {
++                memcpy(piece.host, buf, piece.len);
++                if (dirty) {
++                    dirty(opaque, &piece);
++                }
++            } else {
++                memcpy(buf, piece.host, piece.len);
++            }
++            buf += piece.len;
++        }
++        gpa += piece.len;
++        left -= piece.len;
++    }
++    return true;
++}
++
++/*
++ * Copy @len bytes between @buf and guest memory at @gpa: into guest memory
++ * when @is_write, out of it otherwise. Returns REIMS_VGPU_RAM_OK, or an error
++ * with nothing copied.
++ */
++static inline int reims_vgpu_ram_copy(ReimsVgpuRamLookup lookup,
++                                      ReimsVgpuRamDirty dirty, void *opaque,
++                                      uint64_t gpa, void *buf, size_t len,
++                                      bool is_write)
++{
++    if (len == 0) {
++        return REIMS_VGPU_RAM_OK;
++    }
++    if (!buf || (uint64_t)len - 1 > UINT64_MAX - gpa) {
++        return REIMS_VGPU_RAM_BAD_RANGE;
++    }
++    /* Every piece first: a refusal must leave guest memory as it was. */
++    if (!reims_vgpu_ram_walk(lookup, dirty, opaque, gpa, buf, len,
++                             is_write, false)) {
++        return REIMS_VGPU_RAM_REFUSED;
++    }
++    /* The lookup answers as it did a moment ago, so this cannot refuse. */
++    if (!reims_vgpu_ram_walk(lookup, dirty, opaque, gpa, buf, len,
++                             is_write, true)) {
++        return REIMS_VGPU_RAM_REFUSED;
++    }
++    return REIMS_VGPU_RAM_OK;
++}
++
++#endif
+diff --git a/include/system/memory.h b/include/system/memory.h
+index e143c9c3f3..9fe47e1ae7 100644
+--- a/include/system/memory.h
++++ b/include/system/memory.h
+@@ -2931,6 +2931,31 @@ void *qemu_map_ram_ptr(RAMBlock *ram_block, ram_addr_t addr);
+ int memory_access_size(MemoryRegion *mr, unsigned l, hwaddr addr);
+ bool prepare_mmio_access(MemoryRegion *mr);
+ 
++/**
++ * memory_no_dispatch_begin: start a section in which the calling thread may
++ * reach RAM only.
++ *
++ * Until the matching memory_no_dispatch_end(), an access through this API
++ * that would be dispatched to a device's MemoryRegionOps fails with
++ * MEMTX_ACCESS_ERROR instead, before the BQL is taken; RAM is read and
++ * written as usual. Sections nest. This is for code that runs without the
++ * BQL while holding a lock the BQL's holder may wait for, and must not cause
++ * device side effects: reading guest memory on a device's behalf, including
++ * the page-table reads of a debug address translation.
++ */
++void memory_no_dispatch_begin(void);
++
++/**
++ * memory_no_dispatch_end: end the section memory_no_dispatch_begin() began.
++ */
++void memory_no_dispatch_end(void);
++
++/**
++ * memory_dispatch_forbidden: whether the calling thread is in a section
++ * started by memory_no_dispatch_begin().
++ */
++bool memory_dispatch_forbidden(void);
++
+ static inline bool memory_region_supports_direct_access(const MemoryRegion *mr)
+ {
+     /* ROM DEVICE regions only allow direct access if in ROMD mode. */
+diff --git a/system/memory_ldst.c.inc b/system/memory_ldst.c.inc
+index a728b7737c..273baea2cc 100644
+--- a/system/memory_ldst.c.inc
++++ b/system/memory_ldst.c.inc
+@@ -37,10 +37,16 @@ uint64_t glue(address_space_ldm_internal, SUFFIX)(ARG1_DECL, MemOp mop,
+     RCU_READ_LOCK();
+     mr = TRANSLATE(addr, &addr1, &l, false, attrs);
+     if (l < size || !memory_access_is_direct(mr, false, attrs)) {
+-        release_lock |= prepare_mmio_access(mr);
++        if (unlikely(memory_dispatch_forbidden())) {
++            /* A section that may reach RAM only. */
++            val = 0;
++            r = MEMTX_ACCESS_ERROR;
++        } else {
++            release_lock |= prepare_mmio_access(mr);
+ 
+-        /* I/O case */
+-        r = memory_region_dispatch_read(mr, addr1, &val, mop, attrs);
++            /* I/O case */
++            r = memory_region_dispatch_read(mr, addr1, &val, mop, attrs);
++        }
+     } else {
+         /* RAM case */
+         fuzz_dma_read_cb(addr, size, mr);
+@@ -81,8 +87,13 @@ void glue(address_space_stm_internal, SUFFIX)(ARG1_DECL, MemOp mop,
+     RCU_READ_LOCK();
+     mr = TRANSLATE(addr, &addr1, &l, true, attrs);
+     if (l < size || !memory_access_is_direct(mr, true, attrs)) {
+-        release_lock |= prepare_mmio_access(mr);
+-        r = memory_region_dispatch_write(mr, addr1, val, mop, attrs);
++        if (unlikely(memory_dispatch_forbidden())) {
++            /* A section that may reach RAM only. */
++            r = MEMTX_ACCESS_ERROR;
++        } else {
++            release_lock |= prepare_mmio_access(mr);
++            r = memory_region_dispatch_write(mr, addr1, val, mop, attrs);
++        }
+     } else {
+         /* RAM case */
+         stm_p(qemu_map_ram_ptr(mr->ram_block, addr1), mop, val);
+diff --git a/system/physmem.c b/system/physmem.c
+index 9e5b50c5b1..95fb78b13a 100644
+--- a/system/physmem.c
++++ b/system/physmem.c
+@@ -3187,6 +3187,25 @@ int memory_access_size(MemoryRegion *mr, unsigned l, hwaddr addr)
+     return l;
+ }
+ 
++/* Depth of this thread's memory_no_dispatch_begin() sections. */
++static __thread unsigned memory_no_dispatch_depth;
++
++void memory_no_dispatch_begin(void)
++{
++    memory_no_dispatch_depth++;
++}
++
++void memory_no_dispatch_end(void)
++{
++    assert(memory_no_dispatch_depth > 0);
++    memory_no_dispatch_depth--;
++}
++
++bool memory_dispatch_forbidden(void)
++{
++    return memory_no_dispatch_depth > 0;
++}
++
+ bool prepare_mmio_access(MemoryRegion *mr)
+ {
+     bool release_lock = false;
+@@ -3241,7 +3260,12 @@ static MemTxResult flatview_write_continue_step(MemTxAttrs attrs,
+     if (!memory_access_is_direct(mr, true, attrs)) {
+         uint64_t val;
+         MemTxResult result;
+-        bool release_lock = prepare_mmio_access(mr);
++        bool release_lock;
++
++        if (unlikely(memory_dispatch_forbidden())) {
++            return MEMTX_ACCESS_ERROR;
++        }
++        release_lock = prepare_mmio_access(mr);
+ 
+         *l = memory_access_size(mr, *l, mr_addr);
+         /*
+@@ -3338,7 +3362,12 @@ static MemTxResult flatview_read_continue_step(MemTxAttrs attrs, uint8_t *buf,
+         /* I/O case */
+         uint64_t val;
+         MemTxResult result;
+-        bool release_lock = prepare_mmio_access(mr);
++        bool release_lock;
++
++        if (unlikely(memory_dispatch_forbidden())) {
++            return MEMTX_ACCESS_ERROR;
++        }
++        release_lock = prepare_mmio_access(mr);
+ 
+         *l = memory_access_size(mr, *l, mr_addr);
+         result = memory_region_dispatch_read(mr, mr_addr, &val, size_memop(*l),
+diff --git a/tests/unit/meson.build b/tests/unit/meson.build
+index 01cc540a45..c6af216f55 100644
+--- a/tests/unit/meson.build
++++ b/tests/unit/meson.build
+@@ -30,6 +30,8 @@ tests = {
+   'test-mul64': [],
+   # all code tested by test-int128 is inside int128.h
+   'test-int128': [],
++  # all code tested by test-reims-vgpu-ram is inside reims-vgpu-ram.h
++  'test-reims-vgpu-ram': [],
+   'rcutorture': [],
+   'test-rcu-list': [],
+   'test-rcu-simpleq': [],
+diff --git a/tests/unit/test-reims-vgpu-ram.c b/tests/unit/test-reims-vgpu-ram.c
+new file mode 100644
+index 0000000000..ec96fe69a9
+--- /dev/null
++++ b/tests/unit/test-reims-vgpu-ram.c
+@@ -0,0 +1,261 @@
++/*
++ * reims-vgpu: the RAM-only guest-memory copy.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++
++#include "hw/display/reims-vgpu-ram.h"
++
++/*
++ * A small guest physical map: RAM at 0x1000, more RAM right after it at
++ * 0x2000 in another host buffer, a device at 0x3000, read-only RAM at 0x4000,
++ * and nothing anywhere else.
++ */
++typedef struct FakeMap {
++    uint8_t ram_a[0x1000];
++    uint8_t ram_b[0x1000];
++    uint8_t rom[0x1000];
++    unsigned lookups;
++    unsigned dirtied;
++    uint64_t dirty_bytes;
++} FakeMap;
++
++static bool fake_lookup(void *opaque, uint64_t gpa, uint64_t want,
++                        bool is_write, ReimsVgpuRamPiece *piece)
++{
++    FakeMap *m = opaque;
++    uint8_t *base;
++    uint64_t start;
++
++    m->lookups++;
++    if (gpa >= 0x1000 && gpa < 0x2000) {
++        base = m->ram_a;
++        start = 0x1000;
++    } else if (gpa >= 0x2000 && gpa < 0x3000) {
++        base = m->ram_b;
++        start = 0x2000;
++    } else if (gpa >= 0x4000 && gpa < 0x5000 && !is_write) {
++        base = m->rom;
++        start = 0x4000;
++    } else {
++        /* The device, read-only RAM for a write, or nothing. */
++        return false;
++    }
++    piece->host = base + (gpa - start);
++    piece->len = MIN(want, start + 0x1000 - gpa);
++    piece->region = m;
++    piece->offset = gpa;
++    return true;
++}
++
++static void fake_dirty(void *opaque, const ReimsVgpuRamPiece *piece)
++{
++    FakeMap *m = opaque;
++
++    m->dirtied++;
++    m->dirty_bytes += piece->len;
++}
++
++static int copy(FakeMap *m, uint64_t gpa, void *buf, size_t len, bool is_write)
++{
++    return reims_vgpu_ram_copy(fake_lookup, fake_dirty, m, gpa, buf, len,
++                               is_write);
++}
++
++static bool all_bytes(const uint8_t *p, size_t len, uint8_t value)
++{
++    for (size_t i = 0; i < len; i++) {
++        if (p[i] != value) {
++            return false;
++        }
++    }
++    return true;
++}
++
++/* A range over two RAM pieces is read and written whole, and marked dirty. */
++static void test_ram_across_pieces(void)
++{
++    g_autofree FakeMap *m = g_new0(FakeMap, 1);
++    uint8_t out[0x100], in[0x100];
++
++    memset(out, 0x5a, sizeof(out));
++    g_assert_cmpint(copy(m, 0x1f80, out, sizeof(out), true), ==,
++                    REIMS_VGPU_RAM_OK);
++    g_assert_true(all_bytes(m->ram_a + 0xf80, 0x80, 0x5a));
++    g_assert_true(all_bytes(m->ram_b, 0x80, 0x5a));
++    g_assert_cmpuint(m->dirtied, ==, 2);
++    g_assert_cmpuint(m->dirty_bytes, ==, sizeof(out));
++
++    g_assert_cmpint(copy(m, 0x1f80, in, sizeof(in), false), ==,
++                    REIMS_VGPU_RAM_OK);
++    g_assert_cmpmem(in, sizeof(in), out, sizeof(out));
++}
++
++/* A device is never read: an explicit error, and the buffer left alone. */
++static void test_device_read_refused(void)
++{
++    g_autofree FakeMap *m = g_new0(FakeMap, 1);
++    uint8_t buf[16];
++
++    memset(buf, 0xaa, sizeof(buf));
++    g_assert_cmpint(copy(m, 0x3000, buf, sizeof(buf), false), ==,
++                    REIMS_VGPU_RAM_REFUSED);
++    g_assert_true(all_bytes(buf, sizeof(buf), 0xaa));
++
++    /* Nor is the RAM in front of it, when the range runs on into it. */
++    memset(m->ram_b, 0x11, sizeof(m->ram_b));
++    g_assert_cmpint(copy(m, 0x2ff8, buf, sizeof(buf), false), ==,
++                    REIMS_VGPU_RAM_REFUSED);
++    g_assert_true(all_bytes(buf, sizeof(buf), 0xaa));
++}
++
++/*
++ * A write that runs from RAM into a device is refused before any byte is
++ * written: the RAM half is untouched and nothing is marked dirty.
++ */
++static void test_write_into_device_refused_first(void)
++{
++    g_autofree FakeMap *m = g_new0(FakeMap, 1);
++    uint8_t buf[0x100];
++
++    memset(buf, 0x55, sizeof(buf));
++    g_assert_cmpint(copy(m, 0x2f80, buf, sizeof(buf), true), ==,
++                    REIMS_VGPU_RAM_REFUSED);
++    g_assert_true(all_bytes(m->ram_b, sizeof(m->ram_b), 0));
++    g_assert_cmpuint(m->dirtied, ==, 0);
++}
++
++/* Read-only RAM reads, and refuses a write whole. */
++static void test_read_only_ram(void)
++{
++    g_autofree FakeMap *m = g_new0(FakeMap, 1);
++    uint8_t buf[8];
++
++    memset(m->rom, 0x33, sizeof(m->rom));
++    g_assert_cmpint(copy(m, 0x4000, buf, sizeof(buf), false), ==,
++                    REIMS_VGPU_RAM_OK);
++    g_assert_true(all_bytes(buf, sizeof(buf), 0x33));
++
++    memset(buf, 0x77, sizeof(buf));
++    g_assert_cmpint(copy(m, 0x4000, buf, sizeof(buf), true), ==,
++                    REIMS_VGPU_RAM_REFUSED);
++    g_assert_true(all_bytes(m->rom, sizeof(m->rom), 0x33));
++}
++
++/* A range past the top of the address space is refused before any lookup. */
++static void test_bad_ranges(void)
++{
++    g_autofree FakeMap *m = g_new0(FakeMap, 1);
++    uint8_t buf[16];
++
++    g_assert_cmpint(copy(m, UINT64_MAX - 7, buf, sizeof(buf), false), ==,
++                    REIMS_VGPU_RAM_BAD_RANGE);
++    g_assert_cmpint(copy(m, UINT64_MAX - 7, buf, sizeof(buf), true), ==,
++                    REIMS_VGPU_RAM_BAD_RANGE);
++    g_assert_cmpint(copy(m, 0x1000, NULL, 4, false), ==,
++                    REIMS_VGPU_RAM_BAD_RANGE);
++    g_assert_cmpuint(m->lookups, ==, 0);
++
++    /* Ending exactly at the top does not wrap; it is simply not RAM. */
++    g_assert_cmpint(copy(m, UINT64_MAX - 15, buf, sizeof(buf), false), ==,
++                    REIMS_VGPU_RAM_REFUSED);
++    g_assert_cmpint(copy(m, 0x1000, buf, 0, true), ==, REIMS_VGPU_RAM_OK);
++}
++
++/*
++ * The deadlock this exists to prevent. The main loop holds the BQL and
++ * waits for the device lock; the drain worker holds the device lock and
++ * reads guest memory at an address that is a device. The read must fail
++ * without needing the BQL, so the worker can let go of the device lock.
++ */
++typedef struct LockPair {
++    GMutex bql;
++    GMutex device;
++    GMutex state_lock;
++    GCond state_cond;
++    bool main_loop_has_bql;
++    bool main_loop_done;
++} LockPair;
++
++static gpointer main_loop(gpointer opaque)
++{
++    LockPair *p = opaque;
++
++    g_mutex_lock(&p->bql);
++    g_mutex_lock(&p->state_lock);
++    p->main_loop_has_bql = true;
++    g_cond_broadcast(&p->state_cond);
++    g_mutex_unlock(&p->state_lock);
++
++    g_mutex_lock(&p->device);
++    g_mutex_unlock(&p->device);
++    g_mutex_unlock(&p->bql);
++
++    g_mutex_lock(&p->state_lock);
++    p->main_loop_done = true;
++    g_cond_broadcast(&p->state_cond);
++    g_mutex_unlock(&p->state_lock);
++    return NULL;
++}
++
++static void test_no_bql_while_device_lock_held(void)
++{
++    g_autofree FakeMap *m = g_new0(FakeMap, 1);
++    LockPair p = { 0 };
++    GThread *thread;
++    uint8_t buf[16];
++    gint64 deadline;
++
++    memset(buf, 0, sizeof(buf));
++    g_mutex_init(&p.bql);
++    g_mutex_init(&p.device);
++    g_mutex_init(&p.state_lock);
++    g_cond_init(&p.state_cond);
++
++    g_mutex_lock(&p.device);
++    thread = g_thread_new("main-loop", main_loop, &p);
++    g_mutex_lock(&p.state_lock);
++    while (!p.main_loop_has_bql) {
++        g_cond_wait(&p.state_cond, &p.state_lock);
++    }
++    g_mutex_unlock(&p.state_lock);
++
++    g_assert_cmpint(copy(m, 0x3000, buf, sizeof(buf), false), ==,
++                    REIMS_VGPU_RAM_REFUSED);
++    g_assert_cmpint(copy(m, 0x2ff8, buf, sizeof(buf), true), ==,
++                    REIMS_VGPU_RAM_REFUSED);
++    /* The main loop still holds the BQL: the worker never needed it. */
++    g_assert_false(g_mutex_trylock(&p.bql));
++    g_mutex_unlock(&p.device);
++
++    deadline = g_get_monotonic_time() + 5 * G_TIME_SPAN_SECOND;
++    g_mutex_lock(&p.state_lock);
++    while (!p.main_loop_done) {
++        g_assert_true(g_cond_wait_until(&p.state_cond, &p.state_lock,
++                                        deadline));
++    }
++    g_mutex_unlock(&p.state_lock);
++    g_thread_join(thread);
++
++    g_cond_clear(&p.state_cond);
++    g_mutex_clear(&p.state_lock);
++    g_mutex_clear(&p.device);
++    g_mutex_clear(&p.bql);
++}
++
++int main(int argc, char **argv)
++{
++    g_test_init(&argc, &argv, NULL);
++    g_test_add_func("/reims-vgpu-ram/ram-across-pieces", test_ram_across_pieces);
++    g_test_add_func("/reims-vgpu-ram/device-read-refused",
++                    test_device_read_refused);
++    g_test_add_func("/reims-vgpu-ram/write-into-device-refused-first",
++                    test_write_into_device_refused_first);
++    g_test_add_func("/reims-vgpu-ram/read-only-ram", test_read_only_ram);
++    g_test_add_func("/reims-vgpu-ram/bad-ranges", test_bad_ranges);
++    g_test_add_func("/reims-vgpu-ram/no-bql-while-device-lock-held",
++                    test_no_bql_while_device_lock_held);
++    return g_test_run();
++}
+-- 
+2.43.0
+

@@ -1,0 +1,75 @@
+From c1a4553e9fb2a9fec0a9c570f95c6e4a934f65ca Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Sun, 8 Nov 2026 10:13:06 +0800
+Subject: [PATCH] hw/display/reims-vgpu-shim: Read guest virtual memory from
+ RAM only
+
+Reims tries guest registers as pointers when macOS 26 moves the IOSurface
+mapper handoff, and one of them can name device MMIO. cpu_memory_rw_debug
+reads a device register like any other address, with its side effects.
+A 26.6.2 restore that did so logged a blocked re-entrant read of the
+Reims MMIO and lost its USB link; with this the same restore finished.
+Refuse any page that is not RAM.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/display/reims-vgpu-shim.c | 36 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/hw/display/reims-vgpu-shim.c b/hw/display/reims-vgpu-shim.c
+index 31039948d9..31aadd6619 100644
+--- a/hw/display/reims-vgpu-shim.c
++++ b/hw/display/reims-vgpu-shim.c
+@@ -8,6 +8,7 @@
+ #include "qemu/timer.h"
+ #include "hw/core/cpu.h"
+ #include "exec/cpu-common.h"
++#include "exec/target_page.h"
+ #include "system/address-spaces.h"
+ #include "system/hw_accel.h"
+ #include "system/memory.h"
+@@ -211,7 +212,40 @@ int reims_vgpu_shim_read_kva(void *ctx, uint64_t kva, uint8_t *buf, size_t len)
+         return -2;
+     }
+     cpu_synchronize_state(cs);
+-    return cpu_memory_rw_debug(cs, kva, buf, len, false) == 0 ? 0 : -1;
++    /*
++     * RAM only. Reims tries guest registers as pointers, and one may name
++     * device MMIO: reading a device register has the device's side effects.
++     */
++    while (len > 0) {
++        TranslateForDebugResult tres;
++        hwaddr page = qemu_target_page_size();
++        hwaddr chunk, xlat, plen;
++        AddressSpace *as;
++        MemoryRegion *mr;
++
++        if (!cpu_translate_for_debug(cs, kva, &tres)) {
++            return -1;
++        }
++        chunk = MIN(len, page - (tres.physaddr & (page - 1)));
++        as = cpu_get_address_space(cs, cpu_asidx_from_attrs(cs, tres.attrs));
++        plen = chunk;
++        {
++            RCU_READ_LOCK_GUARD();
++            mr = address_space_translate(as, tres.physaddr, &xlat, &plen,
++                                         false, tres.attrs);
++            if (!memory_region_is_ram(mr) || plen < chunk) {
++                return -1;
++            }
++        }
++        if (address_space_read(as, tres.physaddr, tres.attrs, buf, chunk) !=
++            MEMTX_OK) {
++            return -1;
++        }
++        kva += chunk;
++        buf += chunk;
++        len -= chunk;
++    }
++    return 0;
+ }
+ 
+ static InputButton reims_vgpu_shim_button(uint32_t code, bool *ok)
+-- 
+2.43.0
+

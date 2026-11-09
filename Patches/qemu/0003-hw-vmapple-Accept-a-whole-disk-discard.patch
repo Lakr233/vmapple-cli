@@ -1,0 +1,85 @@
+From 82bea542a1925d85857a1077bf5cdf4f10475ad6 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Sun, 8 Nov 2026 03:33:11 +0800
+Subject: [PATCH 1/2] hw/vmapple: Accept a whole-disk discard
+
+The restore OS discards the whole disk in one request and ignores
+max_discard_sectors. It then waits forever on the I/O error.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/block/virtio-blk.c          | 19 +++++++++++++++----
+ hw/vmapple/virtio-blk.c        |  1 +
+ include/hw/virtio/virtio-blk.h |  2 ++
+ 3 files changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/hw/block/virtio-blk.c b/hw/block/virtio-blk.c
+index 6b92066aff..de1ad00ce9 100644
+--- a/hw/block/virtio-blk.c
++++ b/hw/block/virtio-blk.c
+@@ -386,7 +386,9 @@ static uint8_t virtio_blk_handle_discard_write_zeroes(VirtIOBlockReq *req,
+     uint64_t sector;
+     uint32_t num_sectors, flags, max_sectors;
+     uint8_t err_status;
+-    int bytes;
++    int64_t bytes;
++    bool oversized_discard = !is_write_zeroes &&
++                             VIRTIO_BLK_GET_CLASS(s)->oversized_discard;
+ 
+     sector = virtio_ldq_p(vdev, &dwz_hdr->sector);
+     num_sectors = virtio_ldl_p(vdev, &dwz_hdr->num_sectors);
+@@ -399,14 +401,23 @@ static uint8_t virtio_blk_handle_discard_write_zeroes(VirtIOBlockReq *req,
+      * make us sure that "num_sectors << BDRV_SECTOR_BITS" can fit in
+      * the integer variable.
+      */
+-    if (unlikely(num_sectors > max_sectors)) {
++    if (unlikely(num_sectors > max_sectors && !oversized_discard)) {
+         err_status = VIRTIO_BLK_S_IOERR;
+         goto err;
+     }
+ 
+-    bytes = num_sectors << BDRV_SECTOR_BITS;
++    bytes = (int64_t)num_sectors << BDRV_SECTOR_BITS;
+ 
+-    if (unlikely(!virtio_blk_sect_range_ok(s, sector, bytes))) {
++    if (num_sectors > max_sectors) {
++        uint64_t total_sectors;
++
++        blk_get_geometry(s->blk, &total_sectors);
++        if (sector & s->sector_mask || sector > total_sectors ||
++            num_sectors > total_sectors - sector) {
++            err_status = VIRTIO_BLK_S_IOERR;
++            goto err;
++        }
++    } else if (unlikely(!virtio_blk_sect_range_ok(s, sector, bytes))) {
+         err_status = VIRTIO_BLK_S_IOERR;
+         goto err;
+     }
+diff --git a/hw/vmapple/virtio-blk.c b/hw/vmapple/virtio-blk.c
+index 9de9aaae0b..2c5c5f78e8 100644
+--- a/hw/vmapple/virtio-blk.c
++++ b/hw/vmapple/virtio-blk.c
+@@ -88,6 +88,7 @@ static void vmapple_virtio_blk_class_init(ObjectClass *klass, const void *data)
+     VMAppleVirtIOBlkClass *vvbk = VMAPPLE_VIRTIO_BLK_CLASS(klass);
+ 
+     vbk->handle_unknown_request = vmapple_virtio_blk_handle_unknown_request;
++    vbk->oversized_discard = true;
+     vvbk->get_config = vdc->get_config;
+     vdc->get_config = vmapple_virtio_blk_get_config;
+ }
+diff --git a/include/hw/virtio/virtio-blk.h b/include/hw/virtio/virtio-blk.h
+index 3d8dee7ec1..0a7570814f 100644
+--- a/include/hw/virtio/virtio-blk.h
++++ b/include/hw/virtio/virtio-blk.h
+@@ -106,6 +106,8 @@ typedef struct VirtIOBlkClass {
+     /*< public >*/
+     bool (*handle_unknown_request)(VirtIOBlockReq *req, MultiReqBuffer *mrb,
+                                    uint32_t type);
++    /* The guest discards a whole disk in one request and ignores the limit. */
++    bool oversized_discard;
+ } VirtIOBlkClass;
+ 
+ void virtio_blk_handle_vq(VirtIOBlock *s, VirtQueue *vq);
+-- 
+2.43.0
+

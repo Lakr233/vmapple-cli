@@ -1,0 +1,119 @@
+From 1a6f0d6c9d4a593392ce3193e2c098a0b98ebeb2 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 03:30:22 +0800
+Subject: [PATCH 1/7] hw/vmapple: let the Reims shim read EL1 translation state
+
+Reims resolves IOSurface page lists through guest kernel addresses, which
+it can only translate on a vCPU thread. Since the drain moved to a worker
+thread, its re-reads there answer "no CPU" and it writes through whatever
+page list the last vCPU resolve adopted.
+
+Answer TTBR1_EL1, TCR_EL1, SCTLR_EL1 and the vCPU index through the Reims
+read_xreg callback at indices from 0x1000, synchronized from KVM on the
+publishing vCPU like the X registers already are, so Reims can capture a
+translation root there and walk kernel addresses in guest physical memory
+from the worker. No ABI change: a shim without this answers -1 for those
+indices, as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 2da32f52eeb64a2cd774ec1eaf7f889bdb36741d)
+---
+ hw/display/reims-vgpu-mmio.c | 12 ++++++++++++
+ hw/vmapple/vmapple.c         | 33 +++++++++++++++++++++++++++++++++
+ include/hw/vmapple/vmapple.h |  9 +++++++++
+ 3 files changed, 54 insertions(+)
+
+diff --git a/hw/display/reims-vgpu-mmio.c b/hw/display/reims-vgpu-mmio.c
+index f4b01c6b92..4965598da8 100644
+--- a/hw/display/reims-vgpu-mmio.c
++++ b/hw/display/reims-vgpu-mmio.c
+@@ -185,10 +185,22 @@ static int reims_vgpu_mmio_window_main_loop(void)
+  * invoked on the MMIO path of the publishing vCPU — Rust calls this from
+  * iosfc producer write (sync path). No first_cpu fallback: same deadlock
+  * class as read_kva if used from the BH.
++ *
++ * Indices from 0x1000 name EL1 translation state rather than an X register:
++ * Reims captures TTBR1_EL1, TCR_EL1 and SCTLR_EL1 here, on the vCPU, so its
++ * drain thread can walk guest kernel addresses from guest physical memory
++ * without a CPU. Before this, these indices answered -1, which Reims reads as
++ * "no translation root".
+  */
++#define REIMS_VGPU_SYSREG_BASE 0x1000u
++
+ static int reims_vgpu_mmio_read_xreg(void *ctx, uint32_t index, uint64_t *out)
+ {
+     (void)ctx;
++    if (index >= REIMS_VGPU_SYSREG_BASE) {
++        return vmapple_read_current_sysreg(index - REIMS_VGPU_SYSREG_BASE, out)
++            ? 0 : -1;
++    }
+     return vmapple_read_current_xreg(index, out) ? 0 : -1;
+ }
+ 
+diff --git a/hw/vmapple/vmapple.c b/hw/vmapple/vmapple.c
+index 53b1d7cc21..c4dac94872 100644
+--- a/hw/vmapple/vmapple.c
++++ b/hw/vmapple/vmapple.c
+@@ -94,6 +94,39 @@ bool vmapple_read_current_xreg(unsigned int index, uint64_t *value)
+     return true;
+ }
+ 
++/*
++ * The EL1 translation state of the vCPU in this MMIO exit, for a device that
++ * walks guest kernel addresses later from a thread with no vCPU. Like the
++ * X registers, only meaningful on the vCPU thread: the state is synchronized
++ * from KVM here and nowhere else.
++ */
++bool vmapple_read_current_sysreg(VMAppleSysreg reg, uint64_t *value)
++{
++    CPUState *cs = current_cpu;
++    CPUARMState *env;
++
++    if (!cs || !value) {
++        return false;
++    }
++    cpu_synchronize_state(cs);
++    env = &ARM_CPU(cs)->env;
++    switch (reg) {
++    case VMAPPLE_SYSREG_TTBR1_EL1:
++        *value = env->cp15.ttbr1_el[1];
++        return true;
++    case VMAPPLE_SYSREG_TCR_EL1:
++        *value = env->cp15.tcr_el[1];
++        return true;
++    case VMAPPLE_SYSREG_SCTLR_EL1:
++        *value = env->cp15.sctlr_el[1];
++        return true;
++    case VMAPPLE_SYSREG_CPU_INDEX:
++        *value = cs->cpu_index;
++        return true;
++    }
++    return false;
++}
++
+ /* Number of external interrupt lines to configure the GIC with */
+ #define NUM_IRQS 256
+ 
+diff --git a/include/hw/vmapple/vmapple.h b/include/hw/vmapple/vmapple.h
+index b1e692a8ca..105bb893c2 100644
+--- a/include/hw/vmapple/vmapple.h
++++ b/include/hw/vmapple/vmapple.h
+@@ -22,6 +22,15 @@
+ 
+ bool vmapple_read_current_xreg(unsigned int index, uint64_t *value);
+ 
++typedef enum VMAppleSysreg {
++    VMAPPLE_SYSREG_TTBR1_EL1,
++    VMAPPLE_SYSREG_TCR_EL1,
++    VMAPPLE_SYSREG_SCTLR_EL1,
++    VMAPPLE_SYSREG_CPU_INDEX,
++} VMAppleSysreg;
++
++bool vmapple_read_current_sysreg(VMAppleSysreg reg, uint64_t *value);
++
+ #define TYPE_VMAPPLE_VUSB "vresearch-vusb"
+ #define TYPE_VMAPPLE_VUSB_PCI "vresearch-vusb-pci"
+ 
+-- 
+2.43.0
+

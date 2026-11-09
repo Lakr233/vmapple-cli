@@ -1,0 +1,974 @@
+From 44976cbc215fd9067c0cc5b86b636249f1fd1f44 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 08:40:14 +0800
+Subject: [PATCH 2/3] Look up definitions without rescanning the module per
+ query
+
+macOS 27.2 draws its first frame with CoreAnimation's uber fragment
+shader: 94 KB of AIR that inlines to one function of 5,200 blocks and
+62,000 instructions. Translating it took 17 s on the host's little cores
+(8.3 s in a guest on the big ones), and most of that was linear searches
+repeated per instruction or per loop:
+
+- the continue-merge repair walked every block for every loop header,
+  and rebuilt the dominator tree after each one-operand retarget;
+- the wrapper collapse, the private-placeholder neutralizer and three
+  load planners called type_def_of or value_result_type, each a scan of
+  the globals or of the whole module, once per instruction in loops that
+  change nothing those scans read;
+- the helper inliner cloned every global into a fresh map for each
+  inlined pointer instruction, and regrew its result-type map per call;
+- exact_raw_word_fact searched every function for a pointer's
+  definition on each load the raw-word rewrite considered.
+
+Each now reads a map built for that loop. A map answers what the scan
+it replaces answered: the first definition in module order, and for the
+inliner the last one, synthesized globals first. The raw-word rewrite
+keeps its map in step with every instruction it inserts or changes,
+stops using it at the first id defined twice, and debug builds compare
+each answer with the scan. A merge retarget changes no branch, so it
+keeps the dominator tree; a repair that adds a block rebuilds it.
+
+The SPIR-V and reflection are byte-identical for that shader and for
+144 other AIR files from macOS 13.6 to 27.2 guests. The shader now
+translates in 6.1 s instead of 17.0 s on the little cores, and in 2.9 s
+instead of 7.9 s on a big one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/passes/access/private_memory.rs           |  21 +-
+ src/passes/access/raw_byte.rs                 |   8 +-
+ src/passes/access/vector_subword.rs           |   8 +-
+ src/passes/cfg_repair/mod.rs                  | 115 +++++++---
+ src/passes/emitted_inline/mod.rs              |  33 ++-
+ src/passes/mod.rs                             |  16 +-
+ src/passes/resources/collapse.rs              |   3 +-
+ .../resources/rewrites/raw_word_rewrite.rs    | 207 ++++++++++++++++--
+ src/passes/value_queries.rs                   |  54 +++++
+ 9 files changed, 400 insertions(+), 65 deletions(-)
+
+diff --git a/src/passes/access/private_memory.rs b/src/passes/access/private_memory.rs
+index 9cd048e..f62cd32 100644
+--- a/src/passes/access/private_memory.rs
++++ b/src/passes/access/private_memory.rs
+@@ -94,6 +94,7 @@ pub(in crate::passes) fn neutralize_private_placeholder_access_chains(
+             _ => None,
+         })
+         .collect();
++    let defs = GlobalDefs::new(ctx);
+     let mut roots: HashSet<Word> = ctx
+         .module
+         .types_global_values
+@@ -122,7 +123,9 @@ pub(in crate::passes) fn neutralize_private_placeholder_access_chains(
+             {
+                 return None;
+             }
+-            private_pointer_pointee(ctx, inst.result_type?).map(|_| result)
++            defs.get(inst.result_type?)
++                .and_then(private_pointer_type_pointee)
++                .map(|_| result)
+         })
+         .collect();
+ 
+@@ -141,7 +144,11 @@ pub(in crate::passes) fn neutralize_private_placeholder_access_chains(
+         let (Some(result_type), Some(result)) = (inst.result_type, inst.result_id) else {
+             continue;
+         };
+-        if private_pointer_pointee(ctx, result_type).is_none() {
++        if defs
++            .get(result_type)
++            .and_then(private_pointer_type_pointee)
++            .is_none()
++        {
+             continue;
+         }
+         let deps = match inst.class.opcode {
+@@ -347,7 +354,11 @@ pub(in crate::passes) fn private_zero_pointer_for_type(
+ }
+ 
+ pub(in crate::passes) fn private_pointer_pointee(ctx: &Ctx, ptr_ty: Word) -> Option<Word> {
+-    let inst = type_def_of(ctx, ptr_ty)?;
++    private_pointer_type_pointee(&type_def_of(ctx, ptr_ty)?)
++}
++
++/// The element type `inst` declares, if it is a `Private` OpTypePointer.
++fn private_pointer_type_pointee(inst: &Instruction) -> Option<Word> {
+     if inst.class.opcode != Op::TypePointer {
+         return None;
+     }
+@@ -438,6 +449,8 @@ pub(in crate::passes) fn is_function_variable(inst: &Instruction) -> bool {
+ /// Vulkan builtin: the body's original `zext i16 -> i32` then compiles to a same-width `OpUConvert
+ /// %uint %uint`. A no-op copy is the semantically-correct result. General (a true convert keeps its op).
+ pub(in crate::passes) fn fix_noop_width_converts(ctx: &mut Ctx, entry_idx: usize) {
++    // A rewrite below keeps the instruction's id and result type, so these stay current.
++    let value_types = ValueTypes::new(ctx);
+     let n_blocks = ctx.module.functions[entry_idx].blocks.len();
+     for bi in 0..n_blocks {
+         let n_insts = ctx.module.functions[entry_idx].blocks[bi]
+@@ -460,7 +473,7 @@ pub(in crate::passes) fn fix_noop_width_converts(ctx: &mut Ctx, entry_idx: usize
+                 };
+                 (rty, *src)
+             };
+-            let Some(src_ty) = value_result_type(ctx, src) else {
++            let Some(src_ty) = value_types.get(src) else {
+                 continue;
+             };
+             let replacement = if src_ty == rty {
+diff --git a/src/passes/access/raw_byte.rs b/src/passes/access/raw_byte.rs
+index 6db3c41..95525fc 100644
+--- a/src/passes/access/raw_byte.rs
++++ b/src/passes/access/raw_byte.rs
+@@ -224,6 +224,7 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_direct_loads(ctx: &mut Ctx, en
+     }
+ 
+     let mut plans = HashMap::<(usize, usize), Plan>::new();
++    let value_types = ValueTypes::new(ctx);
+     for (block_idx, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+         for (instruction_idx, instruction) in block.instructions.iter().enumerate() {
+             if instruction.class.opcode != Op::Load || instruction.operands.len() != 1 {
+@@ -236,7 +237,7 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_direct_loads(ctx: &mut Ctx, en
+             ) else {
+                 continue;
+             };
+-            let Some(pointer_ty) = value_result_type(ctx, *pointer) else {
++            let Some(pointer_ty) = value_types.get(*pointer) else {
+                 continue;
+             };
+             let Some(&(storage, pointee)) = ptr_info.get(&pointer_ty) else {
+@@ -2017,6 +2018,7 @@ pub(in crate::passes) fn rewrite_reinterpret_scalar_loads(ctx: &mut Ctx, entry_i
+     }
+ 
+     let mut plans: Vec<Plan> = Vec::new();
++    let value_types = ValueTypes::new(ctx);
+     for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+         for (ii, inst) in block.instructions.iter().enumerate() {
+             if inst.class.opcode != Op::Load {
+@@ -2028,7 +2030,7 @@ pub(in crate::passes) fn rewrite_reinterpret_scalar_loads(ctx: &mut Ctx, entry_i
+             let Some(Operand::IdRef(ptr)) = inst.operands.first() else {
+                 continue;
+             };
+-            let Some(ptr_ty) = value_result_type(ctx, *ptr) else {
++            let Some(ptr_ty) = value_types.get(*ptr) else {
+                 continue;
+             };
+             let Some(&(sc, pointee_ty)) = ptr_info.get(&ptr_ty) else {
+@@ -2081,7 +2083,7 @@ pub(in crate::passes) fn rewrite_reinterpret_scalar_loads(ctx: &mut Ctx, entry_i
+                 if indices.is_empty() {
+                     continue;
+                 }
+-                let Some(base_ptr_ty) = value_result_type(ctx, *base) else {
++                let Some(base_ptr_ty) = value_types.get(*base) else {
+                     continue;
+                 };
+                 let Some(&(_, base_pointee)) = ptr_info.get(&base_ptr_ty) else {
+diff --git a/src/passes/access/vector_subword.rs b/src/passes/access/vector_subword.rs
+index cd220c3..a1e5be7 100644
+--- a/src/passes/access/vector_subword.rs
++++ b/src/passes/access/vector_subword.rs
+@@ -7,6 +7,8 @@ use super::*;
+ /// requires the otherwise address-identical zero descent to produce `T*` first.
+ pub(in crate::passes) fn repair_load_through_array_pointer(ctx: &mut Ctx, entry_idx: usize) {
+     let mut plans = HashMap::<(usize, usize), (Word, Word, StorageClass)>::new();
++    let value_types = ValueTypes::new(ctx);
++    let defs = GlobalDefs::new(ctx);
+     for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+         for (ii, load) in block.instructions.iter().enumerate() {
+             if load.class.opcode != Op::Load || load.operands.len() != 1 {
+@@ -17,10 +19,10 @@ pub(in crate::passes) fn repair_load_through_array_pointer(ctx: &mut Ctx, entry_
+             else {
+                 continue;
+             };
+-            let Some(pointer_ty) = value_result_type(ctx, *pointer) else {
++            let Some(pointer_ty) = value_types.get(*pointer) else {
+                 continue;
+             };
+-            let Some(pointer_def) = type_def_of(ctx, pointer_ty) else {
++            let Some(pointer_def) = defs.get(pointer_ty) else {
+                 continue;
+             };
+             let (Some(Operand::StorageClass(storage)), Some(Operand::IdRef(array_ty))) =
+@@ -28,7 +30,7 @@ pub(in crate::passes) fn repair_load_through_array_pointer(ctx: &mut Ctx, entry_
+             else {
+                 continue;
+             };
+-            let Some(array_def) = type_def_of(ctx, *array_ty) else {
++            let Some(array_def) = defs.get(*array_ty) else {
+                 continue;
+             };
+             if !matches!(array_def.class.opcode, Op::TypeArray | Op::TypeRuntimeArray)
+diff --git a/src/passes/cfg_repair/mod.rs b/src/passes/cfg_repair/mod.rs
+index ac8d9f3..aa0e128 100644
+--- a/src/passes/cfg_repair/mod.rs
++++ b/src/passes/cfg_repair/mod.rs
+@@ -1255,9 +1255,16 @@ fn reachable_labels_except(
+ }
+ 
+ pub(in crate::passes) fn repair_continue_selection_merge_targets(ctx: &mut Ctx, entry_idx: usize) {
++    // Retargeting a selection merge changes no branch, so the dominator tree that repair was decided
++    // on still holds for the next one; only a repair that adds a block or an edge rebuilds it.
++    let mut dominators = None;
+     loop {
+-        if !repair_one_continue_selection_merge_target(ctx, entry_idx) {
+-            break;
++        let current = dominators
++            .get_or_insert_with(|| CompactDominators::new(&ctx.module.functions[entry_idx].blocks));
++        match repair_continue_selection_merge_target_with(ctx, entry_idx, current) {
++            ContinueMergeRepair::Unchanged => break,
++            ContinueMergeRepair::MergeRetargeted => {}
++            ContinueMergeRepair::CfgChanged => dominators = None,
+         }
+     }
+ }
+@@ -1464,12 +1471,33 @@ pub(in crate::passes) fn repair_one_loop_continue_external_predecessor(
+     false
+ }
+ 
++#[cfg(test)]
+ pub(in crate::passes) fn repair_one_continue_selection_merge_target(
+     ctx: &mut Ctx,
+     entry_idx: usize,
+ ) -> bool {
+     let dominators = CompactDominators::new(&ctx.module.functions[entry_idx].blocks);
++    repair_continue_selection_merge_target_with(ctx, entry_idx, &dominators)
++        != ContinueMergeRepair::Unchanged
++}
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum ContinueMergeRepair {
++    Unchanged,
++    /// Only an `OpSelectionMerge` target changed; every branch, and so the dominator tree, is as it was.
++    MergeRetargeted,
++    CfgChanged,
++}
++
++fn repair_continue_selection_merge_target_with(
++    ctx: &mut Ctx,
++    entry_idx: usize,
++    dominators: &CompactDominators,
++) -> ContinueMergeRepair {
+     let block_count = ctx.module.functions[entry_idx].blocks.len();
++    // Every change below returns at once, so the selections can be grouped by merge target once
++    // per call rather than rescanned for every loop header.
++    let selections_by_merge = labeled_selections_by_merge(&ctx.module.functions[entry_idx].blocks);
+     for header_idx in 0..block_count {
+         let Some(loop_header_label) = ctx.module.functions[entry_idx].blocks[header_idx]
+             .label
+@@ -1491,30 +1519,16 @@ pub(in crate::passes) fn repair_one_continue_selection_merge_target(
+         let Some(continue_label) = loop_merge.operands.get(1).and_then(id_ref_operand) else {
+             continue;
+         };
++        let Some(selections) = selections_by_merge.get(&continue_label) else {
++            continue;
++        };
+ 
+-        for block_idx in 0..block_count {
+-            let Some(block_label) = ctx.module.functions[entry_idx].blocks[block_idx]
+-                .label
+-                .as_ref()
+-                .and_then(|label| label.result_id)
+-            else {
+-                continue;
+-            };
+-            let Some(selection_merge_idx) = ctx.module.functions[entry_idx].blocks[block_idx]
+-                .instructions
+-                .iter()
+-                .position(|inst| inst.class.opcode == Op::SelectionMerge)
+-            else {
+-                continue;
+-            };
+-            let selection_merge = ctx.module.functions[entry_idx].blocks[block_idx].instructions
+-                [selection_merge_idx]
+-                .operands
+-                .first()
+-                .and_then(id_ref_operand);
+-            if selection_merge != Some(continue_label) {
+-                continue;
+-            }
++        for &LabeledSelection {
++            block_idx,
++            block_label,
++            selection_merge_idx,
++        } in selections
++        {
+             let Some(term) = ctx.module.functions[entry_idx].blocks[block_idx]
+                 .instructions
+                 .last()
+@@ -1556,7 +1570,7 @@ pub(in crate::passes) fn repair_one_continue_selection_merge_target(
+                     .first_mut()
+                 {
+                     *merge = boundary;
+-                    return true;
++                    return ContinueMergeRepair::MergeRetargeted;
+                 }
+             }
+             let branches_to_continue_and_merge = (true_target == continue_label
+@@ -1574,13 +1588,17 @@ pub(in crate::passes) fn repair_one_continue_selection_merge_target(
+                     continue_label,
+                     &[loop_merge_label],
+                 ) {
+-                    return split_selection_continue_merge(
++                    return if split_selection_continue_merge(
+                         ctx,
+                         entry_idx,
+                         block_idx,
+                         selection_merge_idx,
+                         continue_label,
+-                    );
++                    ) {
++                        ContinueMergeRepair::CfgChanged
++                    } else {
++                        ContinueMergeRepair::Unchanged
++                    };
+                 }
+                 continue;
+             }
+@@ -1617,10 +1635,47 @@ pub(in crate::passes) fn repair_one_continue_selection_merge_target(
+                     )],
+                 },
+             );
+-            return true;
++            return ContinueMergeRepair::CfgChanged;
+         }
+     }
+-    false
++    ContinueMergeRepair::Unchanged
++}
++
++/// A labeled block's first `OpSelectionMerge`.
++struct LabeledSelection {
++    block_idx: usize,
++    block_label: Word,
++    selection_merge_idx: usize,
++}
++
++/// Labeled blocks with a selection merge, keyed by merge target, each list in block order.
++fn labeled_selections_by_merge(blocks: &[Block]) -> HashMap<Word, Vec<LabeledSelection>> {
++    let mut selections = HashMap::<Word, Vec<LabeledSelection>>::new();
++    for (block_idx, block) in blocks.iter().enumerate() {
++        let Some(block_label) = block.label.as_ref().and_then(|label| label.result_id) else {
++            continue;
++        };
++        let Some(selection_merge_idx) = block
++            .instructions
++            .iter()
++            .position(|inst| inst.class.opcode == Op::SelectionMerge)
++        else {
++            continue;
++        };
++        let Some(merge) = block.instructions[selection_merge_idx]
++            .operands
++            .first()
++            .and_then(id_ref_operand)
++        else {
++            continue;
++        };
++        selections.entry(merge).or_default().push(LabeledSelection {
++            block_idx,
++            block_label,
++            selection_merge_idx,
++        });
++    }
++    selections
+ }
+ 
+ #[derive(Clone)]
+diff --git a/src/passes/emitted_inline/mod.rs b/src/passes/emitted_inline/mod.rs
+index 07b6d16..620823d 100644
+--- a/src/passes/emitted_inline/mod.rs
++++ b/src/passes/emitted_inline/mod.rs
+@@ -1730,7 +1730,18 @@ fn redirect_terminator_target(block: &mut Block, from: Word, to: Word) -> bool {
+ }
+ 
+ fn collect_result_types(ctx: &Ctx) -> HashMap<Word, Word> {
+-    let mut result_types = HashMap::new();
++    // Sized up front: this runs once per inlined call over the whole module, and growing the map
++    // through every doubling cost more than filling it.
++    let body_instructions: usize = ctx
++        .module
++        .functions
++        .iter()
++        .flat_map(|func| &func.blocks)
++        .map(|block| block.instructions.len())
++        .sum();
++    let mut result_types = HashMap::with_capacity(
++        ctx.module.types_global_values.len() + ctx.new_globals.len() + body_instructions,
++    );
+     for inst in ctx
+         .module
+         .ext_inst_imports
+@@ -1797,21 +1808,33 @@ fn retarget_inlined_pointer_result(
+     let Some(base_type) = result_types.get(&base).copied() else {
+         return;
+     };
+-    let defs = type_defs_with_new_globals(ctx);
+-    let Some(base_storage) = ptr_storage(&defs, base_type) else {
++    let Some(base_storage) =
++        type_def_with_new_globals(ctx, base_type).and_then(pointer_type_storage)
++    else {
+         return;
+     };
+-    let Some(result_storage) = ptr_storage(&defs, result_type) else {
++    let result_def = type_def_with_new_globals(ctx, result_type);
++    let Some(result_storage) = result_def.and_then(pointer_type_storage) else {
+         return;
+     };
+     if base_storage == result_storage {
+         return;
+     }
+-    let Some(pointee) = ptr_pointee(&defs, result_type) else {
++    let Some(pointee) = result_def.and_then(pointer_type_pointee) else {
+         return;
+     };
+     inst.result_type = Some(ctx.ty_ptr(base_storage, pointee));
+ }
+ 
++/// The entry [`type_defs_with_new_globals`] would hold for `id`, found without building the map:
++/// a synthesized global wins over the module's, and a later definition over an earlier one.
++fn type_def_with_new_globals(ctx: &Ctx, id: Word) -> Option<&Instruction> {
++    ctx.new_globals
++        .iter()
++        .rev()
++        .chain(ctx.module.types_global_values.iter().rev())
++        .find(|inst| inst.result_id == Some(id))
++}
++
+ #[cfg(test)]
+ mod tests;
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index 22f2bac..5e1b432 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -364,7 +364,16 @@ fn type_defs(module: &Module) -> HashMap<Word, Instruction> {
+ 
+ /// The element type of a pointer type id, if it is OpTypePointer.
+ fn ptr_pointee(defs: &HashMap<Word, Instruction>, ptr: Word) -> Option<Word> {
+-    let inst = defs.get(&ptr)?;
++    pointer_type_pointee(defs.get(&ptr)?)
++}
++
++/// The storage class of a pointer type id.
++fn ptr_storage(defs: &HashMap<Word, Instruction>, ptr: Word) -> Option<StorageClass> {
++    pointer_type_storage(defs.get(&ptr)?)
++}
++
++/// The element type `inst` declares, if it is OpTypePointer.
++fn pointer_type_pointee(inst: &Instruction) -> Option<Word> {
+     if inst.class.opcode == Op::TypePointer {
+         if let Operand::IdRef(p) = inst.operands[1] {
+             return Some(p);
+@@ -373,9 +382,8 @@ fn ptr_pointee(defs: &HashMap<Word, Instruction>, ptr: Word) -> Option<Word> {
+     None
+ }
+ 
+-/// The storage class of a pointer type id.
+-fn ptr_storage(defs: &HashMap<Word, Instruction>, ptr: Word) -> Option<StorageClass> {
+-    let inst = defs.get(&ptr)?;
++/// The storage class `inst` declares, if it is OpTypePointer.
++fn pointer_type_storage(inst: &Instruction) -> Option<StorageClass> {
+     if inst.class.opcode == Op::TypePointer {
+         if let Operand::StorageClass(sc) = inst.operands[0] {
+             return Some(sc);
+diff --git a/src/passes/resources/collapse.rs b/src/passes/resources/collapse.rs
+index 24f5dc2..59f6a29 100644
+--- a/src/passes/resources/collapse.rs
++++ b/src/passes/resources/collapse.rs
+@@ -1292,6 +1292,7 @@ pub(in crate::passes) fn collapse_late_pointer_and_opaque_wrappers(
+     ctx: &mut Ctx,
+     entry_idx: usize,
+ ) -> Result<(), String> {
++    let defs = GlobalDefs::new(ctx);
+     let resource_values = ctx
+         .new_globals
+         .iter()
+@@ -1304,7 +1305,7 @@ pub(in crate::passes) fn collapse_late_pointer_and_opaque_wrappers(
+         )
+         .filter_map(|inst| {
+             let result = inst.result_id?;
+-            let ty = type_def_of(ctx, inst.result_type?)?;
++            let ty = defs.get(inst.result_type?)?;
+             matches!(
+                 ty.class.opcode,
+                 Op::TypePointer | Op::TypeImage | Op::TypeSampler | Op::TypeSampledImage
+diff --git a/src/passes/resources/rewrites/raw_word_rewrite.rs b/src/passes/resources/rewrites/raw_word_rewrite.rs
+index 93f8866..f087e52 100644
+--- a/src/passes/resources/rewrites/raw_word_rewrite.rs
++++ b/src/passes/resources/rewrites/raw_word_rewrite.rs
+@@ -96,6 +96,7 @@ pub(in crate::passes) fn rewrite_raw_word_alias_chains(
+         }
+     }
+ 
++    let mut definitions = ChainDefinitions::new(&ctx.module);
+     let n_blocks = ctx.module.functions[entry_idx].blocks.len();
+     for bi in 0..n_blocks {
+         let mut ii = 0;
+@@ -151,6 +152,7 @@ pub(in crate::passes) fn rewrite_raw_word_alias_chains(
+                                     Operand::IdRef(zero),
+                                     Operand::IdRef(word),
+                                 ];
++                                definitions.replace(&snapshot, inst);
+                                 ii += 1;
+                                 continue;
+                             }
+@@ -201,6 +203,7 @@ pub(in crate::passes) fn rewrite_raw_word_alias_chains(
+                                         Operand::IdRef(zero),
+                                         Operand::IdRef(word),
+                                     ];
++                                    definitions.replace(&snapshot, inst);
+                                     ii += 1;
+                                     continue;
+                                 }
+@@ -281,6 +284,7 @@ pub(in crate::passes) fn rewrite_raw_word_alias_chains(
+                                                 Operand::IdRef(zero),
+                                                 Operand::IdRef(word),
+                                             ];
++                                            definitions.replace(&snapshot, inst);
+                                             ii += 1;
+                                             continue;
+                                         }
+@@ -302,10 +306,12 @@ pub(in crate::passes) fn rewrite_raw_word_alias_chains(
+                         defs,
+                         buffer_types: &buffer_types,
+                         paths: &paths,
++                        definitions: &definitions,
+                     },
+                     &snapshot,
+                 ) {
+                     let inserted = rewrite.prefix.len();
++                    definitions.splice(&snapshot, &rewrite.prefix, &rewrite.replacement);
+                     let insts = &mut ctx.module.functions[entry_idx].blocks[bi].instructions;
+                     for (offset, inst) in rewrite.prefix.into_iter().enumerate() {
+                         insts.insert(ii + offset, inst);
+@@ -323,10 +329,12 @@ pub(in crate::passes) fn rewrite_raw_word_alias_chains(
+                         defs,
+                         buffer_types: &buffer_types,
+                         paths: &paths,
++                        definitions: &definitions,
+                     },
+                     &snapshot,
+                 ) {
+                     let inserted = rewrite.prefix.len();
++                    definitions.splice(&snapshot, &rewrite.prefix, &rewrite.replacement);
+                     let insts = &mut ctx.module.functions[entry_idx].blocks[bi].instructions;
+                     for (offset, inst) in rewrite.prefix.into_iter().enumerate() {
+                         insts.insert(ii + offset, inst);
+@@ -343,9 +351,11 @@ pub(in crate::passes) fn rewrite_raw_word_alias_chains(
+                     defs,
+                     &buffer_types,
+                     &paths,
++                    &definitions,
+                     &snapshot,
+                 ) {
+                     let inserted = rewrite.prefix.len();
++                    definitions.splice(&snapshot, &rewrite.prefix, &rewrite.replacement);
+                     let insts = &mut ctx.module.functions[entry_idx].blocks[bi].instructions;
+                     for (offset, inst) in rewrite.prefix.into_iter().enumerate() {
+                         insts.insert(ii + offset, inst);
+@@ -364,9 +374,11 @@ pub(in crate::passes) fn rewrite_raw_word_alias_chains(
+                     defs,
+                     &buffer_types,
+                     &paths,
++                    &definitions,
+                     &snapshot,
+                 ) {
+                     let inserted = rewrite.prefix.len();
++                    definitions.splice(&snapshot, &rewrite.prefix, &rewrite.replacement);
+                     let insts = &mut ctx.module.functions[entry_idx].blocks[bi].instructions;
+                     for (offset, inst) in rewrite.prefix.into_iter().enumerate() {
+                         insts.insert(ii + offset, inst);
+@@ -387,6 +399,9 @@ pub(in crate::passes) fn rewrite_raw_word_alias_chains(
+                 &snapshot,
+             ) {
+                 let inserted = rewrite.prefix.len();
++                let mut retargeted = snapshot.clone();
++                retargeted.operands[0] = Operand::IdRef(rewrite.ptr);
++                definitions.splice(&snapshot, &rewrite.prefix, &retargeted);
+                 let insts = &mut ctx.module.functions[entry_idx].blocks[bi].instructions;
+                 for (offset, inst) in rewrite.prefix.into_iter().enumerate() {
+                     insts.insert(ii + offset, inst);
+@@ -440,6 +455,7 @@ struct StructuredRawInputs<'a> {
+     defs: &'a HashMap<Word, Instruction>,
+     buffer_types: &'a HashMap<Word, Word>,
+     paths: &'a HashMap<Word, BufferAccessPath>,
++    definitions: &'a ChainDefinitions,
+ }
+ 
+ /// Reconstruct a vector of 32-bit lanes from the raw descriptor that replaced its source aggregate.
+@@ -474,7 +490,13 @@ fn plan_structured_raw_vector_load_rewrite(
+     let Operand::IdRef(ptr) = load.operands[0] else {
+         return None;
+     };
+-    exact_raw_word_fact(ctx, inputs.types, inputs.buffer_types, ptr)?;
++    exact_raw_word_fact(
++        ctx,
++        inputs.types,
++        inputs.buffer_types,
++        inputs.definitions,
++        ptr,
++    )?;
+     let access = structured_raw_word_access(
+         ctx,
+         inputs.types,
+@@ -482,6 +504,7 @@ fn plan_structured_raw_vector_load_rewrite(
+         inputs.defs,
+         inputs.buffer_types,
+         inputs.paths,
++        inputs.definitions,
+         ptr,
+     )?;
+     let uint = ctx.ty_uint();
+@@ -595,7 +618,13 @@ fn plan_structured_raw_subword_load_rewrite(
+     let Operand::IdRef(ptr) = load.operands[0] else {
+         return None;
+     };
+-    exact_raw_word_fact(ctx, inputs.types, inputs.buffer_types, ptr)?;
++    exact_raw_word_fact(
++        ctx,
++        inputs.types,
++        inputs.buffer_types,
++        inputs.definitions,
++        ptr,
++    )?;
+     let access = structured_raw_word_access(
+         ctx,
+         inputs.types,
+@@ -603,6 +632,7 @@ fn plan_structured_raw_subword_load_rewrite(
+         inputs.defs,
+         inputs.buffer_types,
+         inputs.paths,
++        inputs.definitions,
+         ptr,
+     )?;
+     let uint = ctx.ty_uint();
+@@ -688,6 +718,7 @@ pub(in crate::passes) fn plan_mismatched_raw_word_load_rewrite(
+     defs: &HashMap<Word, Instruction>,
+     buffer_types: &HashMap<Word, Word>,
+     paths: &HashMap<Word, BufferAccessPath>,
++    definitions: &ChainDefinitions,
+     load: &Instruction,
+ ) -> Option<RawLoadRewrite> {
+     let result = load.result_id?;
+@@ -721,6 +752,7 @@ pub(in crate::passes) fn plan_mismatched_raw_word_load_rewrite(
+             defs,
+             buffer_types,
+             paths,
++            definitions,
+             *ptr,
+             result,
+             result_ty,
+@@ -749,6 +781,7 @@ pub(in crate::passes) fn plan_mismatched_raw_word_load_rewrite(
+         defs,
+         buffer_types,
+         paths,
++        definitions,
+         *ptr,
+         result,
+         result_ty,
+@@ -820,6 +853,7 @@ pub(in crate::passes) fn plan_raw_byte_store_rewrite(
+     defs: &HashMap<Word, Instruction>,
+     buffer_types: &HashMap<Word, Word>,
+     paths: &HashMap<Word, BufferAccessPath>,
++    definitions: &ChainDefinitions,
+     store: &Instruction,
+ ) -> Option<RawStoreRewrite> {
+     let [Operand::IdRef(ptr), Operand::IdRef(object), ..] = store.operands.as_slice() else {
+@@ -857,6 +891,7 @@ pub(in crate::passes) fn plan_raw_byte_store_rewrite(
+         defs,
+         buffer_types,
+         paths,
++        definitions,
+         *ptr,
+         object,
+     ) {
+@@ -1034,14 +1069,24 @@ pub(in crate::passes) fn plan_structured_raw_word_load_rewrite(
+     defs: &HashMap<Word, Instruction>,
+     buffer_types: &HashMap<Word, Word>,
+     paths: &HashMap<Word, BufferAccessPath>,
++    definitions: &ChainDefinitions,
+     ptr: Word,
+     result: Word,
+     result_ty: Word,
+     result_kind: RawStoreObject,
+ ) -> Option<RawLoadRewrite> {
+-    let has_exact_raw_fact = exact_raw_word_fact(ctx, types, buffer_types, ptr).is_some();
+-    let access =
+-        structured_raw_word_access(ctx, types, raw_alias_vars, defs, buffer_types, paths, ptr)?;
++    let has_exact_raw_fact =
++        exact_raw_word_fact(ctx, types, buffer_types, definitions, ptr).is_some();
++    let access = structured_raw_word_access(
++        ctx,
++        types,
++        raw_alias_vars,
++        defs,
++        buffer_types,
++        paths,
++        definitions,
++        ptr,
++    )?;
+ 
+     let uint = ctx.ty_uint();
+     let mut prefix = Vec::new();
+@@ -1145,6 +1190,7 @@ pub(in crate::passes) fn plan_structured_raw_word_store_rewrite(
+     defs: &HashMap<Word, Instruction>,
+     buffer_types: &HashMap<Word, Word>,
+     paths: &HashMap<Word, BufferAccessPath>,
++    definitions: &ChainDefinitions,
+     ptr: Word,
+     object: Word,
+ ) -> Option<RawStoreRewrite> {
+@@ -1154,8 +1200,16 @@ pub(in crate::passes) fn plan_structured_raw_word_store_rewrite(
+     if byte_offset % 4 == 0 {
+         return None;
+     }
+-    let access =
+-        structured_raw_word_access(ctx, types, raw_alias_vars, defs, buffer_types, paths, ptr)?;
++    let access = structured_raw_word_access(
++        ctx,
++        types,
++        raw_alias_vars,
++        defs,
++        buffer_types,
++        paths,
++        definitions,
++        ptr,
++    )?;
+ 
+     let uint = ctx.ty_uint();
+     let mut instructions = Vec::new();
+@@ -1198,9 +1252,12 @@ pub(in crate::passes) fn structured_raw_word_access(
+     defs: &HashMap<Word, Instruction>,
+     buffer_types: &HashMap<Word, Word>,
+     paths: &HashMap<Word, BufferAccessPath>,
++    definitions: &ChainDefinitions,
+     ptr: Word,
+ ) -> Option<StructuredRawWordAccess> {
+-    if let Some((root, byte_offset)) = exact_raw_word_fact(ctx, types, buffer_types, ptr) {
++    if let Some((root, byte_offset)) =
++        exact_raw_word_fact(ctx, types, buffer_types, definitions, ptr)
++    {
+         let binding = descriptor_binding(&ctx.module, root)?;
+         let raw_var = match raw_alias_vars.get(&root).copied() {
+             Some(var) => var,
+@@ -1235,10 +1292,80 @@ pub(in crate::passes) fn structured_raw_word_access(
+     })
+ }
+ 
++/// The defining instruction of each id in the module's function bodies, kept in step with the
++/// changes [`rewrite_raw_word_alias_chains`] makes, so [`exact_raw_word_fact`] can look a pointer's
++/// definition up instead of scanning every function for it.
++///
++/// The scan answers with the first definition in module order. While every id has one definition
++/// that is the only one, so the map answers the same; at the first id defined twice the map is
++/// dropped and every later lookup scans again.
++pub(in crate::passes) struct ChainDefinitions(Option<HashMap<Word, Instruction>>);
++
++impl ChainDefinitions {
++    fn new(module: &Module) -> Self {
++        let mut definitions = Self(Some(HashMap::new()));
++        for inst in module
++            .functions
++            .iter()
++            .flat_map(|function| &function.blocks)
++            .flat_map(|block| &block.instructions)
++        {
++            definitions.insert(inst);
++        }
++        definitions
++    }
++
++    fn insert(&mut self, inst: &Instruction) {
++        let (Some(definitions), Some(id)) = (&mut self.0, inst.result_id) else {
++            return;
++        };
++        if definitions.insert(id, inst.clone()).is_some() {
++            self.0 = None;
++        }
++    }
++
++    /// `old` was replaced in place by `new`.
++    fn replace(&mut self, old: &Instruction, new: &Instruction) {
++        if let (Some(definitions), Some(id)) = (&mut self.0, old.result_id) {
++            definitions.remove(&id);
++        }
++        self.insert(new);
++    }
++
++    /// `prefix` was inserted before `old`, and `old` was replaced by `new`.
++    fn splice(&mut self, old: &Instruction, prefix: &[Instruction], new: &Instruction) {
++        for inst in prefix {
++            self.insert(inst);
++        }
++        self.replace(old, new);
++    }
++
++    fn find<'a>(&'a self, module: &'a Module, id: Word) -> Option<&'a Instruction> {
++        let scan = || {
++            module.functions.iter().find_map(|function| {
++                function
++                    .blocks
++                    .iter()
++                    .flat_map(|block| &block.instructions)
++                    .find(|instruction| instruction.result_id == Some(id))
++            })
++        };
++        match &self.0 {
++            Some(definitions) => {
++                let found = definitions.get(&id);
++                debug_assert_eq!(found, scan(), "stale definition of %{id}");
++                found
++            }
++            None => scan(),
++        }
++    }
++}
++
+ fn exact_raw_word_fact(
+     ctx: &Ctx,
+     types: &HashMap<Word, Instruction>,
+     buffer_types: &HashMap<Word, Word>,
++    definitions: &ChainDefinitions,
+     ptr: Word,
+ ) -> Option<(Word, u32)> {
+     let mut fact_ptr = ptr;
+@@ -1255,13 +1382,7 @@ fn exact_raw_word_fact(
+         }) {
+             return Some((fact.root, u32::try_from(fact.byte_offset).ok()?));
+         }
+-        let definition = ctx.module.functions.iter().find_map(|function| {
+-            function
+-                .blocks
+-                .iter()
+-                .flat_map(|block| &block.instructions)
+-                .find(|instruction| instruction.result_id == Some(fact_ptr))
+-        })?;
++        let definition = definitions.find(&ctx.module, fact_ptr)?;
+         if !matches!(
+             definition.class.opcode,
+             Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain | Op::CopyObject
+@@ -1944,3 +2065,59 @@ pub(in crate::passes) fn raw_byte_store_from_u32_at_const_offset(
+     ));
+     value_types.insert(old, uint);
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::spirv_module::{Block, Function};
++
++    fn copy(id: Word, source: Word) -> Instruction {
++        Instruction::new(
++            Op::CopyObject,
++            Some(1),
++            Some(id),
++            vec![Operand::IdRef(source)],
++        )
++    }
++
++    fn module_with(blocks: Vec<Vec<Instruction>>) -> Module {
++        let mut module = Module::new();
++        let mut function = Function::new();
++        function.blocks = blocks
++            .into_iter()
++            .map(|instructions| Block {
++                label: None,
++                instructions,
++            })
++            .collect();
++        module.functions.push(function);
++        module
++    }
++
++    #[test]
++    fn chain_definitions_follow_the_rewrites_and_answer_like_the_scan() {
++        let mut module = module_with(vec![vec![copy(10, 2)], vec![copy(11, 10)]]);
++        let mut definitions = ChainDefinitions::new(&module);
++        assert_eq!(definitions.find(&module, 11), Some(&copy(11, 10)));
++        assert_eq!(definitions.find(&module, 12), None);
++
++        let old = module.functions[0].blocks[1].instructions[0].clone();
++        let prefix = vec![copy(12, 2)];
++        let new = copy(13, 12);
++        definitions.splice(&old, &prefix, &new);
++        module.functions[0].blocks[1].instructions = vec![prefix[0].clone(), new.clone()];
++        assert_eq!(definitions.find(&module, 11), None);
++        assert_eq!(definitions.find(&module, 12), Some(&prefix[0]));
++        assert_eq!(definitions.find(&module, 13), Some(&new));
++    }
++
++    #[test]
++    fn chain_definitions_scan_once_an_id_is_defined_twice() {
++        let first = copy(10, 2);
++        let second = copy(10, 3);
++        let module = module_with(vec![vec![first.clone()], vec![second]]);
++        let definitions = ChainDefinitions::new(&module);
++        assert!(definitions.0.is_none());
++        assert_eq!(definitions.find(&module, 10), Some(&first));
++    }
++}
+diff --git a/src/passes/value_queries.rs b/src/passes/value_queries.rs
+index 7a16a1e..82d155e 100644
+--- a/src/passes/value_queries.rs
++++ b/src/passes/value_queries.rs
+@@ -65,6 +65,60 @@ pub(in crate::passes) fn value_result_type(ctx: &Ctx, v: Word) -> Option<Word> {
+     None
+ }
+ 
++/// What [`type_def_of`] finds for every id, gathered in one pass for a scan that leaves the globals
++/// alone. The first definition of an id wins, as in [`type_def_of`].
++pub(in crate::passes) struct GlobalDefs<'a>(HashMap<Word, &'a Instruction>);
++
++impl<'a> GlobalDefs<'a> {
++    pub(in crate::passes) fn new(ctx: &'a Ctx) -> Self {
++        let mut defs = HashMap::new();
++        for inst in ctx
++            .new_globals
++            .iter()
++            .chain(ctx.module.types_global_values.iter())
++        {
++            if let Some(id) = inst.result_id {
++                defs.entry(id).or_insert(inst);
++            }
++        }
++        Self(defs)
++    }
++
++    pub(in crate::passes) fn get(&self, ty: Word) -> Option<&'a Instruction> {
++        self.0.get(&ty).copied()
++    }
++}
++
++/// What [`value_result_type`] finds for every id, gathered in one pass for a scan that leaves the
++/// module alone. The first definition of an id wins, as in [`value_result_type`].
++pub(in crate::passes) struct ValueTypes(HashMap<Word, Option<Word>>);
++
++impl ValueTypes {
++    pub(in crate::passes) fn new(ctx: &Ctx) -> Self {
++        let mut types = HashMap::new();
++        let functions = ctx.module.functions.iter().flat_map(|f| {
++            f.parameters
++                .iter()
++                .chain(f.blocks.iter().flat_map(|block| block.instructions.iter()))
++        });
++        for inst in ctx
++            .new_globals
++            .iter()
++            .chain(ctx.module.types_global_values.iter())
++            .chain(functions)
++        {
++            if let Some(id) = inst.result_id {
++                types.entry(id).or_insert(inst.result_type);
++            }
++        }
++        Self(types)
++    }
++
++    pub(in crate::passes) fn get(&self, v: Word) -> Option<Word> {
++        self.0.get(&v).copied().flatten()
++    }
++}
++
+ /// True if `v` is an integer scalar or vector rather than a sampler or pointer.
+ pub(in crate::passes) fn value_is_int_or_intvec(ctx: &Ctx, v: Word) -> bool {
+     let Some(ty) = value_result_type(ctx, v) else {
+-- 
+2.43.0
+

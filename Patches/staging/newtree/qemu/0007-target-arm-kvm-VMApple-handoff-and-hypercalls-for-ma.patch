@@ -1,0 +1,265 @@
+From 4e83b2bdbf77cb8938c4ab380ec34712f0ff126c Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Sun, 8 Nov 2026 05:55:38 +0800
+Subject: [PATCH 07/14] target/arm/kvm: VMApple handoff and hypercalls for
+ macOS 14 to 26
+
+iBoot enters the kernel through a trampoline whose address depends on the
+build: QEMU_VMAPPLE_HANDOFF_PC names the candidates, and a pass without boot
+arguments, or through other code at the same address, is stepped over.
+
+The boot arguments are read physically, as iBoot no longer maps them one to
+one from macOS 14, which also moved to revision 3.
+
+arm64 ignores hypercall.ret, so CPU_INITIALIZE now answers 0 in x0: macOS 14
+spins until it does. From macOS 15 the kernel switches PAC keys per task with
+0xc1000003, which is acknowledged without effect, as EL0 and EL1 share keys.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ target/arm/kvm.c | 140 ++++++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 109 insertions(+), 31 deletions(-)
+
+diff --git a/target/arm/kvm.c b/target/arm/kvm.c
+index a3ab349163..49000a4c88 100644
+--- a/target/arm/kvm.c
++++ b/target/arm/kvm.c
+@@ -659,7 +659,7 @@ int kvm_arch_init(MachineState *ms, KVMState *s)
+     if (g_getenv("QEMU_VMAPPLE_PAC_DEFAULTS")) {
+         struct kvm_smccc_filter filter = {
+             .base = 0xc1000000,
+-            .nr_functions = 2,
++            .nr_functions = 16,
+             .action = KVM_SMCCC_FILTER_FWD_TO_USER,
+         };
+         struct kvm_device_attr attr = {
+@@ -1509,8 +1509,42 @@ static void kvm_arm_vm_state_change(void *opaque, bool running, RunState state)
+ #define VMAPPLE_GIC_SCAN_WINDOW      (128u * 1024u * 1024u)
+ 
+ static bool vmapple_handoff_armed;
+-static bool vmapple_handoff_stepped;
+ static bool vmapple_handoff_stepping;
++static uint64_t vmapple_handoff_stepping_pc;
++static uint64_t vmapple_handoff_pcs[4];
++static int vmapple_handoff_pc_count;
++
++/*
++ * iBoot enters the kernel through a trampoline, and where that runs depends on
++ * the iBoot build: a copy at 0xaca00000 up to macOS 15, in place in the image
++ * from 26. QEMU_VMAPPLE_HANDOFF_PC names them, comma-separated.
++ */
++static void vmapple_handoff_load_pcs(void)
++{
++    const char *list = g_getenv("QEMU_VMAPPLE_HANDOFF_PC");
++    g_auto(GStrv) items = list ? g_strsplit(list, ",", -1) : NULL;
++
++    vmapple_handoff_pc_count = 0;
++    for (int i = 0; items && items[i] && vmapple_handoff_pc_count < 4; i++) {
++        uint64_t pc = g_ascii_strtoull(items[i], NULL, 0);
++        if (pc) {
++            vmapple_handoff_pcs[vmapple_handoff_pc_count++] = pc;
++        }
++    }
++    if (vmapple_handoff_pc_count == 0) {
++        vmapple_handoff_pcs[vmapple_handoff_pc_count++] = VMAPPLE_HANDOFF_PC;
++    }
++}
++
++static bool vmapple_handoff_is_pc(uint64_t pc)
++{
++    for (int i = 0; i < vmapple_handoff_pc_count; i++) {
++        if (vmapple_handoff_pcs[i] == pc) {
++            return true;
++        }
++    }
++    return false;
++}
+ 
+ /* Declared in accel/kvm/kvm-cpus.h, which the arm target does not include. */
+ int kvm_insert_breakpoint(CPUState *cpu, int type, vaddr addr, vaddr len);
+@@ -1659,7 +1693,7 @@ static bool vmapple_patch_gic_store(uint64_t pbase)
+     return true;
+ }
+ 
+-static void vmapple_handoff_apply(CPUState *cs)
++static bool vmapple_handoff_apply(CPUState *cs)
+ {
+     ARMCPU *cpu = ARM_CPU(cs);
+     CPUARMState *env = &cpu->env;
+@@ -1678,24 +1712,33 @@ static void vmapple_handoff_apply(CPUState *cs)
+     if (!args) {
+         args = "-v serial=11 debug=0x14c";
+     }
+-    if (cpu_memory_rw_debug(cs, boot, boot_info, sizeof(boot_info), 0)) {
+-        return;
++    /*
++     * x1 is a physical address. Reading it through the vCPU's translation only
++     * works while iBoot maps it one to one, which stopped with macOS 14.
++     */
++    if (address_space_read(&address_space_memory, boot, MEMTXATTRS_UNSPECIFIED,
++                           boot_info, sizeof(boot_info)) != MEMTX_OK) {
++        return false;
+     }
+-    if (lduw_le_p(boot_info) != 2 || lduw_le_p(boot_info + 2) != 2) {
+-        return;
++    /* macOS 14 moved to revision 3, which only adds fields at the end. */
++    if (lduw_le_p(boot_info) < 2 || lduw_le_p(boot_info) > 3 ||
++        lduw_le_p(boot_info + 2) != 2) {
++        info_report("vmapple handoff: boot info revision %u version %u at 0x%" PRIx64,
++                    lduw_le_p(boot_info), lduw_le_p(boot_info + 2), boot);
++        return false;
+     }
+     vbase = ldq_le_p(boot_info + 8);
+     pbase = ldq_le_p(boot_info + 16);
+     tree_va = ldq_le_p(boot_info + 96);
+     tree_len = ldl_le_p(boot_info + 104);
+     if (tree_va < vbase || tree_len == 0 || tree_len > 4 * 1024 * 1024) {
+-        return;
++        return false;
+     }
+ 
+     memset(payload, 0, sizeof(payload));
+     g_strlcpy(payload, args, sizeof(payload));
+-    cpu_memory_rw_debug(cs, boot + VMAPPLE_HANDOFF_BOOTARGS_OFF, payload,
+-                        sizeof(payload), 1);
++    address_space_write(&address_space_memory, boot + VMAPPLE_HANDOFF_BOOTARGS_OFF,
++                        MEMTXATTRS_UNSPECIFIED, payload, sizeof(payload));
+ 
+     tree_pa = tree_va - vbase + pbase;
+     tree = g_malloc(tree_len);
+@@ -1715,6 +1758,7 @@ static void vmapple_handoff_apply(CPUState *cs)
+                 patched, freq);
+ 
+     vmapple_patch_gic_store(pbase);
++    return true;
+ }
+ 
+ static void vmapple_handoff_arm(CPUState *cs)
+@@ -1728,15 +1772,20 @@ static void vmapple_handoff_arm(CPUState *cs)
+     /* Breakpoint updates use run_on_cpu() for every vCPU, requiring the BQL. */
+     BQL_LOCK_GUARD();
+     vmapple_handoff_armed = true;
+-    err = kvm_insert_breakpoint(cs, GDB_BREAKPOINT_HW, VMAPPLE_HANDOFF_PC, 4);
+-    info_report("vmapple handoff: arm cpu=%d err=%d max_hw_bps=%d",
+-                cs->cpu_index, err, max_hw_bps);
++    vmapple_handoff_load_pcs();
++    for (int i = 0; i < vmapple_handoff_pc_count; i++) {
++        err = kvm_insert_breakpoint(cs, GDB_BREAKPOINT_HW, vmapple_handoff_pcs[i], 4);
++        info_report("vmapple handoff: arm cpu=%d pc=0x%" PRIx64 " err=%d max_hw_bps=%d",
++                    cs->cpu_index, vmapple_handoff_pcs[i], err, max_hw_bps);
++    }
+     kvm_update_guest_debug(cs, 0);
+ }
+ 
+ static void vmapple_handoff_disarm(CPUState *cs)
+ {
+-    kvm_remove_breakpoint(cs, GDB_BREAKPOINT_HW, VMAPPLE_HANDOFF_PC, 4);
++    for (int i = 0; i < vmapple_handoff_pc_count; i++) {
++        kvm_remove_breakpoint(cs, GDB_BREAKPOINT_HW, vmapple_handoff_pcs[i], 4);
++    }
+     kvm_update_guest_debug(cs, 0);
+ }
+ 
+@@ -1889,7 +1938,7 @@ static bool kvm_arm_handle_debug(ARMCPU *cpu,
+              */
+             vmapple_handoff_stepping = false;
+             cpu_single_step(cs, 0);
+-            kvm_insert_breakpoint(cs, GDB_BREAKPOINT_HW, VMAPPLE_HANDOFF_PC, 4);
++            kvm_insert_breakpoint(cs, GDB_BREAKPOINT_HW, vmapple_handoff_stepping_pc, 4);
+             kvm_update_guest_debug(cs, 0);
+             return false;
+         }
+@@ -1913,27 +1962,24 @@ static bool kvm_arm_handle_debug(ARMCPU *cpu,
+         break;
+     case EC_BREAKPOINT:
+         if (cs->cpu_index == 0 && g_getenv("QEMU_VMAPPLE_HANDOFF") &&
+-            env->pc == VMAPPLE_HANDOFF_PC) {
++            vmapple_handoff_is_pc(env->pc)) {
+             /* KVM exits lack the BQL required by cross-vCPU debug work. */
+             BQL_LOCK_GUARD();
+-            if (env->xregs[1] != 0) {
+-                vmapple_handoff_apply(cs);
++            info_report("vmapple handoff: pass at 0x%" PRIx64 " x0=0x%" PRIx64 " x1=0x%" PRIx64,
++                        env->pc, env->xregs[0], env->xregs[1]);
++            if (env->xregs[1] != 0 && vmapple_handoff_apply(cs)) {
+                 vmapple_handoff_disarm(cs);
+                 return false;
+             }
+-            if (!vmapple_handoff_stepped) {
+-                /*
+-                 * The firmware reaches the handoff entry once with x1 == 0
+-                 * before the real pass. Step over it and re-arm, matching the
+-                 * GDB handoff's ignore_count=1 without retrapping the same PC
+-                 * in KVM.
+-                 */
+-                vmapple_handoff_stepped = true;
+-                vmapple_handoff_stepping = true;
+-                kvm_remove_breakpoint(cs, GDB_BREAKPOINT_HW,
+-                                      VMAPPLE_HANDOFF_PC, 4);
+-                cpu_single_step(cs, SSTEP_ENABLE);
+-            }
++            /*
++             * Earlier stages leave through the same trampoline with x1 == 0,
++             * and another image may run other code at the same address. Step
++             * over the pass and re-arm, without retrapping the same PC in KVM.
++             */
++            vmapple_handoff_stepping = true;
++            vmapple_handoff_stepping_pc = env->pc;
++            kvm_remove_breakpoint(cs, GDB_BREAKPOINT_HW, env->pc, 4);
++            cpu_single_step(cs, SSTEP_ENABLE);
+             return false;
+         }
+         if (find_hw_breakpoint(cs, env->pc)) {
+@@ -2049,10 +2095,21 @@ int kvm_arch_handle_exit(CPUState *cs, struct kvm_run *run)
+     case KVM_EXIT_HYPERCALL:
+         if (g_getenv("QEMU_VMAPPLE_PAC_DEFAULTS") &&
+             run->hypercall.nr == 0xc1000000) {
++            uint64_t success = 0;
+             ret = vmapple_initialize_pac(cs);
+             if (ret) {
+                 return ret;
+             }
++            /*
++             * arm64 ignores hypercall.ret: the result is x0. macOS 14 and later
++             * spin on a non-zero x0 after CPU_INITIALIZE.
++             */
++            ret = kvm_set_one_reg(cs, KVM_REG_ARM64 | KVM_REG_SIZE_U64 |
++                                  KVM_REG_ARM_CORE |
++                                  KVM_REG_ARM_CORE_REG(regs.regs[0]), &success);
++            if (ret) {
++                return ret;
++            }
+             run->hypercall.ret = 0;
+         } else if (g_getenv("QEMU_VMAPPLE_PAC_DEFAULTS") &&
+             run->hypercall.nr == 0xc1000001) {
+@@ -2081,6 +2138,27 @@ int kvm_arch_handle_exit(CPUState *cs, struct kvm_run *run)
+                 warn_report("VMApple PAC_GET_DEFAULT_KEYS answered with research "
+                             "defaults; PAC key switching is not emulated");
+             }
++        } else if (g_getenv("QEMU_VMAPPLE_PAC_DEFAULTS") &&
++                   run->hypercall.nr >= 0xc1000002 &&
++                   run->hypercall.nr < 0xc1000010) {
++            /*
++             * From macOS 15 the kernel switches PAC keys per task with
++             * 0xc1000003, and spins until x0 is zero. EL0 and EL1 share one
++             * set of keys here anyway, so report success and keep them.
++             */
++            static unsigned int reported;
++            uint64_t success = 0;
++            ret = kvm_set_one_reg(cs, KVM_REG_ARM64 | KVM_REG_SIZE_U64 |
++                                  KVM_REG_ARM_CORE |
++                                  KVM_REG_ARM_CORE_REG(regs.regs[0]), &success);
++            if (ret) {
++                return ret;
++            }
++            run->hypercall.ret = 0;
++            if (reported++ < 4) {
++                warn_report("VMApple hypercall %#" PRIx64 " acknowledged without effect",
++                            (uint64_t)run->hypercall.nr);
++            }
+         } else {
+             qemu_log_mask(LOG_UNIMP, "unhandled Arm hypercall %#" PRIx64 "\n",
+                           (uint64_t)run->hypercall.nr);
+-- 
+2.43.0
+

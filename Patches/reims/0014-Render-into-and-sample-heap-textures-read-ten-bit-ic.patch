@@ -1,0 +1,415 @@
+From e6e291166a158ea3c2eca1fd8a3aa90341ca3838 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Sun, 8 Nov 2026 18:33:58 +0800
+Subject: [PATCH] Render into and sample heap textures; read ten-bit icons
+
+26 and 27 place Liquid Glass shapes, shadows and panel snapshots in heaps
+(type 8, opcode 0x15). A heap is host memory the guest never maps, so a
+heap texture has no bytes this device can read. Reims refused them as
+render targets (142 refusals on a 26.6.2 boot, 61 on 27.2) and could not
+sample them.
+
+A heap texture now renders into a persistent engine resident named by
+its own reference: a later pass loads from it, and a sampled bind of the
+texture binds the resident. With nothing rendered yet a LOAD starts
+undefined, as Metal allows. An abandoned chain has nothing to land for
+one. Compute still keeps its own heap residents; a compute-written heap
+texture is not yet visible to a draw.
+
+Buffer textures in RGB10A2 and BGR10A2 (26s and 27s panel icons) are
+narrowed to RGBA8 by the buffer-texture loader alone; everywhere else the
+shared converters keep declining them so the ten bits survive.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/reims-vgpu/src/model/state.rs          |  5 ++
+ crates/reims-vgpu/src/runtime/draw/mod.rs     | 87 ++++++++++++++++++-
+ .../src/runtime/draw/render_target.rs         | 64 ++++++++++++++
+ crates/reims-vgpu/src/runtime/draw/vulkan.rs  | 84 ++++++++++++++++++
+ 4 files changed, 238 insertions(+), 2 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/model/state.rs b/crates/reims-vgpu/src/model/state.rs
+index 0a1a58ad..5f8b9288 100644
+--- a/crates/reims-vgpu/src/model/state.rs
++++ b/crates/reims-vgpu/src/model/state.rs
+@@ -2563,6 +2563,10 @@ pub struct DeviceState {
+     /// serial drain worker (dock-hover freeze). Keyed by (mapping_id, w, h).
+     /// Byte-bounded LRU ([`GUEST_LINEAR_MEMO_BYTE_CAP`]).
+     pub type11_memo: LruBytesMemo<(u32, u32, u32), GuestLinearMemo>,
++    /// `(task, attachment ref)` of every heap-placed texture a pass has
++    /// rendered into, naming the heap texture's own ref. Such a texture has no
++    /// guest storage this device can reach; it lives in an engine resident.
++    pub heap_texture_targets: std::collections::HashMap<(u32, u32), u32>,
+     /// Reusable native BGRA read buffer for the type-11 memo re-read.
+     pub type11_memo_scratch: Vec<u8>,
+     /// Last guest-visible generation produced by a compute storage-image
+@@ -2820,6 +2824,7 @@ impl DeviceState {
+             guest_linear_scratch: Vec::new(),
+             type5_view_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
+             type11_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
++            heap_texture_targets: std::collections::HashMap::new(),
+             type11_memo_scratch: Vec::new(),
+             gva_host_views: Vec::new(),
+             view_stale_reads: 0,
+diff --git a/crates/reims-vgpu/src/runtime/draw/mod.rs b/crates/reims-vgpu/src/runtime/draw/mod.rs
+index 808446d3..0b3e499c 100644
+--- a/crates/reims-vgpu/src/runtime/draw/mod.rs
++++ b/crates/reims-vgpu/src/runtime/draw/mod.rs
+@@ -63,6 +63,9 @@ use crate::runtime::decode::resource::{
+     OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT, OBJECT_TYPE_TEXTURE_VIEW, OBJECT_TYPE_TYPE7,
+     TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
+ };
++use crate::runtime::decode::resource::{
++    decode_heap_texture, HEAP_TEXTURE_OPCODE, HEAP_TEXTURE_WIDE_OPCODE,
++};
+ use crate::runtime::gva_mem;
+ use crate::runtime::host::{HostMemory, HostOps};
+ use crate::runtime::mapper;
+@@ -1666,6 +1669,44 @@ fn load_buffer_bytes<M: HostMemory + HostOps>(
+     read_buffer_bytes_resolved(state, host, task_id, buffer_ref, &backing, offset, None)
+ }
+ 
++/// A texture placed in a heap (type 8, opcode 0x15 or 0x38).
++///
++/// Heaps are host memory the guest never maps, so such a texture has no bytes
++/// this device can read: it lives only in an engine resident, rendered into and
++/// sampled by passes (see `vulkan::heap_target_identity`).
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct HeapTexture {
++    pub width: u32,
++    pub height: u32,
++    pub format: u16,
++    pub sample_count: u32,
++    pub texture_type: u8,
++    pub mipmap_level_count: u16,
++}
++
++/// The heap texture a type-8 descriptor creates, or `None` for any other record.
++pub(crate) fn heap_texture_of(desc: &[u8]) -> Option<HeapTexture> {
++    let opcode = texture_type8_opcode(desc)?;
++    if opcode != HEAP_TEXTURE_OPCODE && opcode != HEAP_TEXTURE_WIDE_OPCODE {
++        return None;
++    }
++    let record = decode_heap_texture(desc).ok()?;
++    let body = if record.wide {
++        crate::runtime::heap_query::decode_wide_serialized_texture_descriptor(record.descriptor)
++    } else {
++        crate::runtime::heap_query::decode_serialized_texture_descriptor(record.descriptor)
++    }
++    .ok()?;
++    Some(HeapTexture {
++        width: body.width,
++        height: body.height,
++        format: body.pixel_format,
++        sample_count: u32::from(body.sample_count.max(1)),
++        texture_type: body.texture_type,
++        mipmap_level_count: body.mipmap_level_count,
++    })
++}
++
+ /// If `texture_ref` is a type-8 object whose descriptor is a buffer-backed
+ /// texture (view_opcode 9, `newTextureWithDescriptor:offset:bytesPerRow:`, or
+ /// its `TextureDescriptor2` form), return its decoded descriptor. `None` for a
+@@ -1822,7 +1863,9 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
+     for y in 0..h as usize {
+         let src = &raw[y * bpr..y * bpr + tight];
+         let dst = &mut rgba[y * dst_row..(y + 1) * dst_row];
+-        if !pixel_format::convert_row_to_rgba8(fmt, src, w, dst) {
++        if !pixel_format::convert_row_to_rgba8(fmt, src, w, dst)
++            && !ten_bit_row_to_rgba8(fmt, src, dst)
++        {
+             crate::observe::fail(format!(
+                 "buftex convert_fail ref={texture_ref} buf={} fmt={fmt:#x} row={y} {w}x{h}",
+                 bt.buffer_ref
+@@ -1833,6 +1876,28 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
+     Some((w, h, rgba))
+ }
+ 
++/// One row of RGB10A2 or BGR10A2 texels narrowed to RGBA8, for the buffer-texture
++/// loader alone. 26 and 27 draw their Setup Assistant icons from buffer textures
++/// in these formats; the shared converters decline them on purpose, because
++/// everywhere else the ten bits are kept by sampling the format natively.
++fn ten_bit_row_to_rgba8(format: u16, src: &[u8], dst: &mut [u8]) -> bool {
++    use crate::contract::pixel_format::{MTL_FORMAT_BGR10A2_UNORM, MTL_FORMAT_RGB10A2_UNORM};
++    if format != MTL_FORMAT_RGB10A2_UNORM && format != MTL_FORMAT_BGR10A2_UNORM {
++        return false;
++    }
++    for (texel, out) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
++        let word = u32::from_le_bytes([texel[0], texel[1], texel[2], texel[3]]);
++        let (low, high) = ((word >> 2) as u8, (word >> 22) as u8);
++        let (r, b) = if format == MTL_FORMAT_RGB10A2_UNORM {
++            (low, high)
++        } else {
++            (high, low)
++        };
++        out.copy_from_slice(&[r, (word >> 12) as u8, b, ((word >> 30) as u8) * 85]);
++    }
++    true
++}
++
+ fn index_elem_size(index_type: u32) -> Option<usize> {
+     match index_type {
+         0 => Some(2), // MTLIndexTypeUInt16
+@@ -4363,6 +4428,10 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
+             }
+         };
+     }
++    if mapping_id == 0 && state.heap_texture_targets.contains_key(&(task_id, att.texture_ref)) {
++        // A heap texture's frame is its resident; there is nothing to land.
++        return true;
++    }
+     if mapping_id == 0 {
+         return lost("no_mapping_and_no_gva");
+     }
+@@ -4634,7 +4703,21 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
+         let mut load_action = att.load_action;
+         let mut clear_color = att.clear_color;
+         let mut seed = None;
+-        if memoryless {
++        let heap = mapping_id == 0
++            && gva == 0
++            && !memoryless
++            && state.heap_texture_targets.contains_key(&(task_id, target_ref));
++        if heap {
++            // A heap texture's content lives in its engine resident. Colour0's
++            // LOAD is honoured from there by `encode_draw_chain`; a secondary
++            // has no way to load one, so it starts undefined.
++            if let Some(cl) = clears.iter().find(|a| a.texture_ref == att.texture_ref) {
++                load_action = MTL_LOAD_ACTION_CLEAR;
++                clear_color = cl.clear_color;
++            } else if load_action == MTL_LOAD_ACTION_LOAD && !colors.is_empty() {
++                load_action = MTL_LOAD_ACTION_DONT_CARE;
++            }
++        } else if memoryless {
+             // Nothing to seed from: a memoryless attachment starts cleared or
+             // undefined, and Metal refuses a LOAD on one.
+             if let Some(cl) = clears.iter().find(|a| a.texture_ref == att.texture_ref) {
+diff --git a/crates/reims-vgpu/src/runtime/draw/render_target.rs b/crates/reims-vgpu/src/runtime/draw/render_target.rs
+index ce68b7d9..e514d4d4 100644
+--- a/crates/reims-vgpu/src/runtime/draw/render_target.rs
++++ b/crates/reims-vgpu/src/runtime/draw/render_target.rs
+@@ -478,6 +478,10 @@ pub(super) enum RenderTargetCause {
+     MemorylessDescDecode { len: usize },
+     /// The memoryless texture's format is not one Metal can render into.
+     MemorylessFormat { fmt: u16 },
++    /// A heap texture this device renders only at level 0 of a 2D texture.
++    HeapShape { level: u32, texture_type: u8 },
++    /// The heap texture's format is not one Metal can render into.
++    HeapFormat { fmt: u16 },
+     /// A mip>0 view of a buffer-backed texture, which has one level.
+     BufferTextureMipView { level: u32 },
+     /// The buffer-backed texture's format is not one Metal can render into.
+@@ -574,6 +578,8 @@ impl crate::observe::Decline for RenderTargetRefusal {
+             C::MemorylessDescRead => "rt_memoryless_desc_read",
+             C::MemorylessDescDecode { .. } => "rt_memoryless_desc_decode",
+             C::MemorylessFormat { .. } => "rt_memoryless_format",
++            C::HeapShape { .. } => "rt_heap_shape",
++            C::HeapFormat { .. } => "rt_heap_format",
+             C::BufferTextureMipView { .. } => "rt_buffer_texture_mip_view",
+             C::BufferTextureFormat { .. } => "rt_buffer_texture_format",
+             C::BufferTextureBacking { .. } => "rt_buffer_texture_backing",
+@@ -680,6 +686,14 @@ impl crate::observe::Decline for RenderTargetRefusal {
+                 v.push(("dims", format!("{width}x{height}")));
+                 v.push(("bpr", row_stride.to_string()));
+             }
++            C::HeapShape {
++                level,
++                texture_type,
++            } => {
++                v.push(("level", level.to_string()));
++                v.push(("type", texture_type.to_string()));
++            }
++            C::HeapFormat { fmt } => v.push(("fmt", format!("{fmt:#x}"))),
+             C::BufferTextureMipView { level } => v.push(("level", level.to_string())),
+             C::BufferTextureBacking { buffer_ref } => v.push(("buf", buffer_ref.to_string())),
+             C::BufferTextureSpan { end, size } => {
+@@ -842,6 +856,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
+     //    descriptor, not prefer the latch. Preferring latch routed dual-mid
+     //    full-screen desktop composites onto only one mid (mid=3 nz=6M vs
+     //    mid=4 stuck logo nz=1.97M; damage rects then preserved logo via Load).
++    state.heap_texture_targets.remove(&(task_id, texture_ref));
+     let live = objects::lookup_list_entry(state, host, task_id, resolved_ref);
+     let live_type = live.as_ref().map(|e| e.object_type);
+     if let Some(ot) = live_type {
+@@ -1050,6 +1065,55 @@ fn resolve_render_target<M: HostMemory + HostOps>(
+             memoryless: true,
+         });
+     }
++    // Type-8 heap texture: no guest storage at all, so it renders into an engine
++    // resident that later passes load from and sample. 26 and 27 place their
++    // Liquid Glass shapes and shadows in heaps.
++    if entry.object_type == OBJECT_TYPE_TEXTURE_VIEW {
++        if let Some(heap) = objects::read_descriptor(state, host, task_id, &entry)
++            .as_deref()
++            .and_then(super::heap_texture_of)
++        {
++            if level != 0 || heap.texture_type != 2 {
++                return Err(C::HeapShape {
++                    level,
++                    texture_type: heap.texture_type,
++                }
++                .at(resolved_ref));
++            }
++            let fmt = effective_view_sample_format(heap.format, view_fmt_override)
++                .unwrap_or(heap.format);
++            if pixel_format::render_target_bpp(fmt).is_none() {
++                return Err(C::HeapFormat { fmt }.at(resolved_ref));
++            }
++            if heap.width == 0 || heap.height == 0 {
++                return Err(C::ZeroExtent {
++                    width: heap.width,
++                    height: heap.height,
++                }
++                .at(resolved_ref));
++            }
++            let row_stride = pixel_format::tight_row_bytes(heap.width, fmt).ok_or(
++                C::LinearTightRow {
++                    width: heap.width,
++                    fmt,
++                }
++                .at(resolved_ref),
++            )?;
++            state
++                .heap_texture_targets
++                .insert((task_id, texture_ref), resolved_ref);
++            return Ok(ResolvedRenderTarget {
++                mapping_id: 0,
++                target_gva: 0,
++                width: heap.width,
++                height: heap.height,
++                row_stride,
++                format: fmt,
++                sample_count: heap.sample_count,
++                memoryless: false,
++            });
++        }
++    }
+     // Type-8 buffer-backed texture: rows of a type-1 buffer from an offset, so a
+     // linear GVA target at the buffer's address. macOS 27's Setup Assistant
+     // renders its panels into these.
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index 05450df1..3a512f09 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -87,6 +87,19 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
+     // ever reaches the pipeline scissor rect, never the Store extent.
+     _force_full_store: bool,
+ ) -> (EncodeStatus, Option<Vec<u8>>) {
++    // A heap texture has no guest pages to write back, and its LOAD is the
++    // content its resident already holds; with none yet it starts undefined.
++    let heap_primary = heap_primary_identity(state, req);
++    let writeback_guest = writeback_guest && heap_primary.is_none();
++    if let Some(identity) = heap_primary.as_ref() {
++        if req.colors[0].load_action == crate::contract::pass_action::MTL_LOAD_ACTION_LOAD {
++            if crate::backend::vulkan::engine::resident_content_ready(identity) {
++                req.chain_from_resident = true;
++            } else {
++                req.colors[0].load_action = MTL_LOAD_ACTION_DONT_CARE;
++            }
++        }
++    }
+     // Charges this chain to one phase at a time all the way down, including the
+     // parts of it that live inside `try_metal2vulkan_draw`. Held here rather
+     // than there because the Store routing below the engine is on the same
+@@ -1144,6 +1157,34 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
+         ));
+     }
+ 
++    // A heap texture is sampled from the resident a pass rendered it into; one
++    // nothing has rendered yet has no content anywhere this device can reach.
++    if let Some(heap) = resource
++        .as_deref()
++        .map(|resource| (resource.entry.object_type, resource.descriptor.clone()))
++        .or_else(|| {
++            objects::resolve_resource(state, host, task_id, texture_ref)
++                .ok()
++                .map(|resource| (resource.entry.object_type, resource.descriptor.clone()))
++        })
++        .filter(|(object_type, _)| *object_type == OBJECT_TYPE_TEXTURE_VIEW)
++        .and_then(|(_, desc)| heap_texture_of(&desc))
++    {
++        let identity = heap_target_identity(texture_ref, heap.width, heap.height);
++        if !crate::backend::vulkan::engine::resident_content_ready(&identity) {
++            crate::runtime::drain::note_store_route("heap_sample_unrendered");
++            return None;
++        }
++        let format = translate::pixel::translate(heap.format).ok()?.vk;
++        crate::runtime::drain::note_store_route("heap_sample_resident");
++        return Some((
++            heap.width,
++            heap.height,
++            0,
++            SampledSourceRequest::Target(identity, format),
++        ));
++    }
++
+     // The object list names exactly ONE surface for a sampled ref. Which one is
+     // decided by the entry's `object_type`, and the cases below are distinct
+     // values of that single u8 field, so they cannot both apply:
+@@ -6305,6 +6346,11 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
+                 c.width,
+                 c.height,
+             )
++        } else if let Some(&base) = (c.mapping_id == 0 && !c.memoryless)
++            .then(|| state.heap_texture_targets.get(&(task_id, c.texture_ref)))
++            .flatten()
++        {
++            heap_target_identity(base, c.width, c.height)
+         } else if c.memoryless {
+             // No guest destination to follow, so the texture ref names it, as
+             // it names a depth attachment. Its content never outlives the pass.
+@@ -9079,6 +9125,41 @@ pub(super) fn depth_chain_identity(
+     })
+ }
+ 
++/// Generation of every heap texture's resident. Memoryless attachments take 0
++/// at the same reference namespace, and the two must never share a resident.
++pub(crate) const HEAP_TARGET_GENERATION: u64 = 1;
++
++/// The engine resident a heap-placed texture lives in, named by the heap
++/// texture's own reference. It persists across passes, unlike a memoryless
++/// attachment's, because a heap texture is a real texture the guest renders
++/// into once and samples later.
++pub(crate) fn heap_target_identity(
++    texture_ref: u32,
++    width: u32,
++    height: u32,
++) -> crate::backend::vulkan::engine::TargetIdentity {
++    crate::backend::vulkan::engine::TargetIdentity::Texture {
++        ref_: texture_ref,
++        width,
++        height,
++        generation: HEAP_TARGET_GENERATION,
++        stencil: false,
++    }
++}
++
++/// Colour0's heap resident, when colour0 is a heap texture.
++fn heap_primary_identity(
++    state: &DeviceState,
++    req: &DrawEncodeRequest,
++) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
++    let c0 = req.colors.first()?;
++    if c0.mapping_id != 0 || c0.target_gva != 0 || c0.memoryless {
++        return None;
++    }
++    let base = *state.heap_texture_targets.get(&(req.task_id, c0.texture_ref))?;
++    Some(heap_target_identity(base, c0.width, c0.height))
++}
++
+ pub(crate) fn render_chain_identity(
+     state: &DeviceState,
+     req: &DrawEncodeRequest,
+@@ -9088,6 +9169,9 @@ pub(crate) fn render_chain_identity(
+     if width == 0 || height == 0 {
+         return None;
+     }
++    if let Some(identity) = heap_primary_identity(state, req) {
++        return Some(identity);
++    }
+     if c0.mapping_id != 0 {
+         return Some(crate::runtime::present_identity::surface_identity(
+             state,
+-- 
+2.43.0
+

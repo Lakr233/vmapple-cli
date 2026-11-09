@@ -1,0 +1,136 @@
+From dbe0fcdbc0ae9bc1e5693b590c7d531b7102499a Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Sun, 8 Nov 2026 16:38:45 +0800
+Subject: [PATCH 13/13] Render into buffer-backed textures
+
+27.2's Setup Assistant renders its panels into textures made over a
+buffer (type 8, opcode 9). Reims refused them as render targets. Such a
+texture is rows of a type-1 buffer from an offset, so it now resolves as a
+linear GVA target at the buffer's address, bounded by the buffer's size.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/runtime/draw/render_target.rs         | 85 ++++++++++++++++++-
+ 1 file changed, 83 insertions(+), 2 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/draw/render_target.rs b/crates/reims-vgpu/src/runtime/draw/render_target.rs
+index 0b1fa0c9..ce68b7d9 100644
+--- a/crates/reims-vgpu/src/runtime/draw/render_target.rs
++++ b/crates/reims-vgpu/src/runtime/draw/render_target.rs
+@@ -478,6 +478,14 @@ pub(super) enum RenderTargetCause {
+     MemorylessDescDecode { len: usize },
+     /// The memoryless texture's format is not one Metal can render into.
+     MemorylessFormat { fmt: u16 },
++    /// A mip>0 view of a buffer-backed texture, which has one level.
++    BufferTextureMipView { level: u32 },
++    /// The buffer-backed texture's format is not one Metal can render into.
++    BufferTextureFormat { fmt: u16 },
++    /// The buffer under a buffer-backed texture could not be resolved.
++    BufferTextureBacking { buffer_ref: u32 },
++    /// The texture's rows run past the end of its buffer.
++    BufferTextureSpan { end: u64, size: u64 },
+     /// The texture entry's descriptor bytes could not be read.
+     LinearDescRead,
+     /// The bytes were read and are not a texture descriptor. Carries the
+@@ -566,6 +574,10 @@ impl crate::observe::Decline for RenderTargetRefusal {
+             C::MemorylessDescRead => "rt_memoryless_desc_read",
+             C::MemorylessDescDecode { .. } => "rt_memoryless_desc_decode",
+             C::MemorylessFormat { .. } => "rt_memoryless_format",
++            C::BufferTextureMipView { .. } => "rt_buffer_texture_mip_view",
++            C::BufferTextureFormat { .. } => "rt_buffer_texture_format",
++            C::BufferTextureBacking { .. } => "rt_buffer_texture_backing",
++            C::BufferTextureSpan { .. } => "rt_buffer_texture_span",
+             C::LinearDescRead => crate::observe::ladder_slug!("rt_linear", desc_read),
+             C::LinearDescDecode { .. } => crate::observe::ladder_slug!("rt_linear", desc_decode),
+             C::LinearDescIncomplete { .. } => "rt_linear_desc_incomplete",
+@@ -668,9 +680,15 @@ impl crate::observe::Decline for RenderTargetRefusal {
+                 v.push(("dims", format!("{width}x{height}")));
+                 v.push(("bpr", row_stride.to_string()));
+             }
+-            C::LinearFormat { fmt } | C::MemorylessFormat { fmt } => {
+-                v.push(("fmt", format!("{fmt:#x}")))
++            C::BufferTextureMipView { level } => v.push(("level", level.to_string())),
++            C::BufferTextureBacking { buffer_ref } => v.push(("buf", buffer_ref.to_string())),
++            C::BufferTextureSpan { end, size } => {
++                v.push(("end", end.to_string()));
++                v.push(("size", size.to_string()));
+             }
++            C::LinearFormat { fmt }
++            | C::MemorylessFormat { fmt }
++            | C::BufferTextureFormat { fmt } => v.push(("fmt", format!("{fmt:#x}"))),
+             C::LinearLevelStride { row_stride } => v.push(("bpr", row_stride.to_string())),
+             C::LinearLevelSpan { row_stride, height } => {
+                 v.push(("bpr", row_stride.to_string()));
+@@ -1032,6 +1050,69 @@ fn resolve_render_target<M: HostMemory + HostOps>(
+             memoryless: true,
+         });
+     }
++    // Type-8 buffer-backed texture: rows of a type-1 buffer from an offset, so a
++    // linear GVA target at the buffer's address. macOS 27's Setup Assistant
++    // renders its panels into these.
++    if entry.object_type == OBJECT_TYPE_TEXTURE_VIEW {
++        if let Some(bt) = super::buffer_texture_descriptor(state, host, task_id, resolved_ref, None)
++        {
++            if level != 0 {
++                return Err(C::BufferTextureMipView { level }.at(resolved_ref));
++            }
++            let base_fmt = if bt.desc.pixel_format != 0 {
++                bt.desc.pixel_format
++            } else {
++                MTL_FORMAT_BGRA8_UNORM
++            };
++            let fmt = effective_view_sample_format(base_fmt, view_fmt_override).unwrap_or(base_fmt);
++            if pixel_format::render_target_bpp(fmt).is_none() {
++                return Err(C::BufferTextureFormat { fmt }.at(resolved_ref));
++            }
++            let (width, height) = (bt.desc.width, bt.desc.height);
++            if width == 0 || height == 0 {
++                return Err(C::ZeroExtent { width, height }.at(resolved_ref));
++            }
++            let tight = pixel_format::tight_row_bytes(width, fmt)
++                .ok_or(C::LinearTightRow { width, fmt }.at(resolved_ref))?;
++            let bpr = if bt.bytes_per_row == 0 {
++                u64::from(tight)
++            } else {
++                bt.bytes_per_row
++            };
++            if bpr < u64::from(tight) || bpr > u64::from(u32::MAX) {
++                return Err(C::RowStride {
++                    bpr: bpr.min(u64::from(u32::MAX)) as u32,
++                    tight,
++                }
++                .at(resolved_ref));
++            }
++            let (gva, size) = objects::resolve_buffer_span(state, host, task_id, bt.buffer_ref)
++                .map_err(|_| {
++                    C::BufferTextureBacking {
++                        buffer_ref: bt.buffer_ref,
++                    }
++                    .at(resolved_ref)
++                })?;
++            let end = bpr
++                .checked_mul(u64::from(height - 1))
++                .and_then(|n| n.checked_add(u64::from(tight)))
++                .and_then(|n| n.checked_add(bt.offset))
++                .unwrap_or(u64::MAX);
++            if end > size {
++                return Err(C::BufferTextureSpan { end, size }.at(resolved_ref));
++            }
++            return Ok(ResolvedRenderTarget {
++                mapping_id: 0,
++                target_gva: gva + bt.offset,
++                width,
++                height,
++                row_stride: bpr as u32,
++                format: fmt,
++                sample_count: 1,
++                memoryless: false,
++            });
++        }
++    }
+     // type-2/3 linear GVA (wallpaper/background layers, UI intermediate RTs).
+     if entry.object_type != OBJECT_TYPE_TEXTURE && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
+     {
+-- 
+2.43.0
+

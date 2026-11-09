@@ -1,0 +1,92 @@
+From 18975e650ac234c5281f5279329eab112b397a43 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Sun, 8 Nov 2026 11:05:27 +0800
+Subject: [PATCH] hw/vmapple/bdif: Write through the backdoor
+
+27.2's iBSS writes 512 bytes to the aux disk at 16 MiB, and its iBEC writes
+NVRAM at 10 MiB, through the backdoor interface. Writes were answered
+with a failure status, which iBSS reports as 0x40200102 and then panics
+on a pointer its error path has not set up yet (70b7ca7d373f8bb:144).
+
+Take write permission on both drives and write the DMA payload. Unknown
+data flags are logged as unimplemented.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/vmapple/bdif.c       | 31 ++++++++++++++++++++++++++++++-
+ hw/vmapple/trace-events |  1 +
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/hw/vmapple/bdif.c b/hw/vmapple/bdif.c
+index 4dc10c151d..c1494df413 100644
+--- a/hw/vmapple/bdif.c
++++ b/hw/vmapple/bdif.c
+@@ -189,9 +189,22 @@ static void vblk_cmd(uint64_t devid, BlockBackend *blk, uint64_t gp_addr,
+         }
+         break;
+     case VBLK_DATA_FLAGS_WRITE:
+-        /* Not needed, iBoot only reads */
++        dma_result = dma_memory_read(&address_space_memory, req.data.addr, buf,
++                                     req.data.len, MEMTXATTRS_UNSPECIFIED);
++        if (dma_result != MEMTX_OK) {
++            goto out;
++        }
++        r = blk_pwrite(blk, off, req.data.len, buf, 0);
++        trace_bdif_vblk_write(devid == DEVID_AUX ? "aux" : "root",
++                              req.data.addr, off, req.data.len, r);
++        if (r < 0) {
++            goto out;
++        }
++        ret = VBLK_RET_SUCCESS;
+         break;
+     default:
++        qemu_log_mask(LOG_UNIMP, "%s: unknown data flags 0x%" PRIx32 "\n",
++                      __func__, req.data.flags);
+         break;
+     }
+ 
+@@ -245,6 +258,21 @@ static void bdif_init(Object *obj)
+     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
+ }
+ 
++static void bdif_realize(DeviceState *dev, Error **errp)
++{
++    VMAppleBdifState *s = VMAPPLE_BDIF(dev);
++    BlockBackend *blks[] = { s->aux, s->root };
++
++    /* iBoot from macOS 27 writes through the backdoor as well as reading. */
++    for (size_t i = 0; i < ARRAY_SIZE(blks); i++) {
++        if (blks[i] &&
++            blk_set_perm(blks[i], BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE,
++                         BLK_PERM_ALL, errp) < 0) {
++            return;
++        }
++    }
++}
++
+ static const Property bdif_properties[] = {
+     DEFINE_PROP_DRIVE("aux", VMAppleBdifState, aux),
+     DEFINE_PROP_DRIVE("root", VMAppleBdifState, root),
+@@ -255,6 +283,7 @@ static void bdif_class_init(ObjectClass *klass, const void *data)
+     DeviceClass *dc = DEVICE_CLASS(klass);
+ 
+     dc->desc = "VMApple Backdoor Interface";
++    dc->realize = bdif_realize;
+     device_class_set_props(dc, bdif_properties);
+ }
+ 
+diff --git a/hw/vmapple/trace-events b/hw/vmapple/trace-events
+index 41df2c18e0..0624439111 100644
+--- a/hw/vmapple/trace-events
++++ b/hw/vmapple/trace-events
+@@ -19,6 +19,7 @@ aes_dump_data(const char *desc, const char *hex) "%s%s"
+ bdif_read(uint64_t offset, uint32_t size, uint64_t value) "offset=0x%"PRIx64" size=0x%x value=0x%"PRIx64
+ bdif_write(uint64_t offset, uint32_t size, uint64_t value) "offset=0x%"PRIx64" size=0x%x value=0x%"PRIx64
+ bdif_vblk_read(const char *dev, uint64_t addr, uint64_t offset, uint32_t len, int r) "dev=%s addr=0x%"PRIx64" off=0x%"PRIx64" size=0x%x r=%d"
++bdif_vblk_write(const char *dev, uint64_t addr, uint64_t offset, uint32_t len, int r) "dev=%s addr=0x%"PRIx64" off=0x%"PRIx64" size=0x%x r=%d"
+ 
+ # vusb.c
+ vusb_read(uint64_t addr, unsigned size, uint64_t val) "0x%04" PRIx64 " size %u -> 0x%" PRIx64
+-- 
+2.43.0
+

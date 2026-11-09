@@ -1,0 +1,623 @@
+From 2fe2c5e9cf2f9e15edea357d86746073d978c486 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 04:06:33 +0800
+Subject: [PATCH 03/24] Time device lock holds per holder, and how long a vCPU
+ waited
+
+A vCPU that publishes on the IOSurface mapper ring blocks on the device
+lock for as long as the drain worker holds it, and a vCPU stopped in an
+MMIO exit answers no interrupt, including the kernel's cross-call to stop
+every CPU for its debugger; a guest panic "DebuggerXCallEnter ... synch
+pending on cpu N" is what that looks like. vcpu_lock_wait counts the
+waits; nothing named the holder that made them long.
+
+Every acquisition of the device lock now goes through a timed guard that
+names its holder: the drain tranche, device reset, the vCPU's mapper
+register reads and writes, the vCPU's direct GFX register reads and
+writes, the console scanout copy, the poll, the action pop, and the
+display readers. Each records its hold, after releasing the lock, into a
+log2 histogram per holder, and the vCPU's contended waits go into another.
+Once per ten seconds, if any hold or wait in that interval reached 50 ms,
+device_lock_hold logs count/max/p99 per holder and the vCPU wait max/p99;
+device_lock_hold_boot logs the boot's totals at reset or destroy.
+
+Cost: two clock reads and four relaxed atomic adds per acquisition.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 6c199b79278e9b80f33ea6d67a90eced44d82f20)
+---
+ .../reims-vgpu/src/device/display_surface.rs  |  13 +-
+ crates/reims-vgpu/src/device/lock_hold.rs     | 391 ++++++++++++++++++
+ crates/reims-vgpu/src/device/mod.rs           |  37 +-
+ 3 files changed, 421 insertions(+), 20 deletions(-)
+ create mode 100644 crates/reims-vgpu/src/device/lock_hold.rs
+
+diff --git a/crates/reims-vgpu/src/device/display_surface.rs b/crates/reims-vgpu/src/device/display_surface.rs
+index 2f91cab1..5e4cdb5e 100644
+--- a/crates/reims-vgpu/src/device/display_surface.rs
++++ b/crates/reims-vgpu/src/device/display_surface.rs
+@@ -13,6 +13,7 @@
+ //! `crate::runtime::draw::vulkan` gives and `window_publish` repeats: a chapter of the
+ //! root lifted out whole should not read as a redesign.
+ 
++use super::lock_hold::{try_hold, Held, Holder};
+ use super::*;
+ 
+ /// Which source owns the host console right now.
+@@ -77,7 +78,7 @@ pub fn device_console_feed(id: u64) -> Option<ConsoleFeed> {
+     // caller is a display tick, the early console is the pre-boundary source by
+     // definition, and the alternative — failing the call — makes the shim invent
+     // a policy for "no answer", which is the thing being removed.
+-    let Some(d) = slot.inner.try_lock() else {
++    let Some(d) = try_hold(&slot.inner, Holder::Display) else {
+         return Some(ConsoleFeed::Firmware);
+     };
+     Some(
+@@ -177,7 +178,7 @@ pub fn device_efi_console_copy(
+     let Some(slot) = device_slot(id) else {
+         return false;
+     };
+-    let Some(mut d) = slot.inner.try_lock() else {
++    let Some(mut d) = try_hold(&slot.inner, Holder::Display) else {
+         return false;
+     };
+     if d.device.state.gfx.efi_fb_start == 0 {
+@@ -214,9 +215,9 @@ pub fn device_scanout_copy(
+         // The worker observes `present_action_pending` before taking this lock
+         // and returns immediately. Blocking here is therefore bounded to that
+         // short handoff; pre-boundary periodic scanout remains nonblocking.
+-        slot.inner.lock()
++        Held::new(slot.inner.lock(), Holder::ScanoutCopy)
+     } else {
+-        let Some(d) = slot.inner.try_lock() else {
++        let Some(d) = try_hold(&slot.inner, Holder::ScanoutCopy) else {
+             return ScanoutCopyResult::Unchanged;
+         };
+         d
+@@ -308,7 +309,7 @@ pub struct CursorGlyphInfo {
+ 
+ pub fn device_cursor_glyph_info(id: u64) -> Option<CursorGlyphInfo> {
+     let slot = device_slot(id)?;
+-    let d = slot.inner.try_lock()?;
++    let d = try_hold(&slot.inner, Holder::Display)?;
+     let c = &d.device.state.cursor;
+     if !c.glyph_ready || c.pixels.is_empty() {
+         return None;
+@@ -325,7 +326,7 @@ pub fn device_cursor_glyph_info(id: u64) -> Option<CursorGlyphInfo> {
+ /// Copy QEMUCursor ARGB pixels. Returns number of pixels written.
+ pub fn device_cursor_glyph_copy(id: u64, out: &mut [u32]) -> Option<usize> {
+     let slot = device_slot(id)?;
+-    let d = slot.inner.try_lock()?;
++    let d = try_hold(&slot.inner, Holder::Display)?;
+     let c = &d.device.state.cursor;
+     if !c.glyph_ready || c.pixels.is_empty() {
+         return None;
+diff --git a/crates/reims-vgpu/src/device/lock_hold.rs b/crates/reims-vgpu/src/device/lock_hold.rs
+new file mode 100644
+index 00000000..89eddca5
+--- /dev/null
++++ b/crates/reims-vgpu/src/device/lock_hold.rs
+@@ -0,0 +1,391 @@
++//! How long each holder keeps the device lock, and how long a vCPU waited for
++//! it.
++//!
++//! # Why
++//!
++//! A vCPU that traps into this device on the mapper ring blocks on the device
++//! lock (`lock_device_for_vcpu`) for as long as the drain worker holds it, and
++//! a vCPU stopped in an MMIO exit answers no interrupt — including the guest
++//! kernel's cross-call to stop every CPU for its debugger. A panic reading
++//! `DebuggerXCallEnter … synch pending on cpu N` is what that looks like from
++//! the guest. `vcpu_lock_wait` already counts the waits once a second; this
++//! names the holder that made them long, with a distribution rather than a sum.
++//!
++//! # Cost
++//!
++//! Two clock reads and four relaxed atomic adds per acquisition. A line is
++//! written at most once per [`REPORT_INTERVAL_MS`], and only when some hold or
++//! wait in that interval reached [`REPORT_THRESHOLD_US`]; a boot summary is
++//! written at device reset.
++
++use std::sync::atomic::{AtomicU64, Ordering};
++
++/// Who took the device lock.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Holder {
++    /// The drain worker's tranche (`device_drain`).
++    Drain,
++    /// `device_reset`.
++    Reset,
++    /// A vCPU reading an IOSurface mapper register.
++    VcpuIosfcRead,
++    /// A vCPU writing one — the mapper ring publish, which drains synchronously.
++    VcpuIosfcWrite,
++    /// A vCPU reading a GFX register under the lock (`try_lock` only).
++    VcpuGfxRead,
++    /// A vCPU applying a GFX register write directly (`try_lock` only).
++    VcpuGfxWrite,
++    /// The host console copying a presented surface.
++    ScanoutCopy,
++    /// The 4 ms poll (`try_lock` only).
++    Poll,
++    /// The main loop taking a queued host action (`try_lock` only).
++    PopAction,
++    /// The console feed, EFI console and cursor readers (`try_lock` only).
++    Display,
++}
++
++const HOLDERS: usize = 10;
++
++impl Holder {
++    const ALL: [Holder; HOLDERS] = [
++        Holder::Drain,
++        Holder::Reset,
++        Holder::VcpuIosfcRead,
++        Holder::VcpuIosfcWrite,
++        Holder::VcpuGfxRead,
++        Holder::VcpuGfxWrite,
++        Holder::ScanoutCopy,
++        Holder::Poll,
++        Holder::PopAction,
++        Holder::Display,
++    ];
++
++    fn index(self) -> usize {
++        self as usize
++    }
++
++    fn name(self) -> &'static str {
++        match self {
++            Self::Drain => "drain",
++            Self::Reset => "reset",
++            Self::VcpuIosfcRead => "vcpu_iosfc_read",
++            Self::VcpuIosfcWrite => "vcpu_iosfc_write",
++            Self::VcpuGfxRead => "vcpu_gfx_read",
++            Self::VcpuGfxWrite => "vcpu_gfx_write",
++            Self::ScanoutCopy => "scanout_copy",
++            Self::Poll => "poll",
++            Self::PopAction => "pop_action",
++            Self::Display => "display",
++        }
++    }
++}
++
++/// A report is written at most this often.
++pub const REPORT_INTERVAL_MS: u64 = 10_000;
++/// ...and only when a hold or a wait in the interval reached this.
++pub const REPORT_THRESHOLD_US: u64 = 50_000;
++
++/// Log2 buckets of microseconds: bucket `i` holds `[2^i, 2^(i+1))`, bucket 0
++/// also holds 0. Thirty-two reach past an hour.
++const BUCKETS: usize = 32;
++
++fn bucket(us: u64) -> usize {
++    (63 - us.max(1).leading_zeros() as usize).min(BUCKETS - 1)
++}
++
++/// One distribution of durations.
++#[derive(Debug)]
++struct Durations {
++    count: AtomicU64,
++    max_us: AtomicU64,
++    buckets: [AtomicU64; BUCKETS],
++}
++
++impl Default for Durations {
++    fn default() -> Self {
++        Self {
++            count: AtomicU64::new(0),
++            max_us: AtomicU64::new(0),
++            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
++        }
++    }
++}
++
++/// What one distribution held when it was read.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct Summary {
++    pub count: u64,
++    pub max_us: u64,
++    /// The upper bound of the log2 bucket holding the 99th percentile.
++    pub p99_us: u64,
++}
++
++impl Durations {
++    fn note(&self, us: u64) {
++        self.count.fetch_add(1, Ordering::Relaxed);
++        self.max_us.fetch_max(us, Ordering::Relaxed);
++        self.buckets[bucket(us)].fetch_add(1, Ordering::Relaxed);
++    }
++
++    /// Read, and clear when `take`.
++    fn summary(&self, take: bool) -> Summary {
++        let read = |a: &AtomicU64| match take {
++            true => a.swap(0, Ordering::Relaxed),
++            false => a.load(Ordering::Relaxed),
++        };
++        let buckets: Vec<u64> = self.buckets.iter().map(read).collect();
++        let count = read(&self.count);
++        let max_us = read(&self.max_us);
++        let total: u64 = buckets.iter().sum();
++        let want = total - total / 100;
++        let mut seen = 0;
++        let mut p99_us = 0;
++        for (i, n) in buckets.iter().enumerate() {
++            seen += n;
++            if *n != 0 && seen >= want {
++                p99_us = (1u64 << (i + 1)).min(max_us.max(1));
++                break;
++            }
++        }
++        Summary {
++            count,
++            max_us,
++            p99_us,
++        }
++    }
++}
++
++/// Holds per holder, and vCPU waits, for the current report interval and for
++/// the boot.
++#[derive(Debug)]
++pub struct LockCensus {
++    interval: [Durations; HOLDERS],
++    boot: [Durations; HOLDERS],
++    vcpu_wait_interval: Durations,
++    vcpu_wait_boot: Durations,
++    last_report_ms: AtomicU64,
++}
++
++impl Default for LockCensus {
++    fn default() -> Self {
++        Self {
++            interval: std::array::from_fn(|_| Durations::default()),
++            boot: std::array::from_fn(|_| Durations::default()),
++            vcpu_wait_interval: Durations::default(),
++            vcpu_wait_boot: Durations::default(),
++            last_report_ms: AtomicU64::new(0),
++        }
++    }
++}
++
++impl LockCensus {
++    pub fn note_hold(&self, holder: Holder, us: u64) {
++        self.interval[holder.index()].note(us);
++        self.boot[holder.index()].note(us);
++    }
++
++    pub fn note_vcpu_wait(&self, us: u64) {
++        self.vcpu_wait_interval.note(us);
++        self.vcpu_wait_boot.note(us);
++    }
++
++    /// The interval's line, if an interval has passed and something in it
++    /// reached the threshold. The interval is cleared whenever it is claimed,
++    /// so a quiet interval does not carry into the next.
++    pub fn report(&self, now_ms: u64) -> Option<String> {
++        let last = self.last_report_ms.load(Ordering::Relaxed);
++        if now_ms.saturating_sub(last) < REPORT_INTERVAL_MS
++            || self
++                .last_report_ms
++                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
++                .is_err()
++        {
++            return None;
++        }
++        let holds: Vec<(Holder, Summary)> = Holder::ALL
++            .iter()
++            .map(|&h| (h, self.interval[h.index()].summary(true)))
++            .collect();
++        let wait = self.vcpu_wait_interval.summary(true);
++        let worst = holds.iter().map(|(_, s)| s.max_us).max().unwrap_or(0);
++        if worst.max(wait.max_us) < REPORT_THRESHOLD_US {
++            return None;
++        }
++        Some(format!(
++            "device_lock_hold win_ms={} vcpu_wait_max_us={} vcpu_wait_p99_us={} vcpu_waits={} {} \
++             (holds of the device lock this interval, per holder: count/max_us/p99_us; a vCPU \
++             waiting here answers no interrupt)",
++            now_ms.saturating_sub(last),
++            wait.max_us,
++            wait.p99_us,
++            wait.count,
++            render(&holds)
++        ))
++    }
++
++    /// The boot's line, and the boot's distributions cleared for the next.
++    pub fn boot_summary(&self) -> Option<String> {
++        let holds: Vec<(Holder, Summary)> = Holder::ALL
++            .iter()
++            .map(|&h| (h, self.boot[h.index()].summary(true)))
++            .collect();
++        let wait = self.vcpu_wait_boot.summary(true);
++        if wait.count == 0 && holds.iter().all(|(_, s)| s.count == 0) {
++            return None;
++        }
++        Some(format!(
++            "device_lock_hold_boot vcpu_wait_max_us={} vcpu_wait_p99_us={} vcpu_waits={} {}",
++            wait.max_us,
++            wait.p99_us,
++            wait.count,
++            render(&holds)
++        ))
++    }
++}
++
++fn render(holds: &[(Holder, Summary)]) -> String {
++    holds
++        .iter()
++        .filter(|(_, s)| s.count != 0)
++        .map(|(h, s)| format!("{}={}/{}/{}", h.name(), s.count, s.max_us, s.p99_us))
++        .collect::<Vec<_>>()
++        .join(" ")
++}
++
++pub static CENSUS: std::sync::LazyLock<LockCensus> = std::sync::LazyLock::new(LockCensus::default);
++
++/// The device lock, held by a named holder and timed until it is released.
++pub struct Held<'a, T> {
++    guard: Option<parking_lot::MutexGuard<'a, T>>,
++    holder: Holder,
++    since: std::time::Instant,
++    census: &'a LockCensus,
++}
++
++impl<'a, T> Held<'a, T> {
++    pub fn new(guard: parking_lot::MutexGuard<'a, T>, holder: Holder) -> Self {
++        Self::counted(guard, holder, &CENSUS)
++    }
++
++    fn counted(
++        guard: parking_lot::MutexGuard<'a, T>,
++        holder: Holder,
++        census: &'a LockCensus,
++    ) -> Self {
++        Self {
++            guard: Some(guard),
++            holder,
++            since: std::time::Instant::now(),
++            census,
++        }
++    }
++}
++
++/// Take the lock, or not, without waiting.
++pub fn try_hold<T>(mutex: &parking_lot::Mutex<T>, holder: Holder) -> Option<Held<'_, T>> {
++    mutex.try_lock().map(|guard| Held::new(guard, holder))
++}
++
++impl<T> std::ops::Deref for Held<'_, T> {
++    type Target = T;
++    fn deref(&self) -> &T {
++        self.guard.as_ref().expect("held until drop")
++    }
++}
++
++impl<T> std::ops::DerefMut for Held<'_, T> {
++    fn deref_mut(&mut self) -> &mut T {
++        self.guard.as_mut().expect("held until drop")
++    }
++}
++
++impl<T> Drop for Held<'_, T> {
++    fn drop(&mut self) {
++        let us = self.since.elapsed().as_micros() as u64;
++        // Released before anything is recorded or written, so the report is
++        // never part of the hold it describes.
++        drop(self.guard.take());
++        self.census.note_hold(self.holder, us);
++        if let Some(line) = self.census.report(crate::observe::elapsed_ms() as u64) {
++            crate::observe::off(line);
++        }
++    }
++}
++
++/// Write the boot's summary; called at device reset and destroy.
++pub fn report_boot() {
++    if let Some(line) = CENSUS.boot_summary() {
++        crate::observe::off(line);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_distribution_reports_its_max_and_a_bucketed_p99() {
++        let d = Durations::default();
++        for _ in 0..990 {
++            d.note(100);
++        }
++        for _ in 0..10 {
++            d.note(70_000);
++        }
++        let s = d.summary(false);
++        assert_eq!(s.count, 1000);
++        assert_eq!(s.max_us, 70_000);
++        assert_eq!(s.p99_us, 128, "the 99th percentile is in 100's bucket");
++        d.note(70_000);
++        assert_eq!(d.summary(false).p99_us, 70_000, "capped at the max");
++        assert_eq!(d.summary(true).count, 1001);
++        assert_eq!(d.summary(false), Summary::default(), "taking clears");
++    }
++
++    /// Quiet intervals write nothing; an interval with a long hold writes one
++    /// line, at most once per interval, naming the holder.
++    #[test]
++    fn a_line_is_written_only_for_a_long_hold_and_only_once_an_interval() {
++        let c = LockCensus::default();
++        c.note_hold(Holder::Drain, 1_000);
++        assert_eq!(c.report(REPORT_INTERVAL_MS), None, "nothing reached 50 ms");
++
++        c.note_hold(Holder::Drain, 120_000);
++        c.note_vcpu_wait(119_000);
++        assert_eq!(
++            c.report(REPORT_INTERVAL_MS + 5),
++            None,
++            "inside the interval"
++        );
++        let line = c
++            .report(2 * REPORT_INTERVAL_MS + 1)
++            .expect("a 120 ms hold is reported");
++        assert!(line.contains("drain=1/120000/120000"), "{line}");
++        assert!(line.contains("vcpu_wait_max_us=119000"), "{line}");
++        assert_eq!(c.report(4 * REPORT_INTERVAL_MS), None, "cleared");
++
++        let boot = c.boot_summary().expect("the boot saw holds");
++        assert!(boot.contains("drain=2/120000/"), "{boot}");
++        assert!(boot.contains("vcpu_waits=1"), "{boot}");
++        assert_eq!(c.boot_summary(), None, "cleared for the next boot");
++    }
++
++    #[test]
++    fn a_held_lock_is_timed_until_it_is_dropped() {
++        let c = LockCensus::default();
++        let m = parking_lot::Mutex::new(5u32);
++        {
++            let mut held = Held::counted(m.lock(), Holder::VcpuIosfcWrite, &c);
++            *held += 1;
++            std::thread::sleep(std::time::Duration::from_millis(2));
++        }
++        assert!(m.try_lock().is_some(), "released at drop");
++        // The boot distribution: a report on drop may already have taken the
++        // interval.
++        let s = c.boot[Holder::VcpuIosfcWrite.index()].summary(false);
++        assert_eq!(s.count, 1);
++        assert!(s.max_us >= 2_000, "{s:?}");
++        assert_eq!(*m.lock(), 6);
++    }
++}
+diff --git a/crates/reims-vgpu/src/device/mod.rs b/crates/reims-vgpu/src/device/mod.rs
+index d54c746b..a2b0dbaf 100644
+--- a/crates/reims-vgpu/src/device/mod.rs
++++ b/crates/reims-vgpu/src/device/mod.rs
+@@ -19,6 +19,10 @@
+ /// the two publish paths the drain and the poll call. Unconditional, because
+ /// the entry points keep a stub arm without the feature and the QEMU ABI
+ /// surface must be the same shape either way.
++/// How long each holder keeps the device lock, and how long a vCPU waited.
++pub(crate) mod lock_hold;
++use lock_hold::{try_hold, Held, Holder};
++
+ mod window_publish;
+ pub(crate) use window_publish::{
+     device_window_run_main, device_window_set_early_fb, device_window_start, device_window_stop,
+@@ -196,9 +200,9 @@ fn apply_gfx_write(inner: &mut DeviceInner, slot: &BoundDevice, write: QueuedGfx
+ /// Apply queued MMIO writes in publication order. Lock order is ingress then
+ /// inner everywhere; producers use `try_lock` for inner and therefore never
+ /// wait behind shader translation/GPU work.
+-fn lock_for_drain(slot: &BoundDevice) -> parking_lot::MutexGuard<'_, DeviceInner> {
++fn lock_for_drain(slot: &BoundDevice, holder: Holder) -> Held<'_, DeviceInner> {
+     let mut ingress = slot.gfx_ingress.lock();
+-    let mut inner = slot.inner.lock();
++    let mut inner = Held::new(slot.inner.lock(), holder);
+     while let Some(write) = ingress.pop_front() {
+         apply_gfx_write(&mut inner, slot, write);
+     }
+@@ -319,8 +323,10 @@ fn announce_stamp_interrupt(id: u64, index: u32) {
+ }
+ 
+ pub fn device_reset(id: u64) -> bool {
++    // The boot that is ending: its lock holds and vCPU waits, in one line.
++    lock_hold::report_boot();
+     if let Some(slot) = device_slot(id) {
+-        let mut d = lock_for_drain(&slot);
++        let mut d = lock_for_drain(&slot, Holder::Reset);
+         let seq = slot.reset_count.fetch_add(1, Ordering::Relaxed) + 1;
+         let state = &d.device.state;
+         let mappings = state.mappings.len();
+@@ -358,6 +364,7 @@ pub fn device_reset(id: u64) -> bool {
+ }
+ 
+ pub fn device_destroy(id: u64) -> bool {
++    lock_hold::report_boot();
+     DEVICES.lock().remove(&id).is_some()
+ }
+ 
+@@ -384,7 +391,7 @@ pub fn device_gfx_read(id: u64, offset: u64, size: u32) -> Option<u64> {
+             return Some(slot.intr_fault.load(Ordering::Acquire) as u64);
+         }
+     }
+-    if let Some(mut d) = slot.inner.try_lock() {
++    if let Some(mut d) = try_hold(&slot.inner, Holder::VcpuGfxRead) {
+         let value = d.device.gfx_read(offset, size);
+         slot.gfx_read_cache.lock().insert((offset, size), value);
+         slot.gfx_read_busy_logged.store(false, Ordering::Relaxed);
+@@ -459,7 +466,7 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
+     };
+     let mut ingress = slot.gfx_ingress.lock();
+     if ingress.is_empty() {
+-        if let Some(mut inner) = slot.inner.try_lock() {
++        if let Some(mut inner) = try_hold(&slot.inner, Holder::VcpuGfxWrite) {
+             apply_gfx_write(&mut inner, &slot, write);
+             return true;
+         }
+@@ -483,20 +490,22 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
+ ///
+ /// The uncontended path takes `try_lock` and never reads the clock, so a fast
+ /// access pays nothing for the instrument.
+-fn lock_device_for_vcpu(slot: &BoundDevice) -> impl std::ops::DerefMut<Target = DeviceInner> + '_ {
++fn lock_device_for_vcpu(slot: &BoundDevice, holder: Holder) -> Held<'_, DeviceInner> {
+     if let Some(guard) = slot.inner.try_lock() {
+         crate::runtime::drain::note_vcpu_lock_free();
+-        return guard;
++        return Held::new(guard, holder);
+     }
+     let waited = std::time::Instant::now();
+     let guard = slot.inner.lock();
+-    crate::runtime::drain::note_vcpu_lock_wait(waited.elapsed().as_micros() as u64);
+-    guard
++    let us = waited.elapsed().as_micros() as u64;
++    crate::runtime::drain::note_vcpu_lock_wait(us);
++    lock_hold::CENSUS.note_vcpu_wait(us);
++    Held::new(guard, holder)
+ }
+ 
+ pub fn device_iosfc_read(id: u64, offset: u64, size: u32) -> Option<u64> {
+     let slot = device_slot(id)?;
+-    let d = lock_device_for_vcpu(&slot);
++    let d = lock_device_for_vcpu(&slot, Holder::VcpuIosfcRead);
+     Some(d.device.iosfc_read(offset, size))
+ }
+ 
+@@ -504,7 +513,7 @@ pub fn device_iosfc_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
+     let Some(slot) = device_slot(id) else {
+         return false;
+     };
+-    let mut d = lock_device_for_vcpu(&slot);
++    let mut d = lock_device_for_vcpu(&slot, Holder::VcpuIosfcWrite);
+     if let Some(ops) = slot.ops {
+         let DeviceInner { device, actions } = &mut *d;
+         let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
+@@ -534,7 +543,7 @@ pub fn device_drain(id: u64) -> bool {
+         crate::runtime::drain::note_drain_exit(entry_us, true);
+         return true;
+     }
+-    let mut d = lock_for_drain(&slot);
++    let mut d = lock_for_drain(&slot, Holder::Drain);
+     crate::runtime::drain::note_drain_lock_wait(
+         crate::observe::elapsed_us().saturating_sub(entry_us),
+     );
+@@ -678,7 +687,7 @@ pub fn device_poll(id: u64) -> bool {
+     let Some(slot) = device_slot(id) else {
+         return false;
+     };
+-    let Some(mut d) = slot.inner.try_lock() else {
++    let Some(mut d) = try_hold(&slot.inner, Holder::Poll) else {
+         // Contended: the drain worker owns `inner` doing present/GPU-encode.
+         // The full poll below would early-return and drop the VBL — under load
+         // that starves the guest's only display time base (present-complete is
+@@ -803,7 +812,7 @@ pub fn device_pop_action(id: u64) -> Option<HostAction> {
+             return Some(a);
+         }
+     }
+-    let mut d = slot.inner.try_lock()?;
++    let mut d = try_hold(&slot.inner, Holder::PopAction)?;
+     d.actions.pop_front()
+ }
+ 
+-- 
+2.43.0
+

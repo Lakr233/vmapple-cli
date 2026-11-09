@@ -1,0 +1,35 @@
+From 344c97eb1f9f7175c14cc78045f2612078c6c578 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Sun, 8 Nov 2026 10:42:19 +0800
+Subject: [PATCH] Keep the AIR of a shader the translator refused
+
+The next translation reuses the scratch name, so the input that failed
+was gone by the time anyone looked. Copy it next to the scratch files as
+failed-<length>-<stage>.air.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/reims-vgpu/src/runtime/m2v_cache.rs | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/m2v_cache.rs b/crates/reims-vgpu/src/runtime/m2v_cache.rs
+index f2078ce3..c1d9f44a 100644
+--- a/crates/reims-vgpu/src/runtime/m2v_cache.rs
++++ b/crates/reims-vgpu/src/runtime/m2v_cache.rs
+@@ -728,7 +728,12 @@ fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
+     // strips, so the post-emit ABI reconciliation below no longer re-reads `k.ll`.
+     let (spirv, reflection) =
+         metal2vulkan::translate_reflected(path.to_str().unwrap_or(name), stage, &tmp)
+-            .map_err(|e| translate_decline(stage, e.to_string()))?;
++            .map_err(|e| {
++                // The next shader reuses the scratch name; keep this one for
++                // the translator.
++                let _ = std::fs::copy(&path, tmp.join(format!("failed-{}-{name}", air.len())));
++                translate_decline(stage, e.to_string())
++            })?;
+     finish_translated(spirv, reflection, stage)
+ }
+ 
+-- 
+2.43.0
+

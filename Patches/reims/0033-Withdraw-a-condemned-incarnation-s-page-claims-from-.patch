@@ -1,0 +1,1027 @@
+From 5b9778ba4b0056797453fbea6b10b73ddb6dd14f Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 09:56:38 +0800
+Subject: [PATCH 17/24] Withdraw a condemned incarnation's page claims from the
+ quarantine
+
+On the first 27.2 regression boot of this build the wire guard condemned
+mid=2 at 18.47 s, and the guest later handed its pages to new window and
+display surfaces (mid=9, 17, 18). Each MAP collided with mid=2, and the
+quarantine held both sides, so the legitimate new surfaces were never
+written and the desktop came out corrupted.
+
+The guard's condemnation is protocol-independent evidence about the old
+side alone: its own wire counts, read through a layout checked against
+the kernel, dropped below what MAP saw while it was still mapped. That
+incarnation now withdraws its page claims, at the worker's next tick,
+in this order: it is quarantined (every page proof void, every CPU,
+import and direct write refused), GPU writes already submitted to its
+pages are waited for, its owed frame is dropped, and only then do
+collision checks stop counting it as an owner. It is never restored; an
+UNMAP ends it and a new MappingInternal for the id is a different
+incarnation that inherits nothing. A debt armed for it later is dropped
+at payment rather than put back.
+
+A new mapping over its pages is then checked as any other, against every
+remaining owner (surface_quarantine_resolved reason=owner_condemned
+order=condemned_first). A mapping already quarantined because of it
+loses exactly that partner; if none is left it is re-resolved, checked
+against every other owner and its own wire counts read positive before
+it is freed with its owed frame intact (order=collision_first), and
+otherwise it stays held (surface_quarantine_kept / _partner_withdrawn).
+Without that evidence, guard off or no anomaly, both sides of a
+collision stay quarantined as before.
+
+Tests: a new mapping over a withdrawn owner's pages is written; a third
+valid owner still blocks it; a withdrawn incarnation whose count turns
+positive stays refused and its debt is dropped; a new incarnation of the
+old id is a valid owner again and is written; writes in flight to the
+old pages settle before it is excluded, and the reverse order frees the
+new side only after that; without wire evidence both stay quarantined.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/backend/vulkan/engine/mod.rs          |   9 +
+ crates/reims-vgpu/src/runtime/mapper/mod.rs   |  56 ++-
+ .../src/runtime/mapper/wire_watch.rs          | 181 +++++++--
+ .../src/runtime/mapper/wire_watch_tests.rs    | 347 +++++++++++++++++-
+ .../src/runtime/surface_quarantine.rs         | 175 +++++++++
+ .../reims-vgpu/src/runtime/writeback_debt.rs  |   9 +-
+ 6 files changed, 724 insertions(+), 53 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs b/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
+index 51ca6789..bc845b59 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
+@@ -1375,6 +1375,15 @@ fn arm_guest_write_pages(pages: &[u64]) {
+     f.armed.push(sorted);
+ }
+ 
++/// A guest-page write submitted and not yet settled, over `pages`, for a test of
++/// a caller that must wait for one. Settles like any other: with no device the
++/// wait clears it.
++#[cfg(test)]
++pub(crate) fn test_arm_guest_write(pages: &[u64]) {
++    arm_guest_write_pages(pages);
++    GUEST_WRITE_DEBT.store(true, std::sync::atomic::Ordering::Release);
++}
++
+ /// Record one resource-owned allocation that an outstanding GPU Store writes.
+ /// Repeated writes through the same admitted resource add no ledger work.
+ fn arm_guest_write_footprint(
+diff --git a/crates/reims-vgpu/src/runtime/mapper/mod.rs b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+index a1da9cb8..dc28fa2c 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/mod.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+@@ -944,7 +944,16 @@ fn surface_pages_are_exclusively_owned(
+     mapping_id: u32,
+     site: &str,
+ ) -> bool {
+-    let Some((gpa, owner)) = first_surface_page_collision(state, mapping_id) else {
++    let (valid, withdrawn) = surface_page_overlaps(state, mapping_id);
++    // An incarnation the wire guard proved the guest unwired owns nothing here;
++    // every other owner still does. See `runtime::surface_quarantine::withdraw`.
++    let held = crate::runtime::surface_quarantine::is_quarantined(state, mapping_id);
++    for (gpa, old) in withdrawn {
++        crate::runtime::surface_quarantine::note_withdrawn_overlap(
++            mapping_id, old, gpa, site, held,
++        );
++    }
++    let Some((gpa, owner)) = valid else {
+         return true;
+     };
+     let mine_pages = state
+@@ -968,14 +977,31 @@ fn surface_pages_are_exclusively_owned(
+ /// this. It is not measure-only; the doc said so for a while and was wrong,
+ /// which is the worse way round for a detector on the guest-corruption rail.
+ ///
++/// An owner whose incarnation withdrew its page claims is not counted: see
++/// [`crate::runtime::surface_quarantine::withdraw`].
++///
+ /// Cost O(this_pages + Σ other live pages); called only on a rewire.
+ fn first_surface_page_collision(state: &DeviceState, mapping_id: u32) -> Option<(u64, u32)> {
++    surface_page_overlaps(state, mapping_id).0
++}
++
++/// `mapping_id`'s overlaps with every other live mapping: the first page it
++/// shares with a valid owner, and one shared page for each owner whose
++/// incarnation withdrew its claims.
++fn surface_page_overlaps(
++    state: &DeviceState,
++    mapping_id: u32,
++) -> (Option<(u64, u32)>, Vec<(u64, u32)>) {
++    let mut valid = None;
++    let mut withdrawn = Vec::new();
+     let page_shift = state.page_shift;
+     let page = state.page_size();
+     let page_base = |gpa: u64| gpa & !(page - 1);
+-    let m = state.mappings.get(&mapping_id)?;
++    let Some(m) = state.mappings.get(&mapping_id) else {
++        return (valid, withdrawn);
++    };
+     if !m.mapped || m.page_entries.is_empty() {
+-        return None;
++        return (valid, withdrawn);
+     }
+     let mine: std::collections::HashSet<u64> = m
+         .page_entries
+@@ -984,21 +1010,29 @@ fn first_surface_page_collision(state: &DeviceState, mapping_id: u32) -> Option<
+         .map(page_base)
+         .collect();
+     if mine.is_empty() {
+-        return None;
++        return (valid, withdrawn);
+     }
+     for (&other_id, other) in &state.mappings {
+         if other_id == mapping_id || !other.mapped || other.page_entries.is_empty() {
+             continue;
+         }
+-        for &e in &other.page_entries {
+-            if let Some(gpa) = crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift) {
+-                if mine.contains(&page_base(gpa)) {
+-                    return Some((page_base(gpa), other_id));
+-                }
+-            }
++        let gone = crate::runtime::surface_quarantine::entry_withdrawn(other);
++        if valid.is_some() && !gone {
++            continue;
++        }
++        let shared = other
++            .page_entries
++            .iter()
++            .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift))
++            .map(page_base)
++            .find(|gpa| mine.contains(gpa));
++        match (shared, gone) {
++            (Some(gpa), true) => withdrawn.push((gpa, other_id)),
++            (Some(gpa), false) => valid = Some((gpa, other_id)),
++            (None, _) => {}
+         }
+     }
+-    None
++    (valid, withdrawn)
+ }
+ 
+ /// Always-on, deduped-per-`(mid, owner, gpa)` fail line for a cross-surface
+diff --git a/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs b/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
+index 511bcad2..2c6d9fea 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
+@@ -75,6 +75,13 @@
+ //! (`wire_guard_still_condemned`). The resident stays, so a later present of the
+ //! surface shows it without writing guest memory.
+ //!
++//! At the worker's next tick a condemned incarnation also withdraws its page
++//! claims from the surface quarantine
++//! ([`crate::runtime::surface_quarantine::withdraw`]): once in-flight writes to it
++//! have settled it no longer owns any page in a collision check, and a mapping
++//! quarantined only because of it is freed after a fresh validation of its own
++//! (re-resolved, no other owner, its own counts read positive).
++//!
+ //! A positive count is not a permission: it is read, then the write happens,
+ //! and the guest can complete the descriptor in between, so the guard only
+ //! stops writes after a drop it has seen. A render target the GPU writes in
+@@ -562,6 +569,33 @@ impl Horizon {
+     }
+ }
+ 
++impl Watched {
++    fn pending(internal: u64) -> Self {
++        Self {
++            internal,
++            phase: Phase::Pending,
++            surface_iomd: 0,
++            table_iomd: 0,
++            pages: 0,
++            surface_fields: IomdFields::default(),
++            table_fields: IomdFields::default(),
++            at_map: None,
++            last: Counts::default(),
++            display: false,
++            anomalous: BTreeSet::new(),
++            writes: 0,
++            writes_after_anomaly: 0,
++            lines_after_anomaly: 0,
++            guard_lines: 0,
++            refused: 0,
++            last_write: None,
++            sampled_us: None,
++            condemned: None,
++            recovered_said: false,
++        }
++    }
++}
++
+ #[derive(Clone, Copy, Debug, Default)]
+ struct Cost {
+     samples: u64,
+@@ -606,6 +640,9 @@ pub struct WireWatch {
+     /// Mappings the guard condemned whose debts and horizon are still to be
+     /// taken, which needs the whole device state.
+     condemn_pending: Vec<u32>,
++    /// Condemned mappings whose page claims are still to be withdrawn, which
++    /// waits for in-flight writes and so is left to the worker's tick.
++    withdraw_pending: Vec<u32>,
+     /// How often each child FIFO was defined or freed; see [`Horizon`].
+     fifo_generations: BTreeMap<u32, u64>,
+     cost: Cost,
+@@ -1497,6 +1534,7 @@ fn apply_condemnations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
+             })
+             .collect();
+         ww.cost.condemned += 1;
++        ww.withdraw_pending.push(mapping_id);
+         if debt {
+             ww.cost.debts_dropped += 1;
+             crate::runtime::drain::note_store_route("wbdebt_dropped_condemned");
+@@ -1572,6 +1610,10 @@ pub fn on_map<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H, mappin
+     };
+     with_watch(state, host, |ww, rd, state| {
+         if let Some(old) = ww.watched.get(&mapping_id) {
++            // A MAP restating a condemned incarnation does not wash it.
++            if old.internal == internal && old.condemned.is_some() {
++                return;
++            }
+             if old.internal != internal {
+                 crate::observe::off(format!(
+                     "wire_watch retired mapping={mapping_id} reason=remapped internal={:#x}",
+@@ -1579,31 +1621,7 @@ pub fn on_map<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H, mappin
+                 ));
+             }
+         }
+-        ww.watched.insert(
+-            mapping_id,
+-            Watched {
+-                internal,
+-                phase: Phase::Pending,
+-                surface_iomd: 0,
+-                table_iomd: 0,
+-                pages: 0,
+-                surface_fields: IomdFields::default(),
+-                table_fields: IomdFields::default(),
+-                at_map: None,
+-                last: Counts::default(),
+-                display: false,
+-                anomalous: BTreeSet::new(),
+-                writes: 0,
+-                writes_after_anomaly: 0,
+-                lines_after_anomaly: 0,
+-                guard_lines: 0,
+-                refused: 0,
+-                last_write: None,
+-                sampled_us: None,
+-                condemned: None,
+-                recovered_said: false,
+-            },
+-        );
++        ww.watched.insert(mapping_id, Watched::pending(internal));
+         activate(ww, rd, state, mapping_id, true);
+     });
+ }
+@@ -2041,6 +2059,116 @@ pub fn on_hold_release(state: &mut DeviceState, held: u32) {
+     crate::observe::off(format!("wire_watch_ev {event}"));
+ }
+ 
++// MARK: - Withdrawn claims
++
++/// Withdraw the page claims of every incarnation condemned since the last
++/// tick, on the worker, where waiting for in-flight writes is allowed; then
++/// free each mapping that was quarantined only because of one of them, once it
++/// passes a fresh validation. See [`crate::runtime::surface_quarantine::withdraw`].
++fn settle_withdrawals<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H) {
++    for old in std::mem::take(&mut state.wire_watch.withdraw_pending) {
++        let Some((internal, evidence)) = state.wire_watch.watched.get(&old).and_then(|w| {
++            let c = w.condemned.as_ref()?;
++            Some((
++                w.internal,
++                format!(
++                    "wire field={} condemned_seq={} t_us={} surface_wire={} table_wire={}",
++                    c.field, c.seq, c.t_us, w.last.surface as i32, w.last.table as i32
++                ),
++            ))
++        }) else {
++            continue;
++        };
++        let Some(freed) =
++            crate::runtime::surface_quarantine::withdraw(state, old, internal, &evidence)
++        else {
++            continue;
++        };
++        for (new, remaining) in freed {
++            if !remaining.is_empty() {
++                crate::observe::off(format!(
++                    "surface_quarantine_partner_withdrawn mid={new} old={old} \
++                     remaining={remaining:?} (still held by its other partners)"
++                ));
++                continue;
++            }
++            match fresh_validation(state, host, new) {
++                Ok(evidence) => crate::runtime::surface_quarantine::release_withdrawn_partner(
++                    state, new, old, &evidence,
++                ),
++                Err(reason) => crate::observe::fail(format!(
++                    "surface_quarantine_kept mid={new} old={old} reason={reason} (its only \
++                     partner withdrew its claims, but this mapping did not validate afresh)"
++                )),
++            }
++        }
++    }
++}
++
++/// The checks a mapping freed by a withdrawal must pass now, not earlier: its
++/// own backing re-read and adopted, no page shared with any other valid
++/// owner, and its own wire counts read positive through a checked layout.
++fn fresh_validation<H: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &H,
++    mapping_id: u32,
++) -> Result<String, &'static str> {
++    if !crate::runtime::mapper::resolve_mapping_backing(state, host, mapping_id) {
++        return Err("resolve_failed");
++    }
++    if let Some((gpa, owner)) = super::first_surface_page_collision(state, mapping_id) {
++        crate::runtime::surface_quarantine::quarantine_collision(
++            state,
++            mapping_id,
++            owner,
++            gpa,
++            "withdrawal_recheck",
++        );
++        return Err("collision");
++    }
++    verified_live(state, host, mapping_id).ok_or("no_wire_evidence")
++}
++
++/// `mapping_id`'s current incarnation, read now: layout checked, not
++/// condemned, no anomaly, both counts positive. The evidence, or `None`.
++fn verified_live<H: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &H,
++    mapping_id: u32,
++) -> Option<String> {
++    let internal = state
++        .mappings
++        .get(&mapping_id)
++        .map(|m| m.mapping_internal)
++        .filter(|&i| i != 0)?;
++    with_watch(state, host, |ww, rd, state| {
++        if ww.watched.get(&mapping_id).map(|w| w.internal) != Some(internal) {
++            ww.watched.insert(mapping_id, Watched::pending(internal));
++        }
++        // A pending entry is checked by its first sample and read by its second.
++        let fresh = sample_one(ww, rd, state, mapping_id, "withdrawal_check")
++            || sample_one(ww, rd, state, mapping_id, "withdrawal_check");
++        let w = ww.watched.get(&mapping_id)?;
++        let live = fresh
++            && w.phase == Phase::Active
++            && w.condemned.is_none()
++            && w.anomalous.is_empty()
++            && (w.last.surface as i32) > 0
++            && (w.last.table as i32) > 0;
++        live.then(|| {
++            format!(
++                "wire internal={internal:#x} surface_wire={} table_wire={} map={}",
++                w.last.surface as i32,
++                w.last.table as i32,
++                w.at_map.map_or_else(
++                    || "late".to_string(),
++                    |c| format!("{}/{}", c.surface as i32, c.table as i32)
++                )
++            )
++        })
++    })
++}
++
+ // MARK: - Hooks: worker
+ 
+ /// The worker's periodic pass: swap buffers, every mapping, held FIFO heads,
+@@ -2108,6 +2236,9 @@ pub fn tick<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H) {
+             }
+         });
+     }
++    if guard_enabled() && !state.wire_watch.withdraw_pending.is_empty() {
++        settle_withdrawals(state, host);
++    }
+     if cost {
+         state.wire_watch.cost_logged_us = Some(now);
+         crate::observe::off(state.wire_watch.cost_line(state.kernel_walk.boot));
+diff --git a/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs b/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs
+index 7dce0902..f4d5104d 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs
+@@ -22,13 +22,42 @@ const VBAR: u64 = TEXT_EXEC;
+ const VTABLE_SIGNED: u64 = 0x5b95_7e00_1000_8638;
+ 
+ const MID: u32 = 2;
+-const PAGES: u64 = 3;
+ const MI: u64 = 0xffff_fe1e_47e6_4c20;
+ const SURFACE: u64 = 0xffff_fe24_13d7_1398;
+ const TABLE: u64 = 0xffff_fe24_13d7_2048;
+ const MIXED: u64 = 0xffff_fe1e_47da_8100;
+ const PAGE_TABLE: u64 = 0xffff_fe9a_f64f_c000;
+ const KERNEL_TASK: u64 = 0xffff_fe1f_4a04_9c70;
++/// The mapper device every MappingInternal points back to.
++const MAPPER: u64 = 0xffff_fe2a_e214_1800;
++/// Mapping 2's guest pages, apart so each is its own run.
++const G: [u64; 3] = [0x1_0000_0000, 0x1_0010_0000, 0x1_0020_0000];
++
++/// One type-11 mapping as 27.2 lays it out in guest memory.
++struct Surface {
++    mid: u32,
++    mi: u64,
++    surface: u64,
++    table: u64,
++    page_table: u64,
++    gpas: Vec<u64>,
++}
++
++fn old_surface() -> Surface {
++    Surface {
++        mid: MID,
++        mi: MI,
++        surface: SURFACE,
++        table: TABLE,
++        page_table: PAGE_TABLE,
++        gpas: G.to_vec(),
++    }
++}
++
++fn entry(gpa: u64) -> u32 {
++    ((gpa >> 14) as u32) << iosurface_pages::PAGE_ENTRY_PFN_SHIFT
++        | iosurface_pages::PAGE_ENTRY_VALID
++}
+ 
+ fn put64(host: &mut FakeHost, at: u64, v: u64) {
+     host.write_gpa(at, &v.to_le_bytes()).unwrap();
+@@ -107,18 +136,40 @@ fn put_iomd(host: &mut FakeHost, at: u64, length: u64, wire: u32, pages: u32, bu
+ 
+ /// Mapping 2 as 27.2 lays it out: three pages, surface wired once, page table
+ /// twice (it is wired at creation as well).
+-fn put_mapping(host: &mut FakeHost) {
+-    put32(host, MI + MI_STATE, 5);
+-    put64(host, MI + MI_SURFACE_IOMD, SURFACE);
+-    put32(host, MI + MI_ID, MID);
+-    put32(host, MI + MI_SIZE, MAPPING_INTERNAL_EXPECTED_SIZE);
+-    put64(host, MI + MI_TABLE_IOMD, TABLE);
+-    put64(host, MI + MI_PAGE_COUNT, PAGES);
+-    put_iomd(host, SURFACE, PAGES * PAGE, 1, PAGES as u32, 0);
+-    put_iomd(host, TABLE, PAGE, 2, 1, PAGE_TABLE);
++/// A MappingInternal the mapper can resolve and the watch can check: its
++/// surface wired `wire` times, its page table twice (it is wired at creation as
++/// well), its page table in kernel memory and its pages in guest RAM.
++fn put_surface(host: &mut FakeHost, s: &Surface, wire: u32) {
++    let n = s.gpas.len() as u64;
++    put32(host, s.mi + MI_STATE, 5);
++    put64(
++        host,
++        s.mi + iosurface_pages::MAPPING_INTERNAL_BACKPTR,
++        MAPPER,
++    );
++    put64(host, s.mi + MI_SURFACE_IOMD, s.surface);
++    put32(host, s.mi + MI_ID, s.mid);
++    put32(host, s.mi + MI_SIZE, MAPPING_INTERNAL_EXPECTED_SIZE);
++    put64(host, s.mi + MI_TABLE_IOMD, s.table);
++    put64(host, s.mi + MI_PAGE_COUNT, n);
++    put_iomd(host, s.surface, n * PAGE, wire, n as u32, 0);
++    put_iomd(host, s.table, PAGE, 2, 1, s.page_table);
++    for (i, &gpa) in s.gpas.iter().enumerate() {
++        put32(host, s.page_table + 4 * i as u64, entry(gpa));
++        host.map_range(gpa, PAGE as usize, 0);
++    }
+     put64(host, MIXED + MIXED_DATA_LENGTH, 0x2000);
+ }
+ 
++/// The device state a resolve of `s` leaves behind.
++fn adopt(state: &mut DeviceState, s: &Surface) {
++    state.map_surface(s.mid);
++    let m = state.mappings.get_mut(&s.mid).unwrap();
++    m.mapping_internal = s.mi;
++    m.page_table_kva = s.page_table;
++    m.page_entries = s.gpas.iter().map(|&g| entry(g)).collect();
++}
++
+ fn set_surface_wire(host: &mut FakeHost, wire: i32) {
+     put32(host, SURFACE + IOMD_WIRE_COUNT, wire as u32);
+ }
+@@ -127,18 +178,15 @@ fn fixture(version: &str) -> (DeviceState, FakeHost) {
+     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+     let mut host = FakeHost::new();
+     put_kernel(&mut host, version);
+-    put_mapping(&mut host);
++    put_surface(&mut host, &old_surface(), 1);
++    state.mapper_device_kva = MAPPER;
+     state.kernel_walk.root = Some(KernelRoot {
+         tcr: TCR_16K_47,
+         sctlr: SCTLR_ON,
+         vbar: Some(VBAR),
+         ..root(0)
+     });
+-    assert!(state.map_surface(MID));
+-    let m = state.mappings.get_mut(&MID).unwrap();
+-    m.mapping_internal = MI;
+-    m.page_table_kva = PAGE_TABLE;
+-    m.page_entries = vec![0x1; PAGES as usize];
++    adopt(&mut state, &old_surface());
+     (state, host)
+ }
+ 
+@@ -979,3 +1027,270 @@ fn a_burst_of_row_writes_reads_the_counts_once() {
+         assert_eq!(state.wire_watch.watched[&MID].refused, 65);
+     });
+ }
++
++// MARK: - Withdrawn claims and the surface quarantine
++
++use crate::runtime::mapper::{
++    first_surface_page_collision, surface_pages_are_exclusively_owned, vouch_mapping_pages_verdict,
++    write_mapping_bytes,
++};
++use crate::runtime::surface_quarantine::{is_quarantined, is_withdrawn};
++
++/// The surface the guest gave one of mapping 2's pages to, as mid=9 on the
++/// regression boot.
++const NEW: u32 = 9;
++/// A page no other surface in these tests holds.
++const SPARE: u64 = 0x1_0030_0000;
++
++fn new_surface(gpas: &[u64]) -> Surface {
++    Surface {
++        mid: NEW,
++        mi: 0xffff_fe1e_47e7_0000,
++        surface: 0xffff_fe24_13d8_0000,
++        table: 0xffff_fe24_13d8_1000,
++        page_table: 0xffff_fe9a_f650_0000,
++        gpas: gpas.to_vec(),
++    }
++}
++
++fn route(name: &str) -> u64 {
++    crate::runtime::drain::census::store_route_count(name)
++}
++
++/// Regression 1: mapping 2 condemned and withdrawn, then a new mapping over
++/// one of its pages: the new one passes its collision check and is written;
++/// mapping 2 takes nothing.
++#[test]
++fn a_new_mapping_over_a_withdrawn_incarnations_pages_is_written() {
++    with_switches(true, true, || {
++        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        on_map(&mut state, &host, MID);
++        let new = new_surface(&[G[1]]);
++        put_surface(&mut host, &new, 1);
++        let cap = crate::observe::FailCapture::start();
++        set_surface_wire(&mut host, 0);
++        tick(&mut state, &host);
++        let withdrawn = cap.one("surface_quarantine_withdrawn");
++        assert!(
++            withdrawn.contains("mid=2 ") && withdrawn.contains("evidence=[wire field=surface"),
++            "{withdrawn}"
++        );
++        assert!(is_withdrawn(&state, MID) && is_quarantined(&state, MID));
++
++        adopt(&mut state, &new);
++        on_map(&mut state, &host, NEW);
++        assert!(surface_pages_are_exclusively_owned(
++            &mut state, NEW, "rewire"
++        ));
++        assert!(!is_quarantined(&state, NEW));
++        assert!(cap.one("surface_quarantine_resolved").contains(
++            "reason=owner_condemned old=mid=2 new=mid=9 order=condemned_first site=rewire"
++        ));
++        let token = vouch_mapping_pages_verdict(&mut state, &host, NEW)
++            .1
++            .expect("the new mapping is vouched");
++        assert!(write_mapping_bytes(
++            &mut state, &mut host, NEW, 0, b"NEW", &token
++        ));
++        let mut b = [0u8; 3];
++        host.read_gpa(G[1], &mut b).unwrap();
++        assert_eq!(&b, b"NEW");
++        assert!(vouch_mapping_pages_verdict(&mut state, &host, MID)
++            .1
++            .is_none());
++    });
++}
++
++/// Regression 2: a withdrawn owner is skipped, a valid one is not.
++#[test]
++fn a_third_valid_owner_still_blocks_the_new_mapping() {
++    with_switches(true, true, || {
++        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        on_map(&mut state, &host, MID);
++        set_surface_wire(&mut host, 0);
++        tick(&mut state, &host);
++        assert!(is_withdrawn(&state, MID));
++        // Mapping 7 holds SPARE, and nothing says it gave it up.
++        host.map_range(SPARE, PAGE as usize, 0);
++        state.map_surface(7);
++        let m = state.mappings.get_mut(&7).unwrap();
++        m.mapping_internal = 0xffff_fe1e_47e8_0000;
++        m.page_entries = vec![entry(SPARE)];
++        let new = new_surface(&[G[1], SPARE]);
++        put_surface(&mut host, &new, 1);
++        adopt(&mut state, &new);
++        let cap = crate::observe::FailCapture::start();
++        assert!(!surface_pages_are_exclusively_owned(
++            &mut state, NEW, "rewire"
++        ));
++        assert!(is_quarantined(&state, NEW) && is_quarantined(&state, 7));
++        let line = cap
++            .lines()
++            .into_iter()
++            .find(|l| l.starts_with("surface_quarantine site=rewire"))
++            .expect("a quarantine line");
++        assert!(line.contains("owner=[mid=7 "), "{line}");
++        assert!(state.mappings[&NEW].quarantine.as_ref().unwrap().partners == vec![7]);
++    });
++}
++
++/// Regression 3: the guest preparing the old incarnation again gives it
++/// nothing back: writes and its owed frame are refused for good.
++#[test]
++fn a_withdrawn_incarnation_stays_refused_when_its_count_recovers() {
++    with_switches(true, true, || {
++        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        on_map(&mut state, &host, MID);
++        set_surface_wire(&mut host, 0);
++        tick(&mut state, &host);
++        assert!(is_withdrawn(&state, MID));
++        let generation = state.mappings[&MID].map_generation;
++        let _ = state.pending_writebacks.arm(
++            MID,
++            crate::runtime::writeback_debt::test_resident_identity(MID, 4, 4, 1),
++            4,
++            4,
++            generation,
++        );
++        set_surface_wire(&mut host, 1);
++        let cap = crate::observe::FailCapture::start();
++        assert!(!write_now(
++            &mut state,
++            &host,
++            MID,
++            "mapping_write",
++            WriteKind::Cpu
++        ));
++        assert!(cap.one("wire_guard_still_condemned").contains("value=1"));
++        assert!(vouch_mapping_pages_verdict(&mut state, &host, MID)
++            .1
++            .is_none());
++        let dropped = route("wbdebt_dropped_withdrawn");
++        crate::runtime::writeback_debt::pay_for_mapping(&mut state, &mut host, MID);
++        assert!(
++            state.pending_writebacks.get(MID).is_none(),
++            "never lands, never kept"
++        );
++        assert_eq!(route("wbdebt_dropped_withdrawn"), dropped + 1);
++        assert!(is_withdrawn(&state, MID));
++    });
++}
++
++/// Regression 4: a new MappingInternal for the old id is another incarnation.
++/// It is a valid owner again and the guard does not carry over.
++#[test]
++fn a_new_incarnation_of_the_old_id_inherits_nothing() {
++    with_switches(true, true, || {
++        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        on_map(&mut state, &host, MID);
++        set_surface_wire(&mut host, 0);
++        tick(&mut state, &host);
++        assert!(is_withdrawn(&state, MID));
++        let again = Surface {
++            mid: MID,
++            mi: MI + 0x2000,
++            surface: SURFACE + 0x2000,
++            table: TABLE + 0x2000,
++            page_table: PAGE_TABLE + 0x4000,
++            gpas: vec![SPARE],
++        };
++        put_surface(&mut host, &again, 1);
++        assert!(state.attach_mapping_internal(MID, again.mi));
++        adopt(&mut state, &again);
++        crate::runtime::surface_quarantine::confirm_new_backing(&mut state, MID);
++        assert!(!is_quarantined(&state, MID) && !is_withdrawn(&state, MID));
++        assert!(write_now(
++            &mut state,
++            &host,
++            MID,
++            "mapping_write",
++            WriteKind::Cpu
++        ));
++        // Another mapping over its new page collides with it as with any owner.
++        state.map_surface(11);
++        let m = state.mappings.get_mut(&11).unwrap();
++        m.mapping_internal = 0xffff_fe1e_47e9_0000;
++        m.page_entries = vec![entry(SPARE)];
++        assert_eq!(first_surface_page_collision(&state, 11), Some((SPARE, MID)));
++    });
++}
++
++/// Regression 5 and the reverse order: the collision comes first and
++/// quarantines both. The condemnation alone excludes nothing; the worker's
++/// next tick waits for writes still in flight to mapping 2's pages, and only
++/// then withdraws it and frees mapping 9, after re-resolving it and reading
++/// its own counts.
++#[test]
++fn in_flight_writes_settle_before_a_condemned_owner_is_excluded() {
++    with_switches(true, true, || {
++        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        on_map(&mut state, &host, MID);
++        let new = new_surface(&[G[1]]);
++        put_surface(&mut host, &new, 1);
++        // Condemned by a write's own sample, not yet withdrawn.
++        set_surface_wire(&mut host, 0);
++        assert!(!write_now(
++            &mut state,
++            &host,
++            MID,
++            "mapping_write",
++            WriteKind::Cpu
++        ));
++        assert!(!is_withdrawn(&state, MID));
++        adopt(&mut state, &new);
++        assert!(
++            !surface_pages_are_exclusively_owned(&mut state, NEW, "rewire"),
++            "until it is withdrawn, mapping 2 still owns its pages"
++        );
++        assert!(is_quarantined(&state, NEW) && is_quarantined(&state, MID));
++        assert!(state.mappings[&NEW].page_entries.is_empty());
++
++        crate::backend::vulkan::engine::test_arm_guest_write(&[G[0]]);
++        assert!(crate::backend::vulkan::engine::guest_writes_outstanding());
++        let settles = route("settle_quarantine_overlap");
++        let cap = crate::observe::FailCapture::start();
++        tick(&mut state, &host);
++        assert!(!crate::backend::vulkan::engine::guest_writes_outstanding());
++        assert_eq!(route("settle_quarantine_overlap"), settles + 1);
++        assert!(cap
++            .one("surface_quarantine_withdrawn")
++            .contains("in_flight_before=overlap"));
++        assert!(is_withdrawn(&state, MID) && is_quarantined(&state, MID));
++        let resolved = cap.one("surface_quarantine_resolved");
++        assert!(
++            resolved.contains("reason=owner_condemned old=mid=2 new=mid=9 order=collision_first")
++                && resolved.contains("evidence=[wire internal=")
++                && resolved.contains("surface_wire=1 table_wire=2"),
++            "{resolved}"
++        );
++        assert!(!is_quarantined(&state, NEW));
++        assert_eq!(state.mappings[&NEW].page_entries, vec![entry(G[1])]);
++    });
++}
++
++/// Without wire evidence for either side, a collision quarantines both and
++/// the worker frees neither: the guard off, or no anomaly.
++#[test]
++fn without_wire_evidence_both_sides_stay_quarantined() {
++    for (guard, wire) in [(false, 0), (true, 1)] {
++        with_switches(true, guard, || {
++            let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++            on_map(&mut state, &host, MID);
++            let new = new_surface(&[G[1]]);
++            put_surface(&mut host, &new, 1);
++            set_surface_wire(&mut host, wire);
++            tick(&mut state, &host);
++            adopt(&mut state, &new);
++            let cap = crate::observe::FailCapture::start();
++            assert!(!surface_pages_are_exclusively_owned(
++                &mut state, NEW, "rewire"
++            ));
++            state.wire_watch.all_sampled_us = None;
++            tick(&mut state, &host);
++            assert!(is_quarantined(&state, NEW) && is_quarantined(&state, MID));
++            assert!(!is_withdrawn(&state, MID));
++            assert!(lines_with(&cap, "surface_quarantine_withdrawn").is_empty());
++            assert!(lines_with(&cap, "surface_quarantine_resolved").is_empty());
++        });
++    }
++}
+diff --git a/crates/reims-vgpu/src/runtime/surface_quarantine.rs b/crates/reims-vgpu/src/runtime/surface_quarantine.rs
+index 31b4a904..55d23023 100644
+--- a/crates/reims-vgpu/src/runtime/surface_quarantine.rs
++++ b/crates/reims-vgpu/src/runtime/surface_quarantine.rs
+@@ -32,6 +32,19 @@
+ //! collision whose new surfaces are later unmapped stays quarantined. Re-reading
+ //! the same page table lifts nothing. There is no page blacklist: the pages are
+ //! free to belong to whoever the next protocol event names.
++//!
++//! # The one exception: an incarnation that withdrew its claims
++//!
++//! With `REIMS_VGPU_WIRE_GUARD`, [`crate::runtime::mapper::wire_watch`] can prove
++//! the guest unwired a surface it still had mapped: its own wire counts, read
++//! through a layout checked against the kernel, dropped below what `MAP` saw.
++//! That incarnation then withdraws its page claims ([`withdraw`]): it is
++//! quarantined for good, in-flight GPU writes to it are waited for, its owed
++//! frame is dropped, and only then do collision checks stop counting it as an
++//! owner. A new mapping over its pages is checked against every other owner as
++//! usual, and one already quarantined because of it loses only that partner,
++//! and is freed only after a fresh validation of its own. Without that proof
++//! both sides of a collision stay quarantined, as above.
+ 
+ use crate::model::DeviceState;
+ 
+@@ -51,6 +64,9 @@ pub struct Quarantine {
+     /// A MAP or new MappingInternal arrived for this id since; the next resolve
+     /// adopting a different table lifts the quarantine.
+     pub rebind_seen: Option<&'static str>,
++    /// The MappingInternal of an incarnation that withdrew its page claims: see
++    /// [`withdraw`]. Only that incarnation; a new one for the id is not.
++    pub withdrawn: Option<u64>,
+ }
+ 
+ pub fn is_quarantined(state: &DeviceState, mapping_id: u32) -> bool {
+@@ -163,6 +179,7 @@ pub fn quarantine_collision(
+                     since_ms: now_ms,
+                     entries: m.page_entries.clone(),
+                     rebind_seen: None,
++                    withdrawn: None,
+                 });
+                 fresh = true;
+             }
+@@ -301,6 +318,164 @@ pub fn confirm_new_backing(state: &mut DeviceState, mapping_id: u32) {
+     lift(state, mapping_id, "new_internal_disjoint_backing");
+ }
+ 
++// MARK: - Withdrawn claims
++
++/// Whether this mapping's current incarnation has withdrawn its page claims.
++/// See [`withdraw`].
++pub fn entry_withdrawn(m: &crate::model::MappingEntry) -> bool {
++    m.mapping_internal != 0
++        && m.quarantine.as_ref().and_then(|q| q.withdrawn) == Some(m.mapping_internal)
++}
++
++/// [`entry_withdrawn`] by id.
++pub fn is_withdrawn(state: &DeviceState, mapping_id: u32) -> bool {
++    state.mappings.get(&mapping_id).is_some_and(entry_withdrawn)
++}
++
++/// The wire guard proved the guest unwired `mapping_id`'s incarnation
++/// `internal` while it was still mapped: that incarnation withdraws its page
++/// claims. `evidence` is the guard's, for the log.
++///
++/// The steps run in this order because each licenses the next:
++///
++/// 1. its write authority is revoked: it is quarantined, which voids every page
++///    proof minted for it and refuses every CPU, import and direct write to
++///    the whole mapping;
++/// 2. GPU writes already submitted to its pages are waited for;
++/// 3. its owed frame is dropped, never landed (the resident is kept: a later
++///    present of the surface shows it without touching guest memory);
++/// 4. only then is it marked withdrawn, and collision checks stop counting it
++///    as an owner of any page.
++///
++/// Nothing restores it. Its UNMAP ends it, and a new MappingInternal for the id
++/// is another incarnation, which [`entry_withdrawn`] does not match.
++///
++/// Every mapping quarantined because of this one loses exactly that partner and
++/// keeps any others. Returned, with the partners each still has, for the caller
++/// to validate afresh and free with [`release_withdrawn_partner`]; nothing here
++/// frees them.
++pub fn withdraw(
++    state: &mut DeviceState,
++    mapping_id: u32,
++    internal: u64,
++    evidence: &str,
++) -> Option<Vec<(u32, Vec<u32>)>> {
++    let now_ms = crate::observe::elapsed_ms() as u64;
++    let shift = state.page_shift;
++    let m = state.mappings.get_mut(&mapping_id)?;
++    if internal == 0 || m.mapping_internal != internal || entry_withdrawn(m) {
++        return None;
++    }
++    m.write_epoch = m.write_epoch.wrapping_add(1);
++    if m.quarantine.is_none() {
++        m.quarantine = Some(Quarantine {
++            partners: Vec::new(),
++            gpa: 0,
++            generation: m.map_generation,
++            since_ms: now_ms,
++            entries: m.page_entries.clone(),
++            rebind_seen: None,
++            withdrawn: None,
++        });
++    }
++    let quarantined = m
++        .quarantine
++        .as_ref()
++        .map(|q| q.entries.as_slice())
++        .unwrap_or(&[]);
++    let mut pages: Vec<u64> = m
++        .page_entries
++        .iter()
++        .chain(quarantined)
++        .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, shift))
++        .collect();
++    pages.sort_unstable();
++    pages.dedup();
++    let in_flight = in_flight(&pages);
++    crate::runtime::render_writeback::settle_guest_writes_unless_disjoint(
++        crate::runtime::render_writeback::SettleSite::Quarantine,
++        || Some(pages.clone()),
++    );
++    let debt = state.pending_writebacks.take(mapping_id).is_some();
++    if let Some(q) = state
++        .mappings
++        .get_mut(&mapping_id)
++        .and_then(|m| m.quarantine.as_mut())
++    {
++        q.withdrawn = Some(internal);
++    }
++    let mut freed = Vec::new();
++    for (&id, other) in state.mappings.iter_mut() {
++        if id == mapping_id {
++            continue;
++        }
++        if let Some(q) = other.quarantine.as_mut() {
++            if q.partners.contains(&mapping_id) {
++                q.partners.retain(|&p| p != mapping_id);
++                freed.push((id, q.partners.clone()));
++            }
++        }
++    }
++    crate::runtime::drain::note_store_route("surface_quarantine_withdrawn");
++    crate::observe::fail(format!(
++        "surface_quarantine_withdrawn mid={mapping_id} internal={internal:#x} pages={} \
++         in_flight_before={in_flight} debt={} freed={:?} evidence=[{evidence}] (the guest unwired \
++         this incarnation while it was mapped: its writes stay refused, in-flight writes to it \
++         have settled, and it no longer owns any page in a collision check)",
++        pages.len(),
++        if debt { "dropped" } else { "none" },
++        freed.iter().map(|(id, _)| *id).collect::<Vec<_>>()
++    ));
++    Some(freed)
++}
++
++/// Free `mapping_id`, whose only remaining partner `old` has withdrawn its
++/// claims, after the caller validated it afresh (`evidence`). Its owed frame
++/// stays owed: it is the mapping's own and lands as any other.
++pub fn release_withdrawn_partner(
++    state: &mut DeviceState,
++    mapping_id: u32,
++    old: u32,
++    evidence: &str,
++) {
++    let now_ms = crate::observe::elapsed_ms() as u64;
++    let Some(m) = state.mappings.get_mut(&mapping_id) else {
++        return;
++    };
++    if !m.quarantine.as_ref().is_some_and(|q| q.partners.is_empty()) {
++        return;
++    }
++    let Some(q) = m.quarantine.take() else {
++        return;
++    };
++    crate::runtime::drain::note_store_route("surface_quarantine_resolved");
++    crate::observe::fail(format!(
++        "surface_quarantine_resolved reason=owner_condemned old=mid={old} new=mid={mapping_id} \
++         order=collision_first held_ms={} owes={} evidence=[{evidence}] (the old incarnation \
++         withdrew its claims; this mapping was validated afresh and is written again)",
++        now_ms.saturating_sub(q.since_ms),
++        state.pending_writebacks.get(mapping_id).is_some()
++    ));
++}
++
++/// A collision check found `mapping_id`'s pages overlapping `old`'s withdrawn
++/// incarnation and did not count it: said once a pair. Not said while
++/// `mapping_id` is itself held, where [`release_withdrawn_partner`] speaks.
++pub fn note_withdrawn_overlap(mapping_id: u32, old: u32, gpa: u64, site: &str, held: bool) {
++    crate::runtime::drain::note_store_route("surface_quarantine_withdrawn_skipped");
++    if held {
++        return;
++    }
++    let key = (u64::from(mapping_id) << 32) | u64::from(old);
++    if crate::observe::first_sight("surface_quarantine_resolved", key) {
++        crate::observe::fail(format!(
++            "surface_quarantine_resolved reason=owner_condemned old=mid={old} new=mid={mapping_id} \
++             order=condemned_first site={site} gpa={gpa:#x} (the old incarnation withdrew its \
++             claims; the new mapping is checked against every other owner)"
++        ));
++    }
++}
++
+ /// What a payment whose store wrote nothing owes afterwards.
+ #[derive(Debug, PartialEq, Eq)]
+ pub enum RefusedStore {
+diff --git a/crates/reims-vgpu/src/runtime/writeback_debt.rs b/crates/reims-vgpu/src/runtime/writeback_debt.rs
+index 9d504e16..10081c2f 100644
+--- a/crates/reims-vgpu/src/runtime/writeback_debt.rs
++++ b/crates/reims-vgpu/src/runtime/writeback_debt.rs
+@@ -1442,7 +1442,14 @@ fn pay<M: HostMemory + HostOps>(
+     route: &'static str,
+ ) {
+     // A quarantined mapping's frame is neither written nor dropped: the
+-    // collision does not say whose it is, and a release or rebind will.
++    // collision does not say whose it is, and a release or rebind will. One
++    // that withdrew its claims is the exception: the guest let it go, so its
++    // frame never lands. See `runtime::surface_quarantine::withdraw`.
++    if crate::runtime::surface_quarantine::is_withdrawn(state, mapping_id) {
++        crate::runtime::drain::note_store_route("wbdebt_dropped_withdrawn");
++        crate::runtime::surface_quarantine::note_refused(mapping_id, "debt_withdrawn");
++        return;
++    }
+     if crate::runtime::surface_quarantine::is_quarantined(state, mapping_id) {
+         state.pending_writebacks.restore(mapping_id, debt);
+         crate::runtime::surface_quarantine::note_refused(mapping_id, "debt");
+-- 
+2.43.0
+

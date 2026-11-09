@@ -1,0 +1,151 @@
+From 8a7b3334968ecf506a6ca5b9b5ac5a5e3d4f2014 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Sun, 8 Nov 2026 23:32:27 +0800
+Subject: [PATCH] Read the IOSurface request ring at its wrapped slot
+
+The guest mapper keeps a free-running request counter and writes request
+n into slot n % capacity, capacity being the entry count it programs into
+the capacity register. Reims read request n at ring_base + n * 16, so once
+the counter passed the capacity every MAP and UNMAP was read from memory
+past the ring and lost. A lost UNMAP left Reims holding the page list of a
+surface the guest had freed, and it went on writing frames into those
+pages: on 15.6.1 a boot that reached account creation took a kernel data
+abort in appleaccountd after thousands of such writes.
+
+The same fix is in aquarat/reims-vgpu 81c0e6a8f9, imbushuo aa7b6e1641 and
+JeanxPereira/orchard 5104b9a9a6.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/contract/iosurface_pages.rs           | 36 ++++++++++++++++---
+ crates/reims-vgpu/src/runtime/drain/mod.rs    | 15 ++++++--
+ crates/reims-vgpu/src/runtime/mapper/mod.rs   |  2 +-
+ crates/reims-vgpu/src/runtime/mapper/tests.rs |  4 +++
+ 4 files changed, 50 insertions(+), 7 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/contract/iosurface_pages.rs b/crates/reims-vgpu/src/contract/iosurface_pages.rs
+index e7dd4a7f..57109931 100644
+--- a/crates/reims-vgpu/src/contract/iosurface_pages.rs
++++ b/crates/reims-vgpu/src/contract/iosurface_pages.rs
+@@ -599,15 +599,29 @@ pub fn entry_gpa_shift(entry: u32, page_shift: u32) -> Option<u64> {
+     Some(((entry >> PAGE_ENTRY_PFN_SHIFT) as u64) << page_shift)
+ }
+ 
+-pub fn mapper_request_entry_offset(index: u32) -> u64 {
+-    (index as u64) * MAPPER_REQUEST_ENTRY_LEN as u64
++/// Byte offset, from the ring base, of mapper request `index`.
++///
++/// The guest's mapper keeps a free-running request counter and writes request
++/// `n` into slot `n % capacity`, where `capacity` is the entry count it programs
++/// into the capacity register. Reading `n * 16` instead runs past the ring once
++/// the counter passes `capacity`: every later MAP and UNMAP is lost, and a lost
++/// UNMAP leaves this device writing frames into pages the guest has freed.
++/// `None` for a ring whose capacity is not programmed.
++pub fn mapper_request_entry_offset(index: u32, capacity: u32) -> Option<u64> {
++    if capacity == 0 {
++        return None;
++    }
++    Some(u64::from(index % capacity) * MAPPER_REQUEST_ENTRY_LEN as u64)
+ }
+ 
+-pub fn mapper_request_published_entry_offset(producer: u32) -> Option<u64> {
++/// Offset of the request published by moving the producer to `producer`, that
++/// is request `producer - 1`. `None` before the first request and for an
++/// unprogrammed ring.
++pub fn mapper_request_published_entry_offset(producer: u32, capacity: u32) -> Option<u64> {
+     if producer == 0 {
+         None
+     } else {
+-        Some(mapper_request_entry_offset(producer - 1))
++        mapper_request_entry_offset(producer - 1, capacity)
+     }
+ }
+ 
+@@ -909,6 +923,20 @@ pub fn build_table_plan(
+ 
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn mapper_request_slots_wrap_at_the_programmed_capacity() {
++        use super::{mapper_request_entry_offset, mapper_request_published_entry_offset};
++        assert_eq!(mapper_request_entry_offset(0, 4), Some(0));
++        assert_eq!(mapper_request_entry_offset(3, 4), Some(3 * 16));
++        assert_eq!(mapper_request_entry_offset(4, 4), Some(0));
++        assert_eq!(mapper_request_entry_offset(9, 4), Some(16));
++        assert_eq!(mapper_request_entry_offset(u32::MAX, 64), Some(63 * 16));
++        assert_eq!(mapper_request_entry_offset(5, 0), None);
++        assert_eq!(mapper_request_published_entry_offset(0, 4), None);
++        assert_eq!(mapper_request_published_entry_offset(5, 4), Some(0));
++        assert_eq!(mapper_request_published_entry_offset(5, 0), None);
++    }
++
+     use super::*;
+     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+     use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SIZE_ARM64E};
+diff --git a/crates/reims-vgpu/src/runtime/drain/mod.rs b/crates/reims-vgpu/src/runtime/drain/mod.rs
+index b1c1bfbe..c9e48e4b 100644
+--- a/crates/reims-vgpu/src/runtime/drain/mod.rs
++++ b/crates/reims-vgpu/src/runtime/drain/mod.rs
+@@ -5106,11 +5106,22 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut
+     }
+ 
+     // Process requests between consumer and producer when ring is programmed.
+-    if state.iosfc.ring_base != 0 && producer > consumer {
++    // Request `idx` lives in slot `idx % capacity`; see
++    // `iosurface_pages::mapper_request_entry_offset`. A ring with a base and no
++    // capacity has no slots to read and catches up as an unprogrammed ring does.
++    if state.iosfc.ring_base != 0 && state.iosfc.capacity == 0 && producer > consumer {
++        note_store_route("iosfc_ring_capacity_unprogrammed");
++    }
++    if state.iosfc.ring_base != 0 && state.iosfc.capacity != 0 && producer > consumer {
++        let capacity = state.iosfc.capacity;
+         let start = consumer;
+         let end = producer;
+         for idx in start..end {
+-            let entry_off = (idx as u64) * MAPPER_REQUEST_ENTRY_LEN as u64;
++            let Some(entry_off) =
++                crate::contract::iosurface_pages::mapper_request_entry_offset(idx, capacity)
++            else {
++                break;
++            };
+             let mut e = [0u8; MAPPER_REQUEST_ENTRY_LEN];
+             if host
+                 .read_gpa(state.iosfc.ring_base + entry_off, &mut e)
+diff --git a/crates/reims-vgpu/src/runtime/mapper/mod.rs b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+index 6d00a238..d2c29175 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/mod.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+@@ -230,7 +230,7 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
+     if producer == 0 || state.iosfc.ring_base == 0 {
+         return None;
+     }
+-    let entry_off = mapper_request_published_entry_offset(producer)?;
++    let entry_off = mapper_request_published_entry_offset(producer, state.iosfc.capacity)?;
+     let mut e = [0u8; MAPPER_REQUEST_ENTRY_LEN];
+     host.read_gpa(state.iosfc.ring_base + entry_off, &mut e)
+         .ok()?;
+diff --git a/crates/reims-vgpu/src/runtime/mapper/tests.rs b/crates/reims-vgpu/src/runtime/mapper/tests.rs
+index f61c7614..2990036f 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/tests.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/tests.rs
+@@ -651,6 +651,8 @@ fn put_u64(h: &mut FakeHost, gpa: u64, v: u64) {
+ #[test]
+ fn capture_validates_identity_and_ring() {
+     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
++    // A one-entry ring: the guest always programs the capacity it wraps at.
++    state.iosfc.capacity = 1;
+     let mut host = FakeHost::new();
+     let ring = 0x7000_0000u64;
+     state.iosfc.ring_base = ring;
+@@ -691,6 +693,8 @@ fn capture_handoff_mismatch_is_fail_visible_and_latched() {
+     // the mapping never attaches → downstream black. It must return None,
+     // latch its reason once (no per-publish flood), and re-arm on clear.
+     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
++    // A one-entry ring: the guest always programs the capacity it wraps at.
++    state.iosfc.capacity = 1;
+     let mut host = FakeHost::new();
+     let ring = 0x7100_0000u64;
+     state.iosfc.ring_base = ring;
+-- 
+2.43.0
+

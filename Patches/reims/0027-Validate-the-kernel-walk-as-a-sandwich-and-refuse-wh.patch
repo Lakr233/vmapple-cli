@@ -1,0 +1,695 @@
+From 72b6d8ebe6a23ab41e0634a334a71c73f0897596 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 03:50:40 +0800
+Subject: [PATCH 11/24] Validate the kernel walk as a sandwich, and refuse what
+ QEMU would fault
+
+Runtime validation compared a CPU read with a later software read, so a
+guest store in between, such as the page-table entries being wired, read
+as a disagreement and retired a correct walker until the root changed.
+Each sample is now CPU, walk, CPU again: bytes that moved make it
+inconclusive, counting toward nothing and revoking nothing. A stable
+disagreement is likely real but not proven under concurrency, so it
+takes two to retire a root.
+
+A capture that cannot read the translation state now takes the held root
+out of service until a later capture validates again, instead of leaving
+a possibly stale snapshot serving.
+
+The walk checked only the final output address against TCR.IPS. Like
+QEMU's walker, it now refuses a root table or any next-level table
+beyond the output size before reading it, and refuses the reserved IPS
+encoding.
+
+Validation is bounded so it moves the timing it studies less: a reader
+takes at most sixteen samples while its root validates and one audit
+sample after, one boundary probe per reader while a crossing is still
+owed, and the probe reads 128 bytes each side so a non-zero crossing
+comes sooner. Samples and probes are counted in store_routes and a
+kva_walk_cost line reports each boot's totals at its reset.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 3c862b05767d696389bdd5fb8c0490f6bf426bf8)
+---
+ crates/reims-vgpu/src/runtime/kernel_walk.rs  | 335 +++++++++++++++---
+ crates/reims-vgpu/src/runtime/mapper/mod.rs   |  33 +-
+ crates/reims-vgpu/src/runtime/mapper/tests.rs |  24 +-
+ 3 files changed, 334 insertions(+), 58 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/kernel_walk.rs b/crates/reims-vgpu/src/runtime/kernel_walk.rs
+index a97b25cd..2c2c7754 100644
+--- a/crates/reims-vgpu/src/runtime/kernel_walk.rs
++++ b/crates/reims-vgpu/src/runtime/kernel_walk.rs
+@@ -100,7 +100,14 @@ pub enum WalkRefusal {
+     Reserved {
+         level: u32,
+     },
+-    OutputBeyondPaSize,
++    /// `TCR_EL1.IPS` holds the reserved encoding.
++    IpsReserved,
++    /// A table or output address wider than `TCR_EL1.IPS` allows, at this
++    /// level; the root table is level `start - 1`. QEMU raises an address size
++    /// fault for the same.
++    AddressSize {
++        level: i32,
++    },
+     /// Guest physical memory could not be read at this address.
+     Read {
+         gpa: u64,
+@@ -121,7 +128,8 @@ impl WalkRefusal {
+             Self::Fault { .. } => "kva_walk_fault",
+             Self::BlockAtLevel { .. } => "kva_walk_block_at_level",
+             Self::Reserved { .. } => "kva_walk_reserved",
+-            Self::OutputBeyondPaSize => "kva_walk_output_beyond_pa_size",
++            Self::IpsReserved => "kva_walk_ips_reserved",
++            Self::AddressSize { .. } => "kva_walk_address_size",
+             Self::Read { .. } => "kva_walk_read",
+         }
+     }
+@@ -183,11 +191,17 @@ impl Regime {
+             2 => 40,
+             3 => 42,
+             4 => 44,
+-            _ => OA_BITS,
++            5 | 6 => OA_BITS,
++            _ => return Err(WalkRefusal::IpsReserved),
+         };
+         let start_bits = va_bits - granule_shift - stride * (levels - 1);
+         let table_bytes = 8u64 << start_bits;
+         let base = root.ttbr1 & ((1u64 << OA_BITS) - 1) & !(table_bytes - 1);
++        if base >> pa_bits != 0 {
++            return Err(WalkRefusal::AddressSize {
++                level: start_level as i32 - 1,
++            });
++        }
+         Ok(Self {
+             granule_shift,
+             stride,
+@@ -246,6 +260,11 @@ fn translate_in<M: HostMemory>(mem: &M, r: &Regime, va: u64) -> Result<u64, Walk
+             (desc & oa_mask) | (va & (span - 1))
+         } else if is_table_or_page {
+             table = desc & oa_mask;
++            if table >> r.pa_bits != 0 {
++                return Err(WalkRefusal::AddressSize {
++                    level: level as i32,
++                });
++            }
+             continue;
+         } else {
+             // Blocks: level 2 for both granules, level 1 for 4 KiB. A 16 KiB
+@@ -256,8 +275,10 @@ fn translate_in<M: HostMemory>(mem: &M, r: &Regime, va: u64) -> Result<u64, Walk
+             }
+             (desc & oa_mask & !(span - 1)) | (va & (span - 1))
+         };
+-        if r.pa_bits < 64 && pa >> r.pa_bits != 0 {
+-            return Err(WalkRefusal::OutputBeyondPaSize);
++        if pa >> r.pa_bits != 0 {
++            return Err(WalkRefusal::AddressSize {
++                level: level as i32,
++            });
+         }
+         return Ok(pa);
+     }
+@@ -361,20 +382,34 @@ pub enum WalkCompare {
+         len: usize,
+         why: &'static str,
+     },
++    /// The CPU read different bytes before and after the walk: the guest wrote
++    /// in between, and the sample says nothing either way.
++    Inconclusive,
+ }
+ 
++/// Disagreements that retire a root. One can be noise the sandwich did not
++/// catch; two are a pattern.
++const MISMATCHES_TO_REVOKE: u32 = 2;
++
++/// Bytes a crossing probe reads on each side of a page boundary.
++const CROSSING_HALF: u64 = 128;
++
+ /// Runtime validation of one root against the CPU.
+ #[derive(Clone, Debug, Default)]
+ struct Validation {
+     samples: u64,
+     pages: std::collections::BTreeSet<u64>,
+     crossed: bool,
+-    mismatch: bool,
++    mismatches: u32,
+ }
+ 
+ impl Validation {
++    fn revoked(&self) -> bool {
++        self.mismatches >= MISMATCHES_TO_REVOKE
++    }
++
+     fn validated(&self) -> bool {
+-        !self.mismatch
++        !self.revoked()
+             && self.samples >= AGREED_SAMPLES
+             && self.pages.len() >= AGREED_PAGES
+             && self.crossed
+@@ -426,21 +461,43 @@ pub struct WalkPolicy {
+     /// Whether a boundary-crossing sample is still owed, so a reader on a vCPU
+     /// knows to take one.
+     pub wants_crossing: bool,
++    /// Whether the root has passed validation, after which a reader only
++    /// audits it: see [`Self::sample_limit`].
++    pub validated: bool,
+ }
+ 
++/// Samples one reader takes while its root is still validating. Enough for a
++/// resolve to validate on its own, and few enough that a 9216-entry page
++/// table is not read three times over on the vCPU.
++const SAMPLES_PER_READER_VALIDATING: u32 = 16;
++/// Samples one reader takes once its root has validated: an audit, not a
++/// comparison of every read.
++const SAMPLES_PER_READER_VALIDATED: u32 = 1;
++
+ impl WalkPolicy {
+     /// A reader that only ever runs on a vCPU and takes no part.
+     pub const OFF: Self = Self {
+         root: None,
+         serve: Serve::Off,
+         wants_crossing: false,
++        validated: false,
+     };
++
++    /// How many kernel reads one reader compares.
++    pub fn sample_limit(&self) -> u32 {
++        match self.validated {
++            true => SAMPLES_PER_READER_VALIDATED,
++            false => SAMPLES_PER_READER_VALIDATING,
++        }
++    }
+ }
+ 
+ /// What one reader observed, folded into [`KernelWalkState`] afterwards.
+ #[derive(Clone, Debug, Default)]
+ pub struct WalkLog {
+     pub compares: Vec<WalkCompare>,
++    /// Boundary-crossing probes taken, each one extra pair of CPU reads.
++    pub probes: u64,
+ }
+ 
+ // MARK: - State
+@@ -457,6 +514,17 @@ pub struct KernelWalkState {
+     validated_reported: bool,
+     /// Refusals logged per mapping, to bound the log.
+     refusals_logged: std::collections::BTreeMap<u32, u32>,
++    /// What validation cost this boot, reported at its end.
++    cost: ValidationCost,
++}
++
++/// Validation work done in one boot: what the A/B pays on the vCPU for it.
++#[derive(Clone, Copy, Debug, Default)]
++struct ValidationCost {
++    samples: u64,
++    probes: u64,
++    inconclusive: u64,
++    mismatches: u64,
+ }
+ 
+ /// How many refusals one mapping may log in a boot. Each carries its time,
+@@ -468,7 +536,7 @@ impl KernelWalkState {
+     /// passed runtime validation.
+     pub fn gate(&self) -> Result<KernelRoot, GateRefusal> {
+         let root = self.root.ok_or(GateRefusal::NoRoot)?;
+-        if self.validation.mismatch {
++        if self.validation.revoked() {
+             return Err(GateRefusal::Mismatched);
+         }
+         if !self.validation.validated() {
+@@ -489,12 +557,27 @@ impl KernelWalkState {
+             root: self.root,
+             serve,
+             wants_crossing: self.root.is_some() && !self.validation.crossed,
++            validated: self.gate().is_ok(),
+         }
+     }
+ 
+     /// Forget everything at a device reset: the next boot's kernel has its own
+-    /// tables, and its own validation to pass.
++    /// tables, and its own validation to pass. The boot's validation cost is
++    /// reported first.
+     pub fn reset(&mut self) {
++        let c = self.cost;
++        if c.samples + c.probes != 0 {
++            crate::observe::off(format!(
++                "kva_walk_cost boot={} samples={} probes={} inconclusive={} mismatches={} \
++                 validated={} (runtime validation work on the vCPU this boot)",
++                self.boot,
++                c.samples,
++                c.probes,
++                c.inconclusive,
++                c.mismatches,
++                self.gate().is_ok()
++            ));
++        }
+         let boot = self.boot.wrapping_add(1);
+         *self = Self {
+             boot,
+@@ -504,7 +587,19 @@ impl KernelWalkState {
+ 
+     /// Fold what one reader on a vCPU path compared.
+     pub fn fold(&mut self, log: WalkLog) {
++        let samples = log.compares.len() as u64;
++        if samples + log.probes != 0 {
++            crate::runtime::drain::note_store_route_n("kva_walk_samples", samples);
++            crate::runtime::drain::note_store_route_n("kva_walk_probes", log.probes);
++            self.cost.samples += samples;
++            self.cost.probes += log.probes;
++        }
+         for compare in log.compares {
++            match compare {
++                WalkCompare::Inconclusive => self.cost.inconclusive += 1,
++                WalkCompare::Mismatch { .. } => self.cost.mismatches += 1,
++                WalkCompare::Agreed { .. } => {}
++            }
+             self.note_compare(compare);
+         }
+     }
+@@ -522,7 +617,7 @@ impl KernelWalkState {
+                 crossed,
+             } => {
+                 crate::runtime::drain::note_store_route("kva_walk_agree");
+-                if !nonzero || v.mismatch {
++                if !nonzero || v.revoked() {
+                     return;
+                 }
+                 v.samples += 1;
+@@ -549,15 +644,23 @@ impl KernelWalkState {
+             }
+             WalkCompare::Mismatch { kva, len, why } => {
+                 crate::runtime::drain::note_store_route("kva_walk_mismatch");
+-                if !v.mismatch {
++                v.mismatches += 1;
++                if v.mismatches <= MISMATCHES_TO_REVOKE {
+                     crate::observe::fail(format!(
+                         "kva_walk_mismatch kva={kva:#x} len={len} detail={why} samples={} \
+-                         ttbr1={:#x} (runtime validation failed: the software walk read \
+-                         differently from the CPU; it serves nothing until the root changes)",
+-                        v.samples, root.ttbr1
++                         mismatches={} ttbr1={:#x} revoked={} (runtime validation: the CPU \
++                         read the same bytes before and after, and the software walk read \
++                         others; at {MISMATCHES_TO_REVOKE} the walk serves nothing until the \
++                         root changes)",
++                        v.samples,
++                        v.mismatches,
++                        root.ttbr1,
++                        v.revoked()
+                     ));
+                 }
+-                v.mismatch = true;
++            }
++            WalkCompare::Inconclusive => {
++                crate::runtime::drain::note_store_route("kva_walk_inconclusive");
+             }
+         }
+     }
+@@ -581,40 +684,56 @@ impl KernelWalkState {
+     }
+ }
+ 
+-/// Compare one CPU read with the walk, for runtime validation. `cpu` is what
+-/// the CPU read at `kva`.
+-pub fn compare<M: HostMemory>(mem: &M, root: &KernelRoot, kva: u64, cpu: &[u8]) -> WalkCompare {
+-    let mut walked = vec![0u8; cpu.len()];
+-    match read(mem, root, kva, &mut walked) {
+-        Ok(()) if walked == cpu => {
++/// One runtime-validation sample, read as a sandwich: `before` is what the CPU
++/// read at `kva`, then the walk reads, then `cpu_again` reads through the CPU
++/// once more. A guest store in between — on 13.6, the very page-table entries
++/// being wired — moves `after` off `before`, and the sample is inconclusive
++/// rather than a disagreement. Stable bytes on both sides make a disagreement
++/// likely real, not proven: the guest can write and restore inside the window.
++pub fn sample<M: HostMemory>(
++    mem: &M,
++    root: &KernelRoot,
++    kva: u64,
++    before: &[u8],
++    cpu_again: impl FnOnce(&mut [u8]) -> bool,
++) -> WalkCompare {
++    let mut walked = vec![0u8; before.len()];
++    let walk = read(mem, root, kva, &mut walked);
++    let mut after = vec![0u8; before.len()];
++    if !cpu_again(&mut after) || after != before {
++        return WalkCompare::Inconclusive;
++    }
++    match walk {
++        Ok(()) if walked == before => {
+             let granule = Regime::of(root).map_or(1 << 14, |r| r.granule());
+-            let last = kva.wrapping_add(cpu.len().max(1) as u64 - 1);
++            let last = kva.wrapping_add(before.len().max(1) as u64 - 1);
+             WalkCompare::Agreed {
+                 kva,
+-                len: cpu.len(),
+-                nonzero: cpu.iter().any(|&b| b != 0),
++                len: before.len(),
++                nonzero: before.iter().any(|&b| b != 0),
+                 crossed: kva & !(granule - 1) != last & !(granule - 1),
+             }
+         }
+         Ok(()) => WalkCompare::Mismatch {
+             kva,
+-            len: cpu.len(),
++            len: before.len(),
+             why: "bytes",
+         },
+         Err(why) => WalkCompare::Mismatch {
+             kva,
+-            len: cpu.len(),
++            len: before.len(),
+             why: why.slug(),
+         },
+     }
+ }
+ 
+ /// The span a boundary-crossing sample reads, around the end of the granule
+-/// page holding `kva`.
++/// page holding `kva`. Wide, because a sample counts only if it holds a
++/// non-zero byte, and the last bytes of a kernel page are often zeros.
+ pub fn crossing_probe(root: &KernelRoot, kva: u64) -> Option<(u64, usize)> {
+     let granule = Regime::of(root).ok()?.granule();
+     let end = (kva | (granule - 1)).checked_add(1)?;
+-    Some((end - 8, 16))
++    Some((end - CROSSING_HALF, 2 * CROSSING_HALF as usize))
+ }
+ 
+ /// Read the vCPU's EL1 translation state and keep it as the root.
+@@ -634,6 +753,17 @@ pub fn capture<H: HostOps>(state: &mut KernelWalkState, host: &H) {
+         ))
+     })();
+     let Some((ttbr1, tcr, sctlr, cpu_index)) = regs else {
++        // A snapshot that cannot be taken now says nothing about the one held:
++        // it stops serving until a capture succeeds and validates again.
++        if let Some(held) = state.root.take() {
++            crate::observe::fail(format!(
++                "kva_walk_root_lost was_ttbr1={:#x} boot={} (the translation state could \
++                 not be read on this vCPU; the held root no longer serves)",
++                held.ttbr1, state.boot
++            ));
++            state.validation = Validation::default();
++            state.validated_reported = false;
++        }
+         if !state.unavailable_reported {
+             state.unavailable_reported = true;
+             crate::observe::off(format!(
+@@ -919,34 +1049,157 @@ pub(crate) mod tests {
+         assert_eq!(state.boot, 1);
+     }
+ 
++    fn stable_mismatch() -> WalkCompare {
++        WalkCompare::Mismatch {
++            kva: kva(0),
++            len: 8,
++            why: "bytes",
++        }
++    }
++
++    /// One stable disagreement is logged and tolerated as possible noise; the
++    /// second retires the root until it changes.
+     #[test]
+-    fn one_disagreement_retires_the_walk_until_the_root_changes() {
++    fn two_stable_disagreements_retire_the_walk_until_the_root_changes() {
+         let mut host = FakeHost::new();
+         give_root(&mut host, L1);
+         let mut state = KernelWalkState::default();
+         capture(&mut state, &host);
+         validate(&mut state);
+-        state.note_compare(WalkCompare::Mismatch {
+-            kva: kva(0),
+-            len: 8,
+-            why: "bytes",
+-        });
++        state.note_compare(stable_mismatch());
++        assert!(state.gate().is_ok(), "one disagreement does not revoke");
++        state.note_compare(stable_mismatch());
+         validate(&mut state);
+         assert_eq!(state.gate(), Err(GateRefusal::Mismatched));
++
++        give_root(&mut host, L1 + 0x10_0000);
++        capture(&mut state, &host);
++        validate(&mut state);
++        assert!(state.gate().is_ok(), "a new root starts clean");
+     }
+ 
+-    /// The comparison itself: equal bytes agree, a different translation does
+-    /// not, and a read the CPU answered but the walk cannot is a disagreement.
++    /// A table address the output size cannot express is an address size fault
++    /// at that level, before anything is read from it — even when the leaf it
++    /// would lead to is a low address. So is a root table the same.
+     #[test]
+-    fn a_comparison_names_agreement_by_bytes() {
++    fn a_table_beyond_the_output_size_is_refused_whatever_the_leaf() {
++        const IPS_32: u64 = (17 << 16) | (0b01 << 30);
++        let r = KernelRoot {
++            tcr: IPS_32,
++            ..root(L1)
++        };
++        let mut host = FakeHost::new();
++        let va = kva(0x30_0000_0000);
++        let high_l2 = 0x1_0000_0000u64;
++        let l3 = 0x5000_0000u64;
++        put_desc(&mut host, L1 + ((va >> 36) & 0x7ff) * 8, high_l2 | 0b11);
++        put_desc(&mut host, high_l2 + ((va >> 25) & 0x7ff) * 8, l3 | 0b11);
++        put_desc(&mut host, l3 + ((va >> 14) & 0x7ff) * 8, 0x6000_0000 | 0b11);
++        assert_eq!(
++            translate(&host, &r, va),
++            Err(WalkRefusal::AddressSize { level: 1 })
++        );
++        assert_eq!(
++            translate(
++                &host,
++                &KernelRoot {
++                    ttbr1: high_l2,
++                    ..r
++                },
++                va
++            ),
++            Err(WalkRefusal::AddressSize { level: 0 }),
++            "the root table itself"
++        );
++        assert_eq!(
++            translate(
++                &host,
++                &KernelRoot {
++                    tcr: IPS_32 | (0b111 << 32),
++                    ..r
++                },
++                va
++            ),
++            Err(WalkRefusal::IpsReserved)
++        );
++    }
++
++    /// A capture that fails takes the held root out of service: a stale
++    /// snapshot must not keep serving. A later capture validates afresh.
++    #[test]
++    fn a_failed_capture_revokes_the_held_root() {
++        let mut host = FakeHost::new();
++        give_root(&mut host, L1);
++        let mut state = KernelWalkState::default();
++        capture(&mut state, &host);
++        validate(&mut state);
++        assert!(state.gate().is_ok());
++
++        host.xregs.clear();
++        capture(&mut state, &host);
++        assert_eq!(state.gate(), Err(GateRefusal::NoRoot));
++
++        give_root(&mut host, L1);
++        capture(&mut state, &host);
++        assert_eq!(state.gate(), Err(GateRefusal::Unvalidated));
++        validate(&mut state);
++        assert!(state.gate().is_ok());
++    }
++
++    /// A guest store between the CPU read and the walk — what wiring a page
++    /// table does — makes the sample inconclusive: it neither validates nor
++    /// revokes, however often it happens.
++    #[test]
++    fn a_concurrent_change_is_inconclusive_and_revokes_nothing() {
++        let mut host = FakeHost::new();
++        let va = kva(0x20_0000_0000);
++        map_page(&mut host, va, 0x9_0000_0000);
++        host.map_range(0x9_0000_0000, G as usize, 0);
++        host.write_gpa(0x9_0000_0000, b"after!!!").unwrap();
++        let r = root(L1);
++        let moved = |buf: &mut [u8]| {
++            buf.copy_from_slice(b"after!!!");
++            true
++        };
++        assert_eq!(
++            sample(&host, &r, va, b"before!!", moved),
++            WalkCompare::Inconclusive
++        );
++        assert_eq!(
++            sample(&host, &r, va, b"before!!", |_: &mut [u8]| false),
++            WalkCompare::Inconclusive,
++            "a second CPU read that failed proves nothing either"
++        );
++
++        give_root(&mut host, L1);
++        let mut state = KernelWalkState::default();
++        capture(&mut state, &host);
++        validate(&mut state);
++        for _ in 0..10 {
++            state.note_compare(WalkCompare::Inconclusive);
++        }
++        assert!(state.gate().is_ok());
++    }
++
++    /// The sample itself, with the CPU reading the same bytes on both sides:
++    /// equal bytes agree, a different translation is a stable disagreement, and
++    /// a read the CPU answered but the walk cannot is one too.
++    #[test]
++    fn a_stable_sample_names_agreement_by_bytes() {
+         let mut host = FakeHost::new();
+         let va = kva(0x20_0000_0000);
+         map_page(&mut host, va, 0x9_0000_0000);
+         host.map_range(0x9_0000_0000, G as usize, 0);
+         host.write_gpa(0x9_0000_0000, b"kernel!!").unwrap();
+         let r = root(L1);
++        let steady = |bytes: &'static [u8]| {
++            move |buf: &mut [u8]| {
++                buf.copy_from_slice(bytes);
++                true
++            }
++        };
+         assert_eq!(
+-            compare(&host, &r, va, b"kernel!!"),
++            sample(&host, &r, va, b"kernel!!", steady(b"kernel!!")),
+             WalkCompare::Agreed {
+                 kva: va,
+                 len: 8,
+@@ -955,16 +1208,16 @@ pub(crate) mod tests {
+             }
+         );
+         assert!(matches!(
+-            compare(&host, &r, va, b"elsewhere"[..8].as_ref()),
++            sample(&host, &r, va, b"elsewhre", steady(b"elsewhre")),
+             WalkCompare::Mismatch { why: "bytes", .. }
+         ));
+         assert!(matches!(
+-            compare(&host, &r, va + G, b"unmapped"),
++            sample(&host, &r, va + G, b"unmapped", steady(b"unmapped")),
+             WalkCompare::Mismatch {
+                 why: "kva_walk_fault",
+                 ..
+             }
+         ));
+-        assert_eq!(crossing_probe(&r, va + 0x10), Some((va + G - 8, 16)));
++        assert_eq!(crossing_probe(&r, va + 0x10), Some((va + G - 128, 256)));
+     }
+ }
+diff --git a/crates/reims-vgpu/src/runtime/mapper/mod.rs b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+index bde62db4..4c514da6 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/mod.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+@@ -152,6 +152,10 @@ struct MapperMem<'a, H: HostMemory + HostOps> {
+     /// The first refusal without a vCPU, and the address it was for.
+     refused: std::cell::Cell<Option<(crate::runtime::kernel_walk::Refused, u64)>>,
+     log: Option<&'a std::cell::RefCell<crate::runtime::kernel_walk::WalkLog>>,
++    /// Samples taken, against [`crate::runtime::kernel_walk::WalkPolicy::sample_limit`].
++    sampled: std::cell::Cell<u32>,
++    /// Whether this reader took its one boundary-crossing probe.
++    probed: std::cell::Cell<bool>,
+ }
+ 
+ impl<'a, H: HostMemory + HostOps> MapperMem<'a, H> {
+@@ -171,6 +175,8 @@ impl<'a, H: HostMemory + HostOps> MapperMem<'a, H> {
+             walk,
+             refused: std::cell::Cell::new(None),
+             log,
++            sampled: std::cell::Cell::new(0),
++            probed: std::cell::Cell::new(false),
+         }
+     }
+ 
+@@ -207,27 +213,40 @@ impl<'a, H: HostMemory + HostOps> MapperMem<'a, H> {
+         }
+     }
+ 
+-    /// Runtime validation: the bytes the CPU just read, read again through the
+-    /// walk, and while no sample has yet crossed a page, a 16-byte read across
+-    /// the end of this one through both.
++    /// Runtime validation: the bytes the CPU just read, read through the walk and
++    /// then through the CPU again (see [`crate::runtime::kernel_walk::sample`]),
++    /// and while no sample has yet crossed a page, the same for 16 bytes across
++    /// the end of this one.
+     fn validate(&self, address: u64, cpu: &[u8]) {
+         use crate::runtime::kernel_walk;
+         let (Some(root), Some(log)) = (self.walk.root, self.log) else {
+             return;
+         };
++        if self.sampled.get() >= self.walk.sample_limit() {
++            return;
++        }
++        self.sampled.set(self.sampled.get() + 1);
+         let mut log = log.borrow_mut();
+-        log.compares
+-            .push(kernel_walk::compare(self.host, &root, address, cpu));
+-        if !self.walk.wants_crossing {
++        let again = |at: u64| move |buf: &mut [u8]| self.host.read_kva(at, buf).is_ok();
++        log.compares.push(kernel_walk::sample(
++            self.host,
++            &root,
++            address,
++            cpu,
++            again(address),
++        ));
++        if !self.walk.wants_crossing || self.probed.get() {
+             return;
+         }
+         let Some((at, len)) = kernel_walk::crossing_probe(&root, address) else {
+             return;
+         };
++        self.probed.set(true);
++        log.probes += 1;
+         let mut probe = vec![0u8; len];
+         if self.host.read_kva(at, &mut probe).is_ok() {
+             log.compares
+-                .push(kernel_walk::compare(self.host, &root, at, &probe));
++                .push(kernel_walk::sample(self.host, &root, at, &probe, again(at)));
+         }
+     }
+ }
+diff --git a/crates/reims-vgpu/src/runtime/mapper/tests.rs b/crates/reims-vgpu/src/runtime/mapper/tests.rs
+index 3176ace6..77140332 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/tests.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/tests.rs
+@@ -1418,18 +1418,22 @@ mod kernel_walk_resolve {
+     #[test]
+     fn a_walk_that_disagrees_with_the_cpu_is_not_used() {
+         let (mut state, mut host) = fixture(entry(0x2_1000));
+-        // The CPU now finds the page object somewhere the guest tables do not.
++        // The guest's own tables send the MappingInternal's page somewhere the
++        // CPU does not read: a copy whose size field differs, every time.
+         let elsewhere = 0x3_2000_0000u64;
++        let mut page = vec![0u8; G as usize];
++        host.read_gpa(backing(A), &mut page).unwrap();
++        let size = MAPPING_INTERNAL_SIZE as usize;
++        page[size..size + 4].copy_from_slice(&(MAPPING_INTERNAL_EXPECTED_SIZE + 1).to_le_bytes());
+         host.map_range(elsewhere, G as usize, 0);
+-        host.write_gpa(
+-            elsewhere + iosurface_pages::MAPPING_PAGE_TABLE_FROM_F48,
+-            &B.to_le_bytes(),
+-        )
+-        .unwrap();
+-        host.write_gpa(elsewhere, b"cpu-only").unwrap();
+-        host.kva_cpu_pages.insert(C, elsewhere);
+-        let _ = resolve_mapping_backing(&mut state, &host, MID);
+-        let _ = resolve_mapping_backing(&mut state, &host, MID);
++        host.write_gpa(elsewhere, &page).unwrap();
++        map_page(&mut host, A, elsewhere);
++        for _ in 0..4 {
++            assert!(
++                resolve_mapping_backing(&mut state, &host, MID),
++                "the CPU path is unaffected"
++            );
++        }
+         assert_eq!(state.kernel_walk.gate(), Err(GateRefusal::Mismatched));
+ 
+         host.kva_no_cpu = true;
+-- 
+2.43.0
+

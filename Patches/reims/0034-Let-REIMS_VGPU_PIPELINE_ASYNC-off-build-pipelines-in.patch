@@ -1,0 +1,380 @@
+From acc890edd361c62e99d5e996a10d8836cc666efc Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 10:30:16 +0800
+Subject: [PATCH 18/24] Let REIMS_VGPU_PIPELINE_ASYNC=off build pipelines
+ inside the draw
+
+A switch, default on, so the compile-off-the-draw path can be A/B'd on
+one binary. Off builds a cold graphics pipeline where the draw first
+asks for it: on the drain thread, under the device and engine locks,
+published before the draw goes on. No ticket is handed out and no
+packet is deferred, which is how every graphics pipeline was built
+before the compiler thread existed. The compile runs on the drain
+breadcrumb lane, since that is the thread inside the driver.
+
+The boot line says which arm ran (pipeline_async on=... switch=...),
+REIMS_VGPU_PIPELINE_ASYNC joins env::ALL (32), and pipeline_compile
+counts in_draw= beside jobs=.
+
+Tests: lib suite 2292 passed, 0 failed (taskset 0-4,10-14, nice 19,
+CARGO_TARGET_DIR ~/reims-wt/target-int2, m2v e1ffa45, llvm-dis on
+PATH). New: with the switch forced off, a cold pipeline is drawn on its
+first ask and counted in_draw. No guest boot.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/backend/vulkan/engine/caches.rs       | 50 ++++++++++--
+ .../vulkan/engine/pipeline_compiler.rs        | 79 +++++++++++++++++--
+ .../vulkan/engine/pipeline_compiler/tests.rs  | 21 +++++
+ crates/reims-vgpu/src/env.rs                  | 14 +++-
+ 4 files changed, 148 insertions(+), 16 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs b/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
+index 4f882b96..d2ee9798 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
+@@ -2169,8 +2169,7 @@ impl ObjectCaches {
+         counters.pipeline_misses.fetch_add(1, Ordering::Relaxed);
+         let attribute_formats = self.graphics_pipeline_formats(ctx, key, ask.vert)?;
+         let ticket = super::pipeline_compiler::PipelineTicket::new(key.clone());
+-        self.flights.insert(key.clone(), ticket.clone());
+-        super::pipeline_compiler::submit(super::pipeline_compiler::GraphicsCompileJob {
++        let job = super::pipeline_compiler::GraphicsCompileJob {
+             ticket: ticket.clone(),
+             life: std::sync::Arc::clone(&ctx.life),
+             recipe: GraphicsRecipe {
+@@ -2185,7 +2184,29 @@ impl ObjectCaches {
+             pipeline_object: ask
+                 .pipeline_object
+                 .map(|identity| (identity.id(), identity.downgrade())),
+-        });
++        };
++        if !super::pipeline_compiler::off_the_draw() {
++            // `REIMS_VGPU_PIPELINE_ASYNC=off`: built here, under the locks, and
++            // filed before this draw goes on, as before the compiler thread.
++            let done = super::pipeline_compiler::compile_in_draw(job);
++            self.publish_one(Some(ctx), pools, counters, done);
++            return match ticket.outcome() {
++                Some(super::pipeline_compiler::PipelineOutcome::Ready) => Ok(PipelineReady::Built(
++                    self.pipelines
++                        .get(key)
++                        .expect("a pipeline answered Ready was filed under its key"),
++                )),
++                Some(super::pipeline_compiler::PipelineOutcome::Failed(error)) => Err(error.clone()),
++                // Only a compile that returned `VK_ERROR_DEVICE_LOST` is answered
++                // `DeviceRebuilt` on the device it ran on; the loss is latched.
++                _ => Err(DrawError::VkCall(VkCall::new(
++                    VkOp::CachesCreateGraphicsPipelines,
++                    vk::Result::ERROR_DEVICE_LOST,
++                ))),
++            };
++        }
++        self.flights.insert(key.clone(), ticket.clone());
++        super::pipeline_compiler::submit(job);
+         Ok(PipelineReady::Pending(ticket))
+     }
+ 
+@@ -2206,8 +2227,22 @@ impl ObjectCaches {
+         pools: &mut ResourcePools,
+         counters: &EngineCounters,
+     ) {
+-        use super::pipeline_compiler::{CompileFailure, PipelineOutcome};
+         for done in super::pipeline_compiler::take_finished() {
++            self.publish_one(ctx, pools, counters, done);
++        }
++    }
++
++    /// File one finished compile and answer its ticket. See
++    /// [`Self::publish_compiled`].
++    unsafe fn publish_one(
++        &mut self,
++        ctx: Option<&DeviceContext>,
++        pools: &mut ResourcePools,
++        counters: &EngineCounters,
++        done: super::pipeline_compiler::CompiledPipeline,
++    ) {
++        use super::pipeline_compiler::{CompileFailure, PipelineOutcome};
++        {
+             let key = done.ticket.key();
+             if self.flights.get(key).is_some_and(|t| t.is(&done.ticket)) {
+                 self.flights.remove(key);
+@@ -2221,7 +2256,7 @@ impl ObjectCaches {
+                 }
+                 done.ticket.settle(PipelineOutcome::DeviceRebuilt);
+                 super::pipeline_compiler::note_published_stale();
+-                continue;
++                return;
+             };
+             match done.result {
+                 Ok(pipeline) => {
+@@ -2246,7 +2281,7 @@ impl ObjectCaches {
+                     if lost {
+                         super::device_lost::note_device_lost_seen();
+                         done.ticket.settle(PipelineOutcome::DeviceRebuilt);
+-                        continue;
++                        return;
+                     }
+                     if let Some(module) = module {
+                         self.shaders.insert_negative(module, error.clone());
+@@ -2711,6 +2746,7 @@ pub(crate) struct GraphicsRecipe {
+ /// remembering a refusal and persisting the pipeline cache belong to the
+ /// callers on either side of the call.
+ pub(crate) unsafe fn create_graphics_pipeline(
++    lane: super::driver_breadcrumb::DriverLane,
+     device: &ash::Device,
+     cache: vk::PipelineCache,
+     recipe: &GraphicsRecipe,
+@@ -2919,7 +2955,7 @@ pub(crate) unsafe fn create_graphics_pipeline(
+     // here for over ten minutes; see `crate::observe::driver_watch`, which
+     // this arming also starts on the compiler's lane.
+     let breadcrumb = match super::driver_breadcrumb::DriverBreadcrumb::arm(
+-        super::driver_breadcrumb::DriverLane::Compiler,
++        lane,
+         &format!(
+             "create_graphics_pipelines vert_words={} frag_words={}",
+             vert.spirv.len(),
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/pipeline_compiler.rs b/crates/reims-vgpu/src/backend/vulkan/engine/pipeline_compiler.rs
+index 5e953682..e7d6e4fe 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/pipeline_compiler.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/pipeline_compiler.rs
+@@ -219,6 +219,37 @@ fn compiler() -> &'static Compiler {
+     })
+ }
+ 
++/// Whether graphics pipelines are built on the compiler thread, the default, or
++/// inside the draw that first needs them under `REIMS_VGPU_PIPELINE_ASYNC=off`.
++/// Read once; the boot line says which.
++pub(crate) fn off_the_draw() -> bool {
++    #[cfg(test)]
++    if test_hooks::in_draw_forced() {
++        return false;
++    }
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| {
++        let (state, value) = crate::env::read(crate::env::PIPELINE_ASYNC);
++        let on = !matches!(state, crate::env::Switch::Off);
++        crate::observe::off(format!(
++            "pipeline_async on={on} switch={state:?} value={}",
++            value.unwrap_or_else(|| "<unset>".into())
++        ));
++        on
++    })
++}
++
++/// Build `job` here and now, on the calling thread and under whatever locks it
++/// holds: the `REIMS_VGPU_PIPELINE_ASYNC=off` arm, which is how every graphics
++/// pipeline was built before the compiler thread existed.
++pub(crate) fn compile_in_draw(job: GraphicsCompileJob) -> CompiledPipeline {
++    CENSUS.jobs.fetch_add(1, Ordering::Relaxed);
++    CENSUS.in_draw.fetch_add(1, Ordering::Relaxed);
++    let done = compile(job, super::driver_breadcrumb::DriverLane::Drain);
++    done.ticket.0.compiled.store(true, Ordering::Release);
++    done
++}
++
+ /// Queue a compile. Never waits for one.
+ pub(crate) fn submit(job: GraphicsCompileJob) {
+     let compiler = compiler();
+@@ -270,7 +301,7 @@ impl Compiler {
+                 }
+             };
+             let ticket = job.ticket.clone();
+-            let done = compile(job);
++            let done = compile(job, super::driver_breadcrumb::DriverLane::Compiler);
+             self.finished
+                 .lock()
+                 .unwrap_or_else(|e| e.into_inner())
+@@ -284,7 +315,7 @@ impl Compiler {
+     }
+ }
+ 
+-fn compile(job: GraphicsCompileJob) -> CompiledPipeline {
++fn compile(job: GraphicsCompileJob, lane: super::driver_breadcrumb::DriverLane) -> CompiledPipeline {
+     let started = Instant::now();
+     CENSUS.note_max(
+         &CENSUS.queue_wait_max_ns,
+@@ -297,7 +328,7 @@ fn compile(job: GraphicsCompileJob) -> CompiledPipeline {
+         #[cfg(test)]
+         test_hooks::wait_at_gate();
+         let built =
+-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { build(&job) }));
++            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { build(&job, lane) }));
+         built.unwrap_or_else(|panic| {
+             let message = panic
+                 .downcast_ref::<&str>()
+@@ -334,9 +365,12 @@ fn compile(job: GraphicsCompileJob) -> CompiledPipeline {
+     }
+ }
+ 
+-unsafe fn build(job: &GraphicsCompileJob) -> Result<vk::Pipeline, CompileFailure> {
+-    let vert = module(&job.life, &job.vert, job.caps)?;
+-    let frag = module(&job.life, &job.frag, job.caps)?;
++unsafe fn build(
++    job: &GraphicsCompileJob,
++    lane: super::driver_breadcrumb::DriverLane,
++) -> Result<vk::Pipeline, CompileFailure> {
++    let vert = module(&job.life, &job.vert, job.caps, lane)?;
++    let frag = module(&job.life, &job.frag, job.caps, lane)?;
+     #[cfg(test)]
+     if let Some(result) = test_hooks::forced_result() {
+         return Err(CompileFailure::Refused {
+@@ -345,6 +379,7 @@ unsafe fn build(job: &GraphicsCompileJob) -> Result<vk::Pipeline, CompileFailure
+         });
+     }
+     let pipeline = create_graphics_pipeline(
++        lane,
+         &job.life.device,
+         job.life.pipeline_cache,
+         &job.recipe,
+@@ -378,6 +413,7 @@ unsafe fn module(
+     life: &DeviceLife,
+     words: &[u32],
+     caps: SpirvStorageCaps,
++    lane: super::driver_breadcrumb::DriverLane,
+ ) -> Result<vk::ShaderModule, CompileFailure> {
+     let declared =
+         declare_image_capabilities(words, caps).map_err(|error| CompileFailure::Refused {
+@@ -402,7 +438,7 @@ unsafe fn module(
+     let built = (|| {
+         refuse_invalid_module(&declared, digest)?;
+         let breadcrumb = super::driver_breadcrumb::DriverBreadcrumb::arm(
+-            super::driver_breadcrumb::DriverLane::Compiler,
++            lane,
+             "create_shader_module",
+             &[("module", &declared)],
+         )
+@@ -430,6 +466,8 @@ unsafe fn module(
+ /// What the compiler and the draws around it did over one census window.
+ struct Census {
+     jobs: AtomicU64,
++    /// Of `jobs`, the ones built inside their draw (`REIMS_VGPU_PIPELINE_ASYNC=off`).
++    in_draw: AtomicU64,
+     built: AtomicU64,
+     refused: AtomicU64,
+     stale_skipped: AtomicU64,
+@@ -452,6 +490,7 @@ impl Census {
+ 
+ static CENSUS: Census = Census {
+     jobs: AtomicU64::new(0),
++    in_draw: AtomicU64::new(0),
+     built: AtomicU64::new(0),
+     refused: AtomicU64::new(0),
+     stale_skipped: AtomicU64::new(0),
+@@ -496,6 +535,7 @@ pub(crate) fn take_census(win_ms: u64) -> Option<String> {
+     let take = |slot: &AtomicU64| slot.swap(0, Ordering::Relaxed);
+     let us = |ns: u64| ns / 1000;
+     let jobs = take(&CENSUS.jobs);
++    let in_draw = take(&CENSUS.in_draw);
+     let built = take(&CENSUS.built);
+     let refused = take(&CENSUS.refused);
+     let stale = take(&CENSUS.stale_skipped);
+@@ -512,7 +552,7 @@ pub(crate) fn take_census(win_ms: u64) -> Option<String> {
+         return None;
+     }
+     Some(format!(
+-        "pipeline_compile win_ms={win_ms} jobs={jobs} built={built} refused={refused} \
++        "pipeline_compile win_ms={win_ms} jobs={jobs} in_draw={in_draw} built={built} refused={refused} \
+          stale_skipped={stale} compile_us={} compile_max_us={} module_us={} \
+          queue_wait_max_us={} published_stale={published_stale} \
+          failures_delivered={delivered} cp_compiles={cp} cp_compile_us={} cp_compile_max_us={}",
+@@ -614,6 +654,29 @@ pub(crate) mod test_hooks {
+         *FORCED.lock().unwrap()
+     }
+ 
++    static IN_DRAW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++
++    /// Builds every pipeline inside its draw, as `REIMS_VGPU_PIPELINE_ASYNC=off`
++    /// does, until dropped.
++    pub(crate) struct InDraw(());
++
++    impl InDraw {
++        pub(crate) fn force() -> Self {
++            IN_DRAW.store(true, std::sync::atomic::Ordering::Release);
++            Self(())
++        }
++    }
++
++    impl Drop for InDraw {
++        fn drop(&mut self) {
++            IN_DRAW.store(false, std::sync::atomic::Ordering::Release);
++        }
++    }
++
++    pub(super) fn in_draw_forced() -> bool {
++        IN_DRAW.load(std::sync::atomic::Ordering::Acquire)
++    }
++
+     /// Wait until `ticket`'s compile has finished on the compiler thread.
+     pub(crate) fn wait_compiled(ticket: &super::PipelineTicket, limit: Duration) -> bool {
+         let deadline = Instant::now() + limit;
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/pipeline_compiler/tests.rs b/crates/reims-vgpu/src/backend/vulkan/engine/pipeline_compiler/tests.rs
+index a5e59d63..68203b0e 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/pipeline_compiler/tests.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/pipeline_compiler/tests.rs
+@@ -387,3 +387,24 @@ fn a_refused_compile_is_remembered_and_not_compiled_again() {
+     }
+     assert_eq!(CENSUS.jobs.load(Ordering::Relaxed), jobs_before);
+ }
++
++/// `REIMS_VGPU_PIPELINE_ASYNC=off` builds a cold pipeline inside its draw:
++/// the draw draws on its first ask, no ticket is handed out, and the compile is
++/// counted as built in the draw.
++#[test]
++fn with_the_switch_off_a_cold_pipeline_is_built_inside_its_draw() {
++    crate::observe::redirect_logs_for_tests();
++    let seed = 5;
++    let frag = frag_variant(seed);
++    let req = request(&frag);
++    let _in_draw = super::test_hooks::InDraw::force();
++    let jobs_before = CENSUS.jobs.load(Ordering::Relaxed);
++    let in_draw_before = CENSUS.in_draw.load(Ordering::Relaxed);
++    match ask(&req) {
++        Asked::Drawn(pixels) => assert_drawn_color(&pixels, seed),
++        Asked::Pending(_) => panic!("the switch is off and the draw still waited"),
++        Asked::NoDevice => return,
++    }
++    assert_eq!(CENSUS.jobs.load(Ordering::Relaxed), jobs_before + 1);
++    assert_eq!(CENSUS.in_draw.load(Ordering::Relaxed), in_draw_before + 1);
++}
+diff --git a/crates/reims-vgpu/src/env.rs b/crates/reims-vgpu/src/env.rs
+index 411d6894..33841eed 100644
+--- a/crates/reims-vgpu/src/env.rs
++++ b/crates/reims-vgpu/src/env.rs
+@@ -342,6 +342,17 @@ pub const PRESENT_DEPTH: &str = "REIMS_VGPU_PRESENT_DEPTH";
+ /// A/B'd on one binary.
+ pub const STAMP_COALESCE: &str = "REIMS_VGPU_STAMP_COALESCE";
+ 
++/// **Default on.** Setting this off builds a graphics pipeline inside the draw
++/// that first needs it — on the drain thread, under the device and engine
++/// locks — instead of on the pipeline compiler thread with the draw's packet
++/// waiting at its FIFO head. See `backend::vulkan::engine::pipeline_compiler`.
++///
++/// It exists so the two can be A/B'd on one binary: moving a compile off the
++/// draw changes when a packet runs relative to the others, and a regression in
++/// what the guest sees has to be attributable to that or ruled out without a
++/// rebuild. Off is the old behaviour exactly, long holds included.
++pub const PIPELINE_ASYNC: &str = "REIMS_VGPU_PIPELINE_ASYNC";
++
+ /// **Probe, default off.** Setting this *on* cuts every guest-page scatter run
+ /// into four contiguous sub-ranges that tile it exactly.
+ ///
+@@ -1239,7 +1250,7 @@ pub fn switch(name: &str) -> Switch {
+ /// Nothing enforces that a new `pub const` above is added to this list; the rule
+ /// is stated and honestly unenforced. What keeps it small is that the list is
+ /// next to the constants, and [`report_line`] is the only consumer.
+-pub const ALL: [&str; 31] = [
++pub const ALL: [&str; 32] = [
+     COLOR_GENERAL,
+     LAZY_WRITEBACK,
+     SLAB_RETAIN,
+@@ -1267,6 +1278,7 @@ pub const ALL: [&str; 31] = [
+     UNUSED_BINDS,
+     PRESENT_DEPTH,
+     STAMP_COALESCE,
++    PIPELINE_ASYNC,
+     SCATTER_SPLIT,
+     COMPUTE_SCATTER,
+     // Absent from this list until 2026-08-11, which made the boot line silent
+-- 
+2.43.0
+

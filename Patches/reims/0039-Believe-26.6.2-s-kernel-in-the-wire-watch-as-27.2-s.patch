@@ -1,0 +1,516 @@
+From c85bbf15995e2b5ae1c577342cddf555fc9e759e Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 11:17:48 +0800
+Subject: [PATCH 23/24] Believe 26.6.2's kernel in the wire watch, as 27.2's
+
+The watch and guard checked their offsets against two 27.2 dumps and
+turned themselves off on any other kernel. A 26.6.2 (25G83) panic dump
+has the same layout on all 8 of its wired mappings: the 0x98-byte
+MappingInternal with id at +0x30, size 0x200 at +0x40, +0x48 and +0x50
+zero, the surface descriptor at +0x20, the page-table descriptor at
++0x58 and the page count at +0x80; the descriptors' _wireCount +0x88,
+_initialized +0x8c, _length +0x50, mixed data +0x90 with its length at
++0x18, _pages +0x98 and _buffer +0xb8; and their class in the kernel's
+__DATA_CONST. Its kernel differs only where the checks already allow:
+VBAR_EL1 is 0x6000 into __TEXT_EXEC rather than at its start, and the
+scan down from it meets a kext's header (filetype 0xb) 68 pages before
+the kernel's, which the scan already passes over since it takes an
+MH_EXECUTE only.
+
+So 26.6.2's version string joins 27.2's, matched exactly as before
+(KNOWN_KERNEL_VERSIONS). 13.6 and 14.6.1 lay the mapping out without the
+Sonoma shift, and 15.6.1 has not been checked; they stay off.
+
+Tests (lib, --test-threads=1): 2309 passed, 0 failed. New: a kext's
+header between VBAR_EL1 and the kernel's is passed over, and alone is no
+kernel; 26.6.2's string with VBAR 0x6000 into a two-page __TEXT_EXEC
+and a kext header on the way is verified, its mapping watched and
+condemned at the drop, while the 13.6, 14.6.1 and 15.6.1 strings are
+refused. No guest was booted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/runtime/mapper/wire_watch.rs          |  50 +++--
+ .../src/runtime/mapper/wire_watch_tests.rs    | 176 +++++++++++++++---
+ 2 files changed, 183 insertions(+), 43 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs b/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
+index e58b5430..c62ee34b 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
+@@ -25,14 +25,19 @@
+ //! # What it reads, and why it believes it
+ //!
+ //! The offsets below are 27.2's (26B123), inferred from the driver's code and
+-//! checked against both dumps. Nothing here is trusted before it is checked:
++//! checked against both dumps. macOS 26.6.2 (25G83) has the same offsets, checked
++//! on every wired mapping of one panic dump. Nothing here is trusted before it
++//! is checked:
+ //!
+ //! 1. The kernel. The Mach-O header of the kernel is found by stepping down
+ //!    page by page from `VBAR_EL1` (captured with the kernel root, see
+-//!    [`crate::runtime::kernel_walk`]); its `__TEXT` must start at the header
+-//!    itself, `VBAR_EL1` must lie in one of its segments, and `__TEXT,__const`
+-//!    must hold exactly [`EXPECTED_KERNEL_VERSION`]. Any other kernel turns the
+-//!    watch off for the boot.
++//!    [`crate::runtime::kernel_walk`]), passing over any header that is not
++//!    `MH_EXECUTE` (26.6.2 has a kext's on the way); its `__TEXT` must start at
++//!    the header itself, `VBAR_EL1` must lie in one of its segments (27.2 enters
++//!    at `__TEXT_EXEC`'s start, 26.6.2 0x6000 into it), and `__TEXT,__const`
++//!    must hold one of [`KNOWN_KERNEL_VERSIONS`] exactly. Any other kernel turns
++//!    the watch off for the boot: 13.6 and 14.6.1 lay the mapping out
++//!    differently, and 15.6.1 has not been checked.
+ //! 2. Each mapping. The `MappingInternal` must name the mapping's id, the
+ //!    `0x200` descriptor size and the page count this device resolved; the
+ //!    page-table descriptor's buffer must be the page table this device reads;
+@@ -159,9 +164,16 @@ pub(crate) fn with_switches<R>(watch: bool, guard: bool, f: impl FnOnce() -> R)
+ 
+ // MARK: - Layout
+ 
+-/// `version[]` of the kernel the offsets below were read from.
+-pub const EXPECTED_KERNEL_VERSION: &str = "Darwin Kernel Version 27.2.0: Wed Oct 14 23:44:09 PDT \
++/// `version[]` of macOS 27.2 (26B123), the kernel the offsets below were read
++/// from.
++pub const KERNEL_VERSION_27_2: &str = "Darwin Kernel Version 27.2.0: Wed Oct 14 23:44:09 PDT \
+      2026; root:xnu-13432.41.4~25/RELEASE_ARM64_VMAPPLE";
++/// `version[]` of macOS 26.6.2 (25G83), whose offsets are 27.2's; see
++/// `~/forensics/layouts.txt` on dgx for what was checked.
++pub const KERNEL_VERSION_26_6_2: &str = "Darwin Kernel Version 25.6.0: Fri Jul 31 19:16:43 PDT \
++     2026; root:xnu-12377.161.14~5/RELEASE_ARM64_VMAPPLE";
++/// The kernels the watch believes, matched exactly.
++pub const KNOWN_KERNEL_VERSIONS: [&str; 2] = [KERNEL_VERSION_27_2, KERNEL_VERSION_26_6_2];
+ const VERSION_PREFIX: &[u8] = b"Darwin Kernel Version ";
+ /// Longest version string read back for the log.
+ const VERSION_MAX: usize = 256;
+@@ -178,13 +190,14 @@ const LOAD_COMMANDS_MAX: usize = 0x10000;
+ /// `__TEXT,__const` larger than this is not read.
+ const TEXT_CONST_MAX: u64 = 8 << 20;
+ /// How far below `VBAR_EL1` the kernel header is looked for. On 27.2 it is
+-/// 0x2ec0000 below; this is a bound on the search, not a guess at the answer.
++/// 0x2ec0000 below, on 26.6.2 0x2c06000; this is a bound on the search, not a
++/// guess at the answer.
+ const KERNEL_SCAN_BYTES: u64 = 256 << 20;
+ 
+-/// `IOSurfaceParavirtMappingInternal`, 27.2. `+0x10` is the driver's own
+-/// `refs * 4 | wired` word, `+0x20` the surface descriptor, `+0x58` the
+-/// page-table descriptor (macOS 14 and later moved the page fields by
+-/// [`iosurface_pages::MAPPING_INTERNAL_SONOMA_SHIFT`]).
++/// `IOSurfaceParavirtMappingInternal`, 27.2 and 26.6.2. `+0x10` is the
++/// driver's own `refs * 4 | wired` word, `+0x20` the surface descriptor,
++/// `+0x58` the page-table descriptor (macOS 14 and later moved the page fields
++/// by [`iosurface_pages::MAPPING_INTERNAL_SONOMA_SHIFT`]).
+ const MI_STATE: u64 = 0x10;
+ const MI_SURFACE_IOMD: u64 = 0x20;
+ const MI_ID: u64 = iosurface_pages::MAPPING_INTERNAL_ID;
+@@ -198,9 +211,10 @@ const MI_PAGE_COUNT: u64 =
+ /// One read covers every field above.
+ const MI_WINDOW: std::ops::Range<u64> = MI_STATE..MI_PAGE_COUNT + 8;
+ 
+-/// `IOBufferMemoryDescriptor` on 27.2's xnu: `IOMemoryDescriptor::_length`,
+-/// `IOGeneralMemoryDescriptor::_task`, `_wireCount`, `_initialized`,
+-/// `_memoryEntries`, `_pages`, and `IOBufferMemoryDescriptor::_buffer`.
++/// `IOBufferMemoryDescriptor` on 27.2's and 26.6.2's xnu:
++/// `IOMemoryDescriptor::_length`, `IOGeneralMemoryDescriptor::_task`,
++/// `_wireCount`, `_initialized`, `_memoryEntries`, `_pages`, and
++/// `IOBufferMemoryDescriptor::_buffer`.
+ const IOMD_LENGTH: u64 = 0x50;
+ const IOMD_TASK: u64 = 0x70;
+ const IOMD_WIRE_COUNT: u64 = 0x88;
+@@ -926,6 +940,8 @@ fn check_kernel<H: HostMemory + HostOps>(
+         let mut b = [0u8; 16];
+         if rd.bytes(at, &mut b) {
+             let word = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
++            // Only the kernel's own header: a kext's (`MH_KEXT_BUNDLE`) can
++            // sit between it and `VBAR_EL1`, and does on 26.6.2.
+             if word(0) == MH_MAGIC_64 && word(1) == CPU_TYPE_ARM64 && word(3) == MH_EXECUTE {
+                 header = Some(at);
+                 break;
+@@ -999,7 +1015,7 @@ fn check_kernel<H: HostMemory + HostOps>(
+             }
+         })
+         .collect();
+-    if version != EXPECTED_KERNEL_VERSION {
++    if !KNOWN_KERNEL_VERSIONS.contains(&version.as_str()) {
+         return KernelVerdict::Wrong(
+             "kernel_version_mismatch",
+             format!("version=\"{version}\" {at_header}"),
+@@ -1045,7 +1061,7 @@ fn kernel_image<H: HostMemory + HostOps>(
+             crate::observe::fail(format!(
+                 "wire_watch_layout_unverified scope=kernel reason={reason} {seen} expected=\"{}\" \
+                  (the watch is off for this boot)",
+-                EXPECTED_KERNEL_VERSION
++                KNOWN_KERNEL_VERSIONS.join("\" | \"")
+             ));
+             ww.kernel = KernelCheck::Unverified;
+             None
+diff --git a/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs b/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs
+index aa88b4a7..556b5ee5 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs
+@@ -248,14 +248,14 @@ fn swap(state: &mut DeviceState, host: &FakeHost, stamp: u32) {
+ #[test]
+ fn a_checked_mapping_reports_every_count_change_and_its_first_drop_once() {
+     with_switches(true, false, || {
+-        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
+         let cap = crate::observe::FailCapture::start();
+         on_map(&mut state, &host, MID);
+         let kernel = lines_with(&cap, "wire_watch_kernel verified");
+         assert_eq!(kernel.len(), 1, "{:?}", cap.lines());
+         assert!(
+             kernel[0].contains(&format!("header={KERNEL:#x}"))
+-                && kernel[0].contains(&format!("version=\"{EXPECTED_KERNEL_VERSION}\"")),
++                && kernel[0].contains(&format!("version=\"{KERNEL_VERSION_27_2}\"")),
+             "{}",
+             kernel[0]
+         );
+@@ -345,7 +345,7 @@ fn a_checked_mapping_reports_every_count_change_and_its_first_drop_once() {
+ #[test]
+ fn a_table_count_below_its_map_value_is_an_anomaly_even_above_zero() {
+     with_switches(true, false, || {
+-        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
+         let cap = crate::observe::FailCapture::start();
+         on_map(&mut state, &host, MID);
+         put32(&mut host, TABLE + IOMD_WIRE_COUNT, 1);
+@@ -391,7 +391,7 @@ fn another_kernel_turns_the_watch_off_and_nothing_else_is_said() {
+ #[test]
+ fn a_kernel_without_its_header_below_vbar_is_not_believed() {
+     with_switches(true, false, || {
+-        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
+         // `__TEXT` that does not start at the header is a header for some other
+         // image than the one running.
+         let mut cmds = segment(b"__TEXT", KERNEL + PAGE, PAGE, &[]);
+@@ -408,6 +408,130 @@ fn a_kernel_without_its_header_below_vbar_is_not_believed() {
+     });
+ }
+ 
++/// `MH_KEXT_BUNDLE`.
++const MH_KEXT_BUNDLE: u32 = 0xb;
++
++/// A kext's Mach-O header, as the scan down from `VBAR_EL1` meets one on 26.6.2.
++fn put_kext_header(host: &mut FakeHost, at: u64) {
++    for (i, word) in [MH_MAGIC_64, CPU_TYPE_ARM64, 0, MH_KEXT_BUNDLE]
++        .into_iter()
++        .enumerate()
++    {
++        put32(host, at + 4 * i as u64, word);
++    }
++}
++
++/// A kext's header between `VBAR_EL1` and the kernel's is passed over: the scan
++/// takes an `MH_EXECUTE` only. Alone, with no `MH_EXECUTE` below it, it is no
++/// kernel.
++#[test]
++fn a_kext_header_below_vbar_is_passed_over() {
++    with_switches(true, false, || {
++        let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
++        put_kext_header(&mut host, KERNEL + PAGE);
++        let cap = crate::observe::FailCapture::start();
++        on_map(&mut state, &host, MID);
++        let kernel = lines_with(&cap, "wire_watch_kernel verified");
++        assert_eq!(kernel.len(), 1, "{:?}", cap.lines());
++        assert!(
++            kernel[0].contains(&format!("header={KERNEL:#x}"))
++                && kernel[0].contains("scanned_pages=4"),
++            "{}",
++            kernel[0]
++        );
++        assert!(!state.wire_watch.off());
++    });
++    with_switches(true, false, || {
++        let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
++        // The kernel's own header, made a kext's.
++        put32(&mut host, KERNEL + 12, MH_KEXT_BUNDLE);
++        let cap = crate::observe::FailCapture::start();
++        on_map(&mut state, &host, MID);
++        assert!(cap
++            .one("wire_watch_layout_unverified")
++            .contains("reason=kernel_header_not_found"));
++        assert!(state.wire_watch.off());
++    });
++}
++
++/// 26.6.2's kernel is believed as 27.2's is: its own version string, matched
++/// exactly, with `VBAR_EL1` 0x6000 into a two-page `__TEXT_EXEC` and a kext's
++/// header met on the way down. Its mapping is watched and the guard condemns it
++/// at the drop. 13.6, 14.6.1 and 15.6.1 stay off.
++#[test]
++fn the_26_6_2_kernel_is_believed_and_its_mappings_guarded() {
++    with_switches(true, true, || {
++        let (mut state, mut host) = fixture(KERNEL_VERSION_26_6_2);
++        let vbar = TEXT_EXEC + 0x6000;
++        let mut cmds = segment(
++            b"__TEXT",
++            KERNEL,
++            2 * PAGE,
++            &[(b"__const", TEXT_CONST, 0x200)],
++        );
++        cmds.extend(segment(b"__DATA_CONST", DATA_CONST, PAGE, &[]));
++        cmds.extend(segment(b"__TEXT_EXEC", TEXT_EXEC, 2 * PAGE, &[]));
++        host.write_gpa(KERNEL + MACH_HEADER_64_LEN as u64, &cmds)
++            .unwrap();
++        put32(&mut host, vbar & !(PAGE - 1), 0);
++        put_kext_header(&mut host, KERNEL + PAGE);
++        state.kernel_walk.root.as_mut().unwrap().vbar = Some(vbar);
++        let cap = crate::observe::FailCapture::start();
++        on_map(&mut state, &host, MID);
++        let kernel = lines_with(&cap, "wire_watch_kernel verified");
++        assert_eq!(kernel.len(), 1, "{:?}", cap.lines());
++        assert!(
++            kernel[0].contains(&format!("version=\"{KERNEL_VERSION_26_6_2}\""))
++                && kernel[0].contains(&format!("header={KERNEL:#x}"))
++                && kernel[0].contains("scanned_pages=5"),
++            "{}",
++            kernel[0]
++        );
++        assert_eq!(lines_with(&cap, "wire_watch map mapping=2 ").len(), 1);
++        set_surface_wire(&mut host, 0);
++        assert!(!write_now(
++            &mut state,
++            &host,
++            MID,
++            "mapping_write",
++            WriteKind::Cpu
++        ));
++        assert!(cap
++            .one("wire_guard_condemned")
++            .contains("mapping=2 field=surface"));
++    });
++    for (macos, version) in [
++        (
++            "13.6",
++            "Darwin Kernel Version 22.6.0: Fri Sep 15 13:39:33 PDT 2023; \
++             root:xnu-8796.141.3.700.8~1/RELEASE_ARM64_VMAPPLE",
++        ),
++        (
++            "14.6.1",
++            "Darwin Kernel Version 23.6.0: Mon Jul 29 21:13:03 PDT 2024; \
++             root:xnu-10063.141.2~1/RELEASE_ARM64_VMAPPLE",
++        ),
++        (
++            "15.6.1",
++            "Darwin Kernel Version 24.6.0: Mon Jul 14 11:30:18 PDT 2025; \
++             root:xnu-11417.140.69~1/RELEASE_ARM64_VMAPPLE",
++        ),
++    ] {
++        with_switches(true, true, || {
++            let (mut state, host) = fixture(version);
++            let cap = crate::observe::FailCapture::start();
++            on_map(&mut state, &host, MID);
++            assert!(
++                cap.one("wire_watch_layout_unverified")
++                    .contains("reason=kernel_version_mismatch"),
++                "{macos}: {:?}",
++                cap.lines()
++            );
++            assert!(state.wire_watch.off(), "{macos}");
++        });
++    }
++}
++
+ /// The check a broken fixture should fail, and how to break it.
+ type Breakage = (&'static str, fn(&mut FakeHost));
+ 
+@@ -425,7 +549,7 @@ fn a_mapping_whose_layout_disagrees_is_not_watched() {
+             ("iomd_class", |h| put64(h, TABLE, 0x5b95_7e00_2000_0638)),
+         ];
+         for (reason, break_it) in cases {
+-            let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++            let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
+             break_it(&mut host);
+             let cap = crate::observe::FailCapture::start();
+             on_map(&mut state, &host, MID);
+@@ -455,7 +579,7 @@ fn a_mapping_whose_layout_disagrees_is_not_watched() {
+ #[test]
+ fn a_count_that_cannot_be_read_is_neither_a_transition_nor_a_refusal() {
+     with_switches(true, true, || {
+-        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
+         let cap = crate::observe::FailCapture::start();
+         on_map(&mut state, &host, MID);
+         // The worker, with no validated walk to read through.
+@@ -485,7 +609,7 @@ fn a_count_that_cannot_be_read_is_neither_a_transition_nor_a_refusal() {
+ #[test]
+ fn the_guard_condemns_at_the_first_drop_and_never_lets_go() {
+     with_switches(true, true, || {
+-        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
+         let cap = crate::observe::FailCapture::start();
+         on_map(&mut state, &host, MID);
+         assert!(write_now(
+@@ -560,7 +684,7 @@ fn the_guard_condemns_at_the_first_drop_and_never_lets_go() {
+         ));
+     });
+     with_switches(true, false, || {
+-        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
+         let cap = crate::observe::FailCapture::start();
+         on_map(&mut state, &host, MID);
+         set_surface_wire(&mut host, 0);
+@@ -576,7 +700,7 @@ fn the_guard_condemns_at_the_first_drop_and_never_lets_go() {
+ #[test]
+ fn a_mapping_checked_after_map_reports_a_count_already_at_zero() {
+     with_switches(true, false, || {
+-        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
+         // `MAP` arrived before the page list resolved.
+         let entries = std::mem::take(&mut state.mappings.get_mut(&MID).unwrap().page_entries);
+         let cap = crate::observe::FailCapture::start();
+@@ -597,7 +721,7 @@ fn a_mapping_checked_after_map_reports_a_count_already_at_zero() {
+ #[test]
+ fn a_reattached_internal_retires_the_watch() {
+     with_switches(true, false, || {
+-        let (mut state, host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (mut state, host) = fixture(KERNEL_VERSION_27_2);
+         let cap = crate::observe::FailCapture::start();
+         on_map(&mut state, &host, MID);
+         state.mappings.get_mut(&MID).unwrap().mapping_internal = MI + 0x200;
+@@ -617,7 +741,7 @@ fn a_reattached_internal_retires_the_watch() {
+ #[test]
+ fn off_by_default_it_reads_nothing_and_says_nothing() {
+     with_switches(false, true, || {
+-        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
+         let cap = crate::observe::FailCapture::start();
+         on_map(&mut state, &host, MID);
+         set_surface_wire(&mut host, 0);
+@@ -641,7 +765,7 @@ fn off_by_default_it_reads_nothing_and_says_nothing() {
+ #[test]
+ fn a_stamp_completes_only_the_swaps_it_reaches() {
+     with_switches(true, false, || {
+-        let (mut state, host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (mut state, host) = fixture(KERNEL_VERSION_27_2);
+         let cap = crate::observe::FailCapture::start();
+         on_map(&mut state, &host, MID);
+         swap(&mut state, &host, 0x20);
+@@ -712,7 +836,7 @@ fn put_display_fifo(state: &mut DeviceState, host: &mut FakeHost) -> (u64, Vec<u
+ #[test]
+ fn a_drop_after_a_display_swap_is_aligned_with_that_swap_and_its_stamp() {
+     with_switches(true, false, || {
+-        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
+         let (regs, packet) = put_display_fifo(&mut state, &mut host);
+         on_map(&mut state, &host, MID);
+         // Past the kernel check, the root is not needed; without it the
+@@ -766,7 +890,7 @@ fn a_drop_after_a_display_swap_is_aligned_with_that_swap_and_its_stamp() {
+ #[test]
+ fn a_display_swap_held_behind_a_translation_is_seen_before_it_runs() {
+     with_switches(true, false, || {
+-        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
+         put_display_fifo(&mut state, &mut host);
+         on_map(&mut state, &host, MID);
+         let peeked = crate::runtime::drain::peek_child_head(&state, &host, CHANNEL).unwrap();
+@@ -803,7 +927,7 @@ fn a_display_swap_held_behind_a_translation_is_seen_before_it_runs() {
+ fn a_condemned_mapping_drops_its_owed_frame() {
+     use crate::runtime::writeback_debt::test_resident_identity;
+     with_switches(true, true, || {
+-        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
+         on_map(&mut state, &host, MID);
+         let _ = state
+             .pending_writebacks
+@@ -825,7 +949,7 @@ fn a_condemned_mapping_drops_its_owed_frame() {
+ fn a_swap_published_before_the_drop_is_refused_and_still_stamped() {
+     use crate::model::{CHILD_REG_HEAD, CHILD_REG_TAIL};
+     with_switches(true, true, || {
+-        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
+         let (regs, first) = put_display_fifo(&mut state, &mut host);
+         on_map(&mut state, &host, MID);
+         state.kernel_walk.root = None;
+@@ -897,7 +1021,7 @@ fn a_rebuilt_fifo_is_not_judged_by_the_old_horizon() {
+         CHILD_REG_HEAD, CHILD_REG_TAIL, PACKET_HEADER_LEN, ROOT_OP_DEFINE_FIFO, ROOT_OP_FREE_FIFO,
+     };
+     with_switches(true, true, || {
+-        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
+         let (regs, packet) = put_display_fifo(&mut state, &mut host);
+         on_map(&mut state, &host, MID);
+         state.kernel_walk.root = None;
+@@ -963,7 +1087,7 @@ fn a_rebuilt_fifo_is_not_judged_by_the_old_horizon() {
+ fn a_fifo_moved_to_another_ring_is_not_judged_by_the_old_horizon() {
+     use crate::model::{CHILD_REG_BASE_PFN, CHILD_REG_HEAD, CHILD_REG_TAIL};
+     with_switches(true, true, || {
+-        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
+         let (regs, packet) = put_display_fifo(&mut state, &mut host);
+         on_map(&mut state, &host, MID);
+         state.kernel_walk.root = None;
+@@ -1004,7 +1128,7 @@ fn a_fifo_moved_to_another_ring_is_not_judged_by_the_old_horizon() {
+ #[test]
+ fn a_burst_of_row_writes_reads_the_counts_once() {
+     with_switches(true, true, || {
+-        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
+         on_map(&mut state, &host, MID);
+         set_surface_wire(&mut host, 0);
+         assert!(!write_now(
+@@ -1063,7 +1187,7 @@ fn route(name: &str) -> u64 {
+ #[test]
+ fn a_new_mapping_over_a_withdrawn_incarnations_pages_is_written() {
+     with_switches(true, true, || {
+-        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
+         on_map(&mut state, &host, MID);
+         let new = new_surface(&[G[1]]);
+         put_surface(&mut host, &new, 1);
+@@ -1105,7 +1229,7 @@ fn a_new_mapping_over_a_withdrawn_incarnations_pages_is_written() {
+ #[test]
+ fn a_third_valid_owner_still_blocks_the_new_mapping() {
+     with_switches(true, true, || {
+-        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
+         on_map(&mut state, &host, MID);
+         set_surface_wire(&mut host, 0);
+         tick(&mut state, &host);
+@@ -1139,7 +1263,7 @@ fn a_third_valid_owner_still_blocks_the_new_mapping() {
+ #[test]
+ fn a_withdrawn_incarnation_stays_refused_when_its_count_recovers() {
+     with_switches(true, true, || {
+-        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
+         on_map(&mut state, &host, MID);
+         set_surface_wire(&mut host, 0);
+         tick(&mut state, &host);
+@@ -1181,7 +1305,7 @@ fn a_withdrawn_incarnation_stays_refused_when_its_count_recovers() {
+ #[test]
+ fn a_new_incarnation_of_the_old_id_inherits_nothing() {
+     with_switches(true, true, || {
+-        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
+         on_map(&mut state, &host, MID);
+         set_surface_wire(&mut host, 0);
+         tick(&mut state, &host);
+@@ -1223,7 +1347,7 @@ fn a_new_incarnation_of_the_old_id_inherits_nothing() {
+ #[test]
+ fn in_flight_writes_settle_before_a_condemned_owner_is_excluded() {
+     with_switches(true, true, || {
+-        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
+         on_map(&mut state, &host, MID);
+         let new = new_surface(&[G[1]]);
+         put_surface(&mut host, &new, 1);
+@@ -1274,7 +1398,7 @@ fn in_flight_writes_settle_before_a_condemned_owner_is_excluded() {
+ fn without_wire_evidence_both_sides_stay_quarantined() {
+     for (guard, wire) in [(false, 0), (true, 1)] {
+         with_switches(true, guard, || {
+-            let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++            let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
+             on_map(&mut state, &host, MID);
+             let new = new_surface(&[G[1]]);
+             put_surface(&mut host, &new, 1);
+@@ -1308,7 +1432,7 @@ fn a_condemned_incarnations_pages_are_never_read() {
+     use crate::runtime::scanout::read_mapping_bgra8;
+ 
+     with_switches(true, true, || {
+-        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        let (mut state, mut host) = fixture(KERNEL_VERSION_27_2);
+         on_map(&mut state, &host, MID);
+         // What the next owner of the pages wrote into them.
+         for &gpa in &G {
+-- 
+2.43.0
+

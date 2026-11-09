@@ -1,0 +1,627 @@
+From c94831b592b82ef3934d7b22d91488970008cb34 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 06:12:06 +0800
+Subject: [PATCH 05/24] Read the IOSurface mapper registers without the device
+ lock
+
+A vCPU reading a mapper register took the device lock, and so waited out
+whatever the drain worker was doing under it: a whole tranche, 8.2 s
+when that tranche compiled a pipeline, with QEMU's BQL held throughout.
+All five reads, ring base, capacity, descriptor table, producer and
+consumer, are plain state with no side effect.
+
+Serve them from IosfcLive, a set of atomics shared with the registry
+slot as the GFX consumer counter already is. Every writer of the
+registers publishes them under the device lock: the register write
+itself before it returns, drain_iosfc once it has advanced the consumer
+and before it queues the mapper interrupt, so the guest's handler finds
+the consumer caught up, and a device reset with the values it cleared.
+
+The writes are unchanged and stay synchronous on the vCPU that makes
+them. A producer write reads that vCPU's registers and walks guest
+kernel memory through its MMU, and the guest finds the request done
+when the write returns; the configuration and consumer writes are rare
+and stay ordered before it. With the QEMU side dispatching the window
+without the BQL, a writer that waits for the device lock no longer
+holds the BQL while it does.
+
+Count each vCPU's mapper register accesses, entry to return, split into
+reads and writes (vcpuN_iosfc_read_call, vcpuN_iosfc_write_call on the
+device_lock_hold lines). While QEMU dispatched the window under the
+BQL, that was how long the vCPU held it. The read holder leaves the
+census, since reads no longer take the lock.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 96177a523795bef122c4257f6d51156ed3f4efdb)
+---
+ crates/reims-vgpu/src/device/lock_hold.rs  | 108 +++++++++++++++++++--
+ crates/reims-vgpu/src/device/mod.rs        |  36 +++++--
+ crates/reims-vgpu/src/device/tests.rs      |  41 ++++++++
+ crates/reims-vgpu/src/model/mod.rs         |   4 +-
+ crates/reims-vgpu/src/model/state.rs       |  58 ++++++++++-
+ crates/reims-vgpu/src/runtime/drain/mod.rs |   3 +
+ crates/reims-vgpu/src/runtime/mmio.rs      |  91 +++++++++++++++--
+ 7 files changed, 309 insertions(+), 32 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/device/lock_hold.rs b/crates/reims-vgpu/src/device/lock_hold.rs
+index 660a0cdb..92c5239a 100644
+--- a/crates/reims-vgpu/src/device/lock_hold.rs
++++ b/crates/reims-vgpu/src/device/lock_hold.rs
+@@ -16,8 +16,8 @@
+ //! Every release goes through [`Held`] and is fair (`unlock_fair`): when a
+ //! thread is parked on the lock, the lock passes straight to the one that
+ //! parked first instead of being left free for whichever thread reaches it
+-//! next. The threads that block on it — the drain worker, a vCPU on the mapper
+-//! registers, the console's scanout copy, device reset — are served in the
++//! next. The threads that block on it — the drain worker, a vCPU writing a
++//! mapper register, the console's scanout copy, device reset — are served in the
+ //! order they blocked. A vCPU waits for the hold in progress and the waiters
+ //! ahead of it, not for a worker that comes straight back for the lock; the
+ //! worker waits for the vCPUs ahead of it, not for every vCPU that arrives
+@@ -75,9 +75,8 @@ pub enum Holder {
+     Drain,
+     /// `device_reset`.
+     Reset,
+-    /// A vCPU reading an IOSurface mapper register.
+-    VcpuIosfcRead,
+-    /// A vCPU writing one — the mapper ring publish, which drains synchronously.
++    /// A vCPU writing an IOSurface mapper register: the ring publish drains
++    /// synchronously. Reads take no lock.
+     VcpuIosfcWrite,
+     /// A vCPU reading a GFX register under the lock (`try_lock` only).
+     VcpuGfxRead,
+@@ -93,13 +92,12 @@ pub enum Holder {
+     Display,
+ }
+ 
+-const HOLDERS: usize = 10;
++const HOLDERS: usize = 9;
+ 
+ impl Holder {
+     const ALL: [Holder; HOLDERS] = [
+         Holder::Drain,
+         Holder::Reset,
+-        Holder::VcpuIosfcRead,
+         Holder::VcpuIosfcWrite,
+         Holder::VcpuGfxRead,
+         Holder::VcpuGfxWrite,
+@@ -117,7 +115,6 @@ impl Holder {
+         match self {
+             Self::Drain => "drain",
+             Self::Reset => "reset",
+-            Self::VcpuIosfcRead => "vcpu_iosfc_read",
+             Self::VcpuIosfcWrite => "vcpu_iosfc_write",
+             Self::VcpuGfxRead => "vcpu_gfx_read",
+             Self::VcpuGfxWrite => "vcpu_gfx_write",
+@@ -134,6 +131,32 @@ impl Holder {
+     }
+ }
+ 
++/// A vCPU's access to an IOSurface mapper register, timed from entry to
++/// return. While QEMU dispatches the region under its BQL, which it does
++/// unless the region is lockless, this is how long that vCPU held the BQL.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum IosfcCall {
++    Read,
++    Write,
++}
++
++const IOSFC_CALLS: usize = 2;
++
++impl IosfcCall {
++    const ALL: [IosfcCall; IOSFC_CALLS] = [IosfcCall::Read, IosfcCall::Write];
++
++    fn index(self) -> usize {
++        self as usize
++    }
++
++    fn name(self) -> &'static str {
++        match self {
++            Self::Read => "read",
++            Self::Write => "write",
++        }
++    }
++}
++
+ /// A report is written at most this often.
+ pub const REPORT_INTERVAL_MS: u64 = 10_000;
+ /// ...and only when a hold or a wait in the interval reached this.
+@@ -271,6 +294,8 @@ struct Period {
+     /// Drain releases made while a vCPU waited, each handing the lock on
+     /// rather than leaving it to be taken again.
+     drain_handoffs: AtomicU64,
++    /// Each vCPU's mapper register accesses, entry to return, by kind.
++    iosfc_calls: [[Durations; CPU_SLOTS]; IOSFC_CALLS],
+ }
+ 
+ impl Default for Period {
+@@ -281,6 +306,7 @@ impl Default for Period {
+             vcpu_wait_by_cpu: std::array::from_fn(|_| Durations::default()),
+             drain_wait: Durations::default(),
+             drain_handoffs: AtomicU64::new(0),
++            iosfc_calls: std::array::from_fn(|_| std::array::from_fn(|_| Durations::default())),
+         }
+     }
+ }
+@@ -292,6 +318,7 @@ struct PeriodSummary {
+     vcpu_wait_by_cpu: Vec<(usize, Summary)>,
+     drain_wait: Summary,
+     drain_handoffs: u64,
++    iosfc_calls: Vec<(IosfcCall, usize, Summary)>,
+ }
+ 
+ impl Period {
+@@ -310,6 +337,14 @@ impl Period {
+                 true => self.drain_handoffs.swap(0, Ordering::Relaxed),
+                 false => self.drain_handoffs.load(Ordering::Relaxed),
+             },
++            iosfc_calls: IosfcCall::ALL
++                .iter()
++                .flat_map(|&call| {
++                    (0..CPU_SLOTS).map(move |cpu| {
++                        (call, cpu, self.iosfc_calls[call.index()][cpu].summary(take))
++                    })
++                })
++                .collect(),
+         }
+     }
+ }
+@@ -319,11 +354,20 @@ impl PeriodSummary {
+         self.vcpu_wait.count == 0
+             && self.drain_wait.count == 0
+             && self.holds.iter().all(|(_, s)| s.count == 0)
++            && self.iosfc_calls.iter().all(|(_, _, s)| s.count == 0)
+     }
+ 
+     fn worst_us(&self) -> u64 {
+         let hold = self.holds.iter().map(|(_, s)| s.max_us).max().unwrap_or(0);
+-        hold.max(self.vcpu_wait.max_us).max(self.drain_wait.max_us)
++        let call = self
++            .iosfc_calls
++            .iter()
++            .map(|(_, _, s)| s.max_us)
++            .max()
++            .unwrap_or(0);
++        hold.max(call)
++            .max(self.vcpu_wait.max_us)
++            .max(self.drain_wait.max_us)
+     }
+ 
+     /// Everything after the leading vCPU wait fields.
+@@ -342,6 +386,12 @@ impl PeriodSummary {
+                 .filter(|(_, s)| s.count != 0)
+                 .map(|(cpu, s)| format!("{}_wait={s}", cpu_name(*cpu))),
+         );
++        fields.extend(
++            self.iosfc_calls
++                .iter()
++                .filter(|(_, _, s)| s.count != 0)
++                .map(|(call, cpu, s)| format!("{}_iosfc_{}_call={s}", cpu_name(*cpu), call.name())),
++        );
+         fields.join(" ")
+     }
+ }
+@@ -500,6 +550,12 @@ impl LockCensus {
+         self.boot.drain_handoffs.fetch_add(1, Ordering::Relaxed);
+     }
+ 
++    fn note_iosfc_call(&self, call: IosfcCall, cpu: usize, us: u64) {
++        for period in [&self.interval, &self.boot] {
++            period.iosfc_calls[call.index()][cpu.min(OTHER_CPU)].note(us);
++        }
++    }
++
+     fn vcpu_waiting(&self) -> bool {
+         self.vcpu_waiters.load(Ordering::Acquire) != 0
+     }
+@@ -732,6 +788,12 @@ impl<T> Drop for Held<'_, T> {
+     }
+ }
+ 
++/// Count one mapper register access by this vCPU, from `started` to now.
++pub fn note_iosfc_call(call: IosfcCall, started: Instant) {
++    let us = started.elapsed().as_micros() as u64;
++    CENSUS.note_iosfc_call(call, this_cpu(), us);
++}
++
+ /// Write the boot's summary; called at device reset and destroy.
+ pub fn report_boot() {
+     if let Some(line) = CENSUS.boot_summary() {
+@@ -818,6 +880,34 @@ mod tests {
+         assert_eq!(*m.lock(), 6);
+     }
+ 
++    /// Mapper register accesses are counted per vCPU and per kind, and a long
++    /// one is reason enough for a line.
++    #[test]
++    fn iosfc_calls_are_counted_per_vcpu_and_kind() {
++        let c = LockCensus::default();
++        c.note_iosfc_call(IosfcCall::Read, 3, 2);
++        assert_eq!(c.report(REPORT_INTERVAL_MS), None, "nothing reached 50 ms");
++
++        c.note_iosfc_call(IosfcCall::Write, 3, 70_000);
++        c.note_iosfc_call(IosfcCall::Read, 3, 2);
++        c.note_iosfc_call(IosfcCall::Read, 40, 5);
++        let line = c
++            .report(2 * REPORT_INTERVAL_MS + 1)
++            .expect("a 70 ms mapper write is reported");
++        assert!(
++            line.contains("vcpu3_iosfc_write_call=1/70000/70000"),
++            "{line}"
++        );
++        assert!(line.contains("vcpu3_iosfc_read_call=1/2/2"), "{line}");
++        assert!(
++            line.contains("vcpu_other_iosfc_read_call=1/5/5"),
++            "past the slots: {line}"
++        );
++
++        let boot = c.boot_summary().expect("the boot saw accesses");
++        assert!(boot.contains("vcpu3_iosfc_read_call=2/2/2"), "{boot}");
++    }
++
+     #[test]
+     fn a_vcpu_thread_name_gives_its_index() {
+         assert_eq!(vcpu_index("CPU 3/KVM"), Some(3));
+diff --git a/crates/reims-vgpu/src/device/mod.rs b/crates/reims-vgpu/src/device/mod.rs
+index 98d2b34f..758e1b5c 100644
+--- a/crates/reims-vgpu/src/device/mod.rs
++++ b/crates/reims-vgpu/src/device/mod.rs
+@@ -107,6 +107,9 @@ struct BoundDevice {
+     /// `writeFifo` producer spin must observe drain progress live, not a
+     /// cached snapshot from before the tranche.
+     fifo_read_live: Arc<AtomicU32>,
++    /// The IOSurface mapper registers, read by a vCPU with no lock; published
++    /// by whoever changes them under the device lock.
++    iosfc_live: Arc<crate::model::IosfcLive>,
+     /// An accepted present is waiting for QEMU to consume its scanout action.
+     /// Kept outside `inner` so new worker wakeups can yield without racing the
+     /// main-loop copy for the same device lock.
+@@ -248,6 +251,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
+     let child_doorbell_rung = Arc::clone(&dev.state.gfx.child_doorbell_rung);
+     let intr_fault = Arc::clone(&dev.state.gfx.interrupt_fault);
+     let fifo_read_live = Arc::clone(&dev.state.gfx.fifo_read);
++    let iosfc_live = Arc::clone(&dev.state.iosfc.live);
+     DEVICES.lock().insert(
+         id,
+         Arc::new(BoundDevice {
+@@ -264,6 +268,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
+             child_doorbell_rung,
+             intr_fault,
+             fifo_read_live,
++            iosfc_live,
+             present_action_pending: AtomicBool::new(false),
+             present_boundary_seen: AtomicBool::new(false),
+             reset_count: AtomicU64::new(0),
+@@ -501,25 +506,36 @@ fn lock_device_for_vcpu(slot: &BoundDevice, holder: Holder) -> Held<'_, DeviceIn
+     held
+ }
+ 
++/// Serve a mapper register read with no lock: see [`crate::model::IosfcLive`].
+ pub fn device_iosfc_read(id: u64, offset: u64, size: u32) -> Option<u64> {
++    let started = std::time::Instant::now();
+     let slot = device_slot(id)?;
+-    let d = lock_device_for_vcpu(&slot, Holder::VcpuIosfcRead);
+-    Some(d.device.iosfc_read(offset, size))
++    let value = crate::runtime::mmio::iosfc_read(&slot.iosfc_live, offset, size);
++    lock_hold::note_iosfc_call(lock_hold::IosfcCall::Read, started);
++    Some(value)
+ }
+ 
++/// Apply a mapper register write on the vCPU that made it, synchronously: a
++/// producer write captures that vCPU's registers and walks guest kernel
++/// memory through its MMU (`read_xreg`, `read_kva`), and the guest finds the
++/// request done when the write returns.
+ pub fn device_iosfc_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
++    let started = std::time::Instant::now();
+     let Some(slot) = device_slot(id) else {
+         return false;
+     };
+-    let mut d = lock_device_for_vcpu(&slot, Holder::VcpuIosfcWrite);
+-    if let Some(ops) = slot.ops {
+-        let DeviceInner { device, actions } = &mut *d;
+-        let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
+-        device.iosfc_write(&mut host, offset, data, size);
+-    } else {
+-        let mut host = NullHost;
+-        d.device.iosfc_write(&mut host, offset, data, size);
++    {
++        let mut d = lock_device_for_vcpu(&slot, Holder::VcpuIosfcWrite);
++        if let Some(ops) = slot.ops {
++            let DeviceInner { device, actions } = &mut *d;
++            let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
++            device.iosfc_write(&mut host, offset, data, size);
++        } else {
++            let mut host = NullHost;
++            d.device.iosfc_write(&mut host, offset, data, size);
++        }
+     }
++    lock_hold::note_iosfc_call(lock_hold::IosfcCall::Write, started);
+     true
+ }
+ 
+diff --git a/crates/reims-vgpu/src/device/tests.rs b/crates/reims-vgpu/src/device/tests.rs
+index 7769c82b..d592b6cb 100644
+--- a/crates/reims-vgpu/src/device/tests.rs
++++ b/crates/reims-vgpu/src/device/tests.rs
+@@ -590,3 +590,44 @@ fn present_action_owns_worker_boundary_until_scanout_copy() {
+     assert_eq!(slot.gfx_ingress.lock().len(), 0);
+     assert!(device_destroy(id));
+ }
++
++/// The IOSurface mapper registers read with no lock. A vCPU reading one while
++/// the drain worker holds the device lock answers at once, rather than waiting
++/// out the tranche, holding QEMU's BQL as it did.
++#[test]
++fn iosfc_reads_do_not_wait_for_the_device_lock() {
++    use crate::model::{
++        IOSFC_REG_CAPACITY, IOSFC_REG_CONSUMER, IOSFC_REG_PRODUCER, IOSFC_REG_RING_BASE,
++    };
++    let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
++    assert!(device_iosfc_write(id, IOSFC_REG_CAPACITY, 0x40, 4));
++    // No ring base: the producer write catches the consumer up, the boot
++    // handshake, and publishes both.
++    assert!(device_iosfc_write(id, IOSFC_REG_PRODUCER, 5, 4));
++    let slot = device_slot(id).expect("slot");
++    let drain_guard = slot.inner.lock();
++    let (sent, reads) = std::sync::mpsc::channel();
++    std::thread::spawn(move || {
++        let read = |offset| device_iosfc_read(id, offset, 4);
++        sent.send([
++            read(IOSFC_REG_RING_BASE),
++            read(IOSFC_REG_CAPACITY),
++            read(IOSFC_REG_PRODUCER),
++            read(IOSFC_REG_CONSUMER),
++        ])
++        .unwrap();
++    });
++    let reads = reads
++        .recv_timeout(std::time::Duration::from_secs(5))
++        .expect("an iosfc read waited for the device lock");
++    assert_eq!(reads, [Some(0), Some(0x40), Some(5), Some(5)]);
++    drop(drain_guard);
++
++    assert!(device_reset(id));
++    assert_eq!(
++        device_iosfc_read(id, IOSFC_REG_CAPACITY, 4),
++        Some(0),
++        "a reset publishes the registers it cleared"
++    );
++    assert!(device_destroy(id));
++}
+diff --git a/crates/reims-vgpu/src/model/mod.rs b/crates/reims-vgpu/src/model/mod.rs
+index 30e7c627..1e20adcd 100644
+--- a/crates/reims-vgpu/src/model/mod.rs
++++ b/crates/reims-vgpu/src/model/mod.rs
+@@ -17,7 +17,7 @@ pub(crate) use regs::*;
+ pub use state::{
+     ChannelRing, ComputeStorageResidencyKey, DeviceId, DeviceState, ExecFault,
+     FailEvent, GfxRegs, GuestLinearMemo, GvaBacking, GvaEvictionWitness,
+-    GvaHostView, HostLinearTexture, HostSurface, MapperCapture, MappingEntry,
++    GvaHostView, HostLinearTexture, HostSurface, IosfcLive, MapperCapture, MappingEntry,
+     PacketFault, PresentBacking, PresentState, RenderFlushWitness, ResourceValidity, SurfaceWriteKind, TaskEntry, TaskResource, TaskResourceLifetimeRef, TaskSamplerState, TaskTable, Type4Walk, UnimplementedCommand, FENCE_DOMAIN_BLIT,
+     FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER, GVA_ENCODE_CACHE_BYTE_CAP,
+     GVA_EVICTION_WITNESS_KEYS,
+@@ -84,7 +84,7 @@ impl<B: Backend> Device<B> {
+     }
+ 
+     pub fn iosfc_read(&self, offset: u64, size: u32) -> u64 {
+-        runtime::mmio::iosfc_read(&self.state, offset, size)
++        runtime::mmio::iosfc_read(&self.state.iosfc.live, offset, size)
+     }
+ 
+     pub fn iosfc_write<H: runtime::host::HostMemory + HostOps>(
+diff --git a/crates/reims-vgpu/src/model/state.rs b/crates/reims-vgpu/src/model/state.rs
+index 3de97c51..2de899c5 100644
+--- a/crates/reims-vgpu/src/model/state.rs
++++ b/crates/reims-vgpu/src/model/state.rs
+@@ -7,7 +7,7 @@ use crate::runtime::decode::resource::{
+ #[cfg(feature = "backend-vulkan")]
+ use std::collections::HashMap;
+ use std::collections::{BTreeMap, BTreeSet};
+-use std::sync::atomic::{AtomicU32, Ordering};
++use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+ use std::sync::{Arc, Mutex, OnceLock};
+ 
+ /// Opaque device instance id (QEMU handle).
+@@ -452,6 +452,57 @@ pub struct IosfcRegs {
+     pub desc_table: u64,
+     pub producer: u32,
+     pub consumer: u32,
++    /// The five registers as a vCPU reads them, shared with the registry slot.
++    /// Every writer of the fields above publishes them here, under the device
++    /// lock, with [`IosfcRegs::publish`].
++    pub live: Arc<IosfcLive>,
++}
++
++impl IosfcRegs {
++    /// Make the registers' current values what a vCPU reads. Called by every
++    /// writer once its change is complete, and before anything the change
++    /// raises — the mapper interrupt above all — can reach the guest.
++    pub fn publish(&self) {
++        let live = &self.live;
++        live.ring_base.store(self.ring_base, Ordering::Release);
++        live.capacity.store(self.capacity, Ordering::Release);
++        live.desc_table.store(self.desc_table, Ordering::Release);
++        live.producer.store(self.producer, Ordering::Release);
++        live.consumer.store(self.consumer, Ordering::Release);
++    }
++}
++
++/// The IOSurface mapper registers, readable with no lock.
++///
++/// A vCPU reading one of them used to take the device lock, and so waited for
++/// a whole drain tranche, seconds when that tranche compiles a pipeline, while
++/// holding QEMU's BQL. All five reads are plain state queries with no side
++/// effect, so they are served from here instead.
++#[derive(Debug, Default)]
++pub struct IosfcLive {
++    ring_base: AtomicU64,
++    capacity: AtomicU32,
++    desc_table: AtomicU64,
++    producer: AtomicU32,
++    consumer: AtomicU32,
++}
++
++impl IosfcLive {
++    /// The register at `offset`, or 0 for an offset that names none.
++    pub fn register(&self, offset: u64) -> u64 {
++        use crate::model::{
++            IOSFC_REG_CAPACITY, IOSFC_REG_CONSUMER, IOSFC_REG_DESC_TABLE, IOSFC_REG_PRODUCER,
++            IOSFC_REG_RING_BASE,
++        };
++        match offset {
++            IOSFC_REG_RING_BASE => self.ring_base.load(Ordering::Acquire),
++            IOSFC_REG_CAPACITY => self.capacity.load(Ordering::Acquire) as u64,
++            IOSFC_REG_DESC_TABLE => self.desc_table.load(Ordering::Acquire),
++            IOSFC_REG_PRODUCER => self.producer.load(Ordering::Acquire) as u64,
++            IOSFC_REG_CONSUMER => self.consumer.load(Ordering::Acquire) as u64,
++            _ => 0,
++        }
++    }
+ }
+ 
+ /// Per-channel child ring cache (page list decoded from base_pfn).
+@@ -3154,7 +3205,12 @@ impl DeviceState {
+         // Cleared as well as kept: a reset drops every channel, so a bit rung
+         // before it names a channel that no longer exists.
+         child_rung.store(0, Ordering::Release);
++        // The mapper registers' read rail, kept the same way and published
++        // as the reset leaves them.
++        let iosfc_live = Arc::clone(&self.iosfc.live);
+         *self = Self::new(id, page_shift);
++        self.iosfc.live = iosfc_live;
++        self.iosfc.publish();
+         self.gfx.interrupt_status_disp = intr_disp;
+         self.gfx.interrupt_status_gpu = intr_gpu;
+         self.gfx.interrupt_fault = intr_fault;
+diff --git a/crates/reims-vgpu/src/runtime/drain/mod.rs b/crates/reims-vgpu/src/runtime/drain/mod.rs
+index b4ade78d..d2bb3c93 100644
+--- a/crates/reims-vgpu/src/runtime/drain/mod.rs
++++ b/crates/reims-vgpu/src/runtime/drain/mod.rs
+@@ -5238,6 +5238,9 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut
+     }
+ 
+     state.iosfc.consumer = consumer;
++    // Published before the interrupt is queued: the guest's handler reads the
++    // consumer register without the device lock, and must find it caught up.
++    state.iosfc.publish();
+     if state.iosfc.consumer == state.iosfc.producer {
+         host.enqueue(HostAction::irq_iosfc());
+     }
+diff --git a/crates/reims-vgpu/src/runtime/mmio.rs b/crates/reims-vgpu/src/runtime/mmio.rs
+index 663d32f2..1d55519f 100644
+--- a/crates/reims-vgpu/src/runtime/mmio.rs
++++ b/crates/reims-vgpu/src/runtime/mmio.rs
+@@ -240,16 +240,11 @@ pub fn gfx_write<H: HostMemory + HostOps>(
+     }
+ }
+ 
+-/// Iosfc MMIO read.
+-pub fn iosfc_read(state: &DeviceState, offset: u64, size: u32) -> u64 {
+-    let mut val = match offset {
+-        IOSFC_REG_RING_BASE => state.iosfc.ring_base,
+-        IOSFC_REG_CAPACITY => state.iosfc.capacity as u64,
+-        IOSFC_REG_DESC_TABLE => state.iosfc.desc_table,
+-        IOSFC_REG_PRODUCER => state.iosfc.producer as u64,
+-        IOSFC_REG_CONSUMER => state.iosfc.consumer as u64,
+-        _ => 0,
+-    };
++/// Iosfc MMIO read, from the lock-free copy every writer publishes: all five
++/// registers are plain state with no read side effect, and a vCPU reading one
++/// must not wait for the device lock. See [`crate::model::IosfcLive`].
++pub fn iosfc_read(live: &crate::model::IosfcLive, offset: u64, size: u32) -> u64 {
++    let mut val = live.register(offset);
+     if size < MMIO_U64 && size > 0 {
+         let bits = (size as u64).saturating_mul(8).min(64);
+         if bits < 64 {
+@@ -295,6 +290,9 @@ pub fn iosfc_write<H: HostMemory + HostOps>(
+         IOSFC_REG_CONSUMER => state.iosfc.consumer = data as u32,
+         _ => {}
+     }
++    // Before the write returns, so the vCPU's next read sees it. A producer
++    // write that drained has published already, before its interrupt.
++    state.iosfc.publish();
+ }
+ 
+ #[cfg(test)]
+@@ -314,4 +312,77 @@ mod tests {
+         assert_ne!(state.active_child_mask & (1 << 4), 0);
+         assert!(host.bh_scheduled);
+     }
++
++    /// Notes what the guest would read from the consumer register, with no
++    /// lock, at the moment the mapper interrupt is queued.
++    struct ConsumerAtIrq {
++        live: std::sync::Arc<crate::model::IosfcLive>,
++        seen: Vec<u64>,
++    }
++
++    impl HostMemory for ConsumerAtIrq {
++        fn read_gpa(
++            &self,
++            _gpa: u64,
++            _buf: &mut [u8],
++        ) -> Result<(), crate::runtime::host::MemError> {
++            Err(crate::runtime::host::MemError::Unmapped)
++        }
++        fn write_gpa(
++            &mut self,
++            _gpa: u64,
++            _buf: &[u8],
++        ) -> Result<(), crate::runtime::host::MemError> {
++            Err(crate::runtime::host::MemError::Unmapped)
++        }
++    }
++
++    impl HostOps for ConsumerAtIrq {
++        fn mono_ns(&self) -> u64 {
++            0
++        }
++        fn enqueue(&mut self, action: HostAction) {
++            if action == HostAction::irq_iosfc() {
++                self.seen.push(self.live.register(IOSFC_REG_CONSUMER));
++            }
++        }
++        fn schedule_bh(&mut self) {}
++    }
++
++    /// The guest's mapper interrupt handler reads the consumer register
++    /// without the device lock, so the consumer must be published before the
++    /// interrupt is queued, not after the write returns.
++    #[test]
++    fn the_consumer_is_published_before_the_mapper_interrupt() {
++        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
++        let mut host = ConsumerAtIrq {
++            live: std::sync::Arc::clone(&state.iosfc.live),
++            seen: Vec::new(),
++        };
++        // No ring base: the producer write catches the consumer up, the boot
++        // handshake, and raises the interrupt.
++        iosfc_write(&mut state, &mut host, IOSFC_REG_PRODUCER, 7, MMIO_U32);
++        assert_eq!(host.seen, vec![7]);
++        assert_eq!(
++            iosfc_read(&state.iosfc.live, IOSFC_REG_PRODUCER, MMIO_U32),
++            7
++        );
++
++        iosfc_write(
++            &mut state,
++            &mut host,
++            IOSFC_REG_RING_BASE,
++            0x1_7000_0000,
++            MMIO_U64,
++        );
++        assert_eq!(
++            iosfc_read(&state.iosfc.live, IOSFC_REG_RING_BASE, MMIO_U32),
++            0x7000_0000,
++            "a 4-byte read keeps the low half"
++        );
++        assert_eq!(
++            iosfc_read(&state.iosfc.live, IOSFC_REG_RING_BASE, MMIO_U64),
++            0x1_7000_0000
++        );
++    }
+ }
+-- 
+2.43.0
+

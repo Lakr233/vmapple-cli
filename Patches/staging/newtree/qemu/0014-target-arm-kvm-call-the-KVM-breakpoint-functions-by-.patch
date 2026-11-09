@@ -1,0 +1,66 @@
+From fcdfd20f5dddd29acb498dc153e1d3910e42a236 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 14:23:23 +0800
+Subject: [PATCH 14/14] target/arm/kvm: call the KVM breakpoint functions by
+ their new names
+
+---
+ target/arm/kvm.c | 14 ++++++++------
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/target/arm/kvm.c b/target/arm/kvm.c
+index 49000a4c88..a480387b84 100644
+--- a/target/arm/kvm.c
++++ b/target/arm/kvm.c
+@@ -1547,8 +1547,10 @@ static bool vmapple_handoff_is_pc(uint64_t pc)
+ }
+ 
+ /* Declared in accel/kvm/kvm-cpus.h, which the arm target does not include. */
+-int kvm_insert_breakpoint(CPUState *cpu, int type, vaddr addr, vaddr len);
+-int kvm_remove_breakpoint(CPUState *cpu, int type, vaddr addr, vaddr len);
++int kvm_insert_gdbstub_breakpoint(CPUState *cpu, GdbBreakpointType type,
++                                  vaddr addr, vaddr len);
++int kvm_remove_gdbstub_breakpoint(CPUState *cpu, GdbBreakpointType type,
++                                  vaddr addr, vaddr len);
+ 
+ static uint32_t vmapple_align4(uint32_t value)
+ {
+@@ -1774,7 +1776,7 @@ static void vmapple_handoff_arm(CPUState *cs)
+     vmapple_handoff_armed = true;
+     vmapple_handoff_load_pcs();
+     for (int i = 0; i < vmapple_handoff_pc_count; i++) {
+-        err = kvm_insert_breakpoint(cs, GDB_BREAKPOINT_HW, vmapple_handoff_pcs[i], 4);
++        err = kvm_insert_gdbstub_breakpoint(cs, GDB_BREAKPOINT_HW, vmapple_handoff_pcs[i], 4);
+         info_report("vmapple handoff: arm cpu=%d pc=0x%" PRIx64 " err=%d max_hw_bps=%d",
+                     cs->cpu_index, vmapple_handoff_pcs[i], err, max_hw_bps);
+     }
+@@ -1784,7 +1786,7 @@ static void vmapple_handoff_arm(CPUState *cs)
+ static void vmapple_handoff_disarm(CPUState *cs)
+ {
+     for (int i = 0; i < vmapple_handoff_pc_count; i++) {
+-        kvm_remove_breakpoint(cs, GDB_BREAKPOINT_HW, vmapple_handoff_pcs[i], 4);
++        kvm_remove_gdbstub_breakpoint(cs, GDB_BREAKPOINT_HW, vmapple_handoff_pcs[i], 4);
+     }
+     kvm_update_guest_debug(cs, 0);
+ }
+@@ -1938,7 +1940,7 @@ static bool kvm_arm_handle_debug(ARMCPU *cpu,
+              */
+             vmapple_handoff_stepping = false;
+             cpu_single_step(cs, 0);
+-            kvm_insert_breakpoint(cs, GDB_BREAKPOINT_HW, vmapple_handoff_stepping_pc, 4);
++            kvm_insert_gdbstub_breakpoint(cs, GDB_BREAKPOINT_HW, vmapple_handoff_stepping_pc, 4);
+             kvm_update_guest_debug(cs, 0);
+             return false;
+         }
+@@ -1978,7 +1980,7 @@ static bool kvm_arm_handle_debug(ARMCPU *cpu,
+              */
+             vmapple_handoff_stepping = true;
+             vmapple_handoff_stepping_pc = env->pc;
+-            kvm_remove_breakpoint(cs, GDB_BREAKPOINT_HW, env->pc, 4);
++            kvm_remove_gdbstub_breakpoint(cs, GDB_BREAKPOINT_HW, env->pc, 4);
+             cpu_single_step(cs, SSTEP_ENABLE);
+             return false;
+         }
+-- 
+2.43.0
+

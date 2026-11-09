@@ -1,0 +1,881 @@
+From 05fd701407c270a3c82ef7751ca69f5a355fbb7e Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 11:05:15 +0800
+Subject: [PATCH 19/24] Read nothing from a condemned incarnation's pages
+
+After the wire guard condemned mid=2 on the 27.2 regression boots
+(~/codex-work/runs/reg2-s272-cold-2 and -3), sampled binds of the
+surface still went down the resident ladder. The guest-write witness
+saw writes to its pages, which were the pages' next owner's, so the
+resident was refused and merged into them (sampled_resident_merge_fail
+mid=2 1920x1080 stage=writeback, 7 and 18 times), and the rungs below
+read them. The screen filled with noise while Terminal was open.
+
+From the condemnation on (and after the withdrawal that follows it) the
+resident is the only copy of the surface:
+
+- a sampled bind takes a ready device-allocation resident as it is,
+  whatever the guest-write witness says; without one the bind is
+  refused, and none of the YCbCr and view loaders, zero-copy imports,
+  host cache or page rungs is tried;
+- a type-11 LOAD takes such a resident to carry the chain, whatever its
+  epoch; without one it is seeded from nothing;
+- the resident merge, the guest-run and contig imports,
+  read_mapping_bytes, read_rect_raw_at, read_raw_rows and the scanout
+  paint refuse, and so do mapping_page_gpas and
+  ensure_contig_view_with_pages, which every other reader of the pages
+  goes through.
+
+A guest-allocation resident is the pages themselves and is not taken.
+The two writers that took a page view before asking the write guard
+(contig_for_write, the GPU writeback's shared backing) now ask it
+first, so a condemned write is refused as a write.
+
+Each refusal is `wire_guard_read_refused mapping= site= n= total=`,
+written at the first refusal of each site and at each power of two
+after it, at most 24 lines a mapping; counted in store_routes, in
+wire_watch_cost reads_refused=, and by site on the wire_watch unmap
+line.
+
+Tests (dgx, --release, backend-vulkan,host-window, --test-threads=1):
+lib 2296 passed, 0 failed. New:
+- mapping 2 condemned through the real watch, its pages filled with
+  another owner's bytes: read_mapping_bytes, mapping_page_gpas,
+  ensure_contig_view, read_rect_raw_at, read_raw_rows and the scanout
+  paint all refuse by site and leave the buffer untouched; the same
+  read before the drop returns the pages' bytes, and a new
+  MappingInternal under the id is read again after UNMAP;
+- a condemned surface's LOAD is not seeded from the cache or its pages,
+  its pages are not handed out as guest runs, and the merge refuses
+  before reading the resident; uncondemned, the cache seeds it;
+- a condemned surface's sampled bind with no resident is refused,
+  where uncondemned the host cache serves it;
+- only a device-allocation resident, for a direct use, is taken.
+
+Not covered: a SHARED_TARGET render target of a condemned surface
+(vmapple-cli turns SHARED_TARGET off). No guest was booted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/reims-vgpu/src/runtime/draw/tests.rs   | 100 ++++++++
+ crates/reims-vgpu/src/runtime/draw/vulkan.rs  | 215 +++++++++++++++++-
+ crates/reims-vgpu/src/runtime/mapper/mod.rs   |  17 ++
+ .../src/runtime/mapper/wire_watch.rs          | 113 ++++++++-
+ .../src/runtime/mapper/wire_watch_tests.rs    | 110 +++++++++
+ .../src/runtime/mapping_write/mod.rs          |  20 +-
+ crates/reims-vgpu/src/runtime/scanout/mod.rs  |   6 +
+ 7 files changed, 572 insertions(+), 9 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/draw/tests.rs b/crates/reims-vgpu/src/runtime/draw/tests.rs
+index eb6718c1..f66c15d9 100644
+--- a/crates/reims-vgpu/src/runtime/draw/tests.rs
++++ b/crates/reims-vgpu/src/runtime/draw/tests.rs
+@@ -4505,6 +4505,106 @@ fn type11_host_cache_rung_identity_tracks_the_cached_frame() {
+     );
+ }
+ 
++/// A sampled bind of a surface the wire guard condemned binds its resident or
++/// nothing. With no resident, the host cache's frame is refused with the pages:
++/// both stand for memory the guest gave away. Uncondemned, the same bind is
++/// served from the cache, so the refusal is the condemnation's.
++#[cfg(feature = "backend-vulkan")]
++#[test]
++fn a_condemned_surface_is_sampled_from_its_resident_or_not_at_all() {
++    use crate::contract::endian::st32;
++    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
++    use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
++    use crate::runtime::gva_mem;
++    use crate::runtime::mapper::wire_watch::{test_condemn, with_switches};
++
++    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
++    let mut host = FakeHost::new();
++    let dir_pfn = 2u32;
++    let root_pfn = 3u32;
++    let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_X86;
++    let root_gpa = (root_pfn as u64) << PAGE_SHIFT_X86;
++    host.map_range(dir_gpa, 0x20, 0);
++    host.map_range(root_gpa, 0x1000, 0);
++    let mut dir = [0u8; 8];
++    st32(&mut dir[DIRECTORY_ROOT_PFN as usize..], root_pfn);
++    st32(&mut dir[DIRECTORY_DEPTH as usize..], 1);
++    assert!(host.write_gpa(dir_gpa, &dir).is_ok());
++    for i in 0..3u32 {
++        let pfn = 4 + i;
++        host.map_range((pfn as u64) << PAGE_SHIFT_X86, 0x1000, 0);
++        let mut pte = [0u8; 4];
++        st32(&mut pte, pfn);
++        assert!(host.write_gpa(root_gpa + (i as u64) * 4, &pte).is_ok());
++    }
++    state.define_task(1, 0x1000, dir_pfn);
++    assert!(state.set_object_list(1, 0, 32));
++
++    let texture_ref = 2u32;
++    let surface_id = 74u32;
++    let desc_gva = 0x1000u64;
++    let built = reims_vgpu_wire::device_desc::Type5Builder::new(surface_id, 0, 0, 0)
++        .with_len(objects::TYPE5_MIN_LEN);
++    assert!(gva_mem::write_task_gva(
++        &mut host,
++        &state.tasks[1],
++        desc_gva,
++        built.bytes(),
++        PAGE_SHIFT_X86,
++    )
++    .is_ok());
++    let list_off = list_object_entry_offset(texture_ref, 32).unwrap();
++    let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
++    let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((objects::TYPE5_MIN_LEN as u32) << 8);
++    st32(&mut list_entry, packed);
++    list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
++    assert!(gva_mem::write_task_gva(
++        &mut host,
++        &state.tasks[1],
++        list_off,
++        &list_entry,
++        PAGE_SHIFT_X86,
++    )
++    .is_ok());
++
++    assert!(state.map_surface(surface_id));
++    assert!(state.set_mapping_geom(surface_id, 4, 3, MTL_FORMAT_BGRA8_UNORM));
++    {
++        let m = state.mappings.get_mut(&surface_id).unwrap();
++        m.page_entries = vec![1];
++        m.mapping_internal = 0x91;
++    }
++    crate::runtime::surface_cache::store(
++        &mut state,
++        surface_id,
++        4,
++        3,
++        [255u8, 0, 0, 255].repeat(4 * 3),
++    );
++
++    let served = resolve_sampled_source(&mut state, &mut host, 1, texture_ref, None, true);
++    assert!(
++        matches!(served, Some((_, _, _, SampledSourceRequest::Bytes(..)))),
++        "uncondemned, the host cache serves the bind"
++    );
++
++    with_switches(true, true, || {
++        test_condemn(&mut state, surface_id);
++        let cap = crate::observe::sink::FailCapture::start();
++        assert!(
++            resolve_sampled_source(&mut state, &mut host, 1, texture_ref, None, true).is_none(),
++            "no resident: nothing else may stand in for it"
++        );
++        let needle = format!("wire_guard_read_refused mapping={surface_id} site=sampled n=1 ");
++        let lines: Vec<String> = cap
++            .lines()
++            .into_iter()
++            .filter(|l| l.contains(&needle))
++            .collect();
++        assert_eq!(lines.len(), 1, "{:?}", cap.lines());
++    });
++}
++
+ /// Live Safari app-launch class: the type-4 base carries an unknown
+ /// 2-byte IOSurface FourCC (`LA08`) while the type-5 descriptor carries
+ /// the exact RG8 Metal view. Defaulting the base to BGRA asks for a
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index 5245084b..5a8e553e 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -1246,6 +1246,17 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
+     }
+ 
+     if let Some(mid) = surface {
++        // A condemned incarnation is bound from its resident or not at all:
++        // every rung below reads its pages, seeds from them or merges into them.
++        if mapper::wire_watch::guest_pages_condemned(state, mid) {
++            return condemned_sampled_source(
++                state,
++                mid,
++                resolved_resource.as_ref(),
++                type5_view,
++                may_bind_resident,
++            );
++        }
+         // Ensure type-4 pages exist for this surface id.
+         let _ = objects::ensure_surface_for_texture_bind(state, host, mid);
+         // A type-5 serialized record is the exact Metal texture view over the
+@@ -2376,6 +2387,12 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
+     target_format: ash::vk::Format,
+ ) -> Option<Type11LoadSeed> {
+     use crate::backend::vulkan::engine::SeedOrder;
++    // A condemned incarnation is seeded from nothing. Its pages are another
++    // owner's, and the cache is a copy of them; a `LOAD` that could take its
++    // resident took it before coming here.
++    if mapper::wire_watch::refuse_guest_read(state, mapping_id, "load_seed") {
++        return None;
++    }
+     // The cache is the other host-side copy of these pages, and it sits above
+     // the only rung that reads the pages themselves — so a stale hit here is
+     // never corrected by anything below it. It takes the same witness the
+@@ -3443,6 +3460,11 @@ fn mapping_window_guest_runs<M: HostMemory + HostOps>(
+     base_off: u64,
+     span: u64,
+ ) -> Option<(Vec<u64>, Vec<crate::backend::vulkan::engine::GuestRun>)> {
++    // The GPU would read these runs; a condemned incarnation's pages are
++    // someone else's. See `mapper::wire_watch::refuse_guest_read`.
++    if mapper::wire_watch::refuse_guest_read(state, mid, "guest_runs") {
++        return None;
++    }
+     if !guest_run_alias_available(host) {
+         return None;
+     }
+@@ -7951,18 +7973,32 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+                         })
+                         .map(|resource| resource.resident_target_backing(&identity))
+                 });
+-                let (resident_current, guest_wrote) =
++                let mapping_id = req.colors.first().map(|c| c.mapping_id).unwrap_or(0);
++                // A condemned incarnation's resident is the surface, whatever
++                // the epoch says, and the guest-write witness sees another
++                // owner's writes. Without a resident it can take, the seed below
++                // refuses the pages too.
++                let condemned = mapper::wire_watch::guest_pages_condemned(state, mapping_id);
++                let (resident_current, guest_wrote) = if condemned {
++                    let backing = backing.unwrap_or_else(|| {
++                        crate::backend::vulkan::engine::resident_content_backing(&identity)
++                    });
++                    (condemned_sample_takes_resident(backing, true), false)
++                } else {
+                     type11_load_resident_is_current(backing, || {
+                         let resident_epoch =
+                             crate::backend::vulkan::engine::resident_content_epoch(&identity);
+-                        let mapping_id = req.colors.first().map(|c| c.mapping_id).unwrap_or(0);
+                         let guest_wrote = type11_guest_wrote_since_store(state, host, mapping_id);
+                         (
+                             type11_resident_is_current(mapping_epoch, resident_epoch)
+                                 && !guest_wrote,
+                             guest_wrote,
+                         )
+-                    });
++                    })
++                };
++                if condemned && resident_current {
++                    crate::runtime::drain::note_store_route("type11_seed_elided_condemned");
++                }
+                 if resident_current {
+                     chain_load_from_target = true;
+                     crate::runtime::drain::note_store_route("type11_seed_elided");
+@@ -9572,6 +9608,72 @@ pub(super) fn type11_guest_wrote_since_store<M: HostOps>(
+     }
+ }
+ 
++/// A sampled bind of a surface whose incarnation the wire guard condemned.
++///
++/// From the condemnation on, its pages hold memory the guest gave to someone
++/// else, so every rung of [`resolve_sampled_source`] that touches them — the
++/// YCbCr and view loaders, the zero-copy imports, the page rungs, and the merge
++/// a guest write sends the resident rung to — would bind that someone's bytes.
++/// On 27.2 the merge is what ran (`sampled_resident_merge_fail mid=2 …
++/// stage=writeback`) and the screen filled with noise. The guest-write witness
++/// says nothing about this surface either: the writes it sees are the new
++/// owner's.
++///
++/// So the resident is bound as it is. Without one a bind can take directly, the
++/// bind is refused by name (`wire_guard_read_refused site=sampled`). The host
++/// cache is no rung here: it is a copy of the pages, and the last copy taken
++/// may already hold the other owner's bytes.
++fn condemned_sampled_source(
++    state: &mut DeviceState,
++    mid: u32,
++    resource: Option<&std::sync::Arc<crate::model::TaskResource>>,
++    view: Option<objects::Type5TextureView>,
++    may_bind_resident: bool,
++) -> Option<(u32, u32, u32, SampledSourceRequest)> {
++    let geom = state
++        .mappings
++        .get(&mid)
++        .filter(|m| m.has_geom && m.width > 0 && m.height > 0)
++        .map(|m| (m.width, m.height, m.format));
++    let taken = geom.and_then(|(w, h, format)| {
++        // A view that has to be materialized is not the resident's image.
++        let view_is_base =
++            view.is_none_or(|v| !type5_view_requires_materialization(true, w, h, format, v));
++        let resident_id = crate::runtime::present_identity::surface_identity(state, mid, w, h);
++        let backing = resource
++            .filter(|resource| resource_type_owns_surface_resident(resource.entry.object_type))
++            .map(|resource| resource.resident_target_backing(&resident_id))
++            .unwrap_or_else(|| {
++                crate::backend::vulkan::engine::resident_content_backing(&resident_id)
++            });
++        condemned_sample_takes_resident(backing, may_bind_resident && view_is_base).then(|| {
++            let format = resident_id.resident_format();
++            (w, h, mid, SampledSourceRequest::Target(resident_id, format))
++        })
++    });
++    match taken {
++        Some(source) => {
++            crate::runtime::drain::note_store_route("t11rung_resident_condemned");
++            Some(source)
++        }
++        None => {
++            let _ = mapper::wire_watch::refuse_guest_read(state, mid, "sampled");
++            None
++        }
++    }
++}
++
++/// Whether a condemned surface's bind or `LOAD` takes its resident: only a
++/// ready device allocation, which holds a copy of its own (a guest-allocation
++/// resident *is* the pages), and only for a use that can take a resident
++/// directly.
++fn condemned_sample_takes_resident(
++    backing: crate::backend::vulkan::engine::ResidentContentBacking,
++    direct: bool,
++) -> bool {
++    direct && backing == crate::backend::vulkan::engine::ResidentContentBacking::DeviceAllocation
++}
++
+ /// Whether the hypervisor watched the guest write anywhere in the allocation a
+ /// type-4 surface's host-side copies were taken from.
+ ///
+@@ -9696,6 +9798,12 @@ fn merge_guest_writes_into_pages<M: HostMemory + HostOps>(
+     identity: &crate::backend::vulkan::engine::TargetIdentity,
+     guest_owned: &[(u64, u64)],
+ ) -> bool {
++    // The guest's half of a condemned incarnation is another owner's memory.
++    // [`resolve_sampled_source`] does not come here for one; this says so if a
++    // caller ever does.
++    if mapper::wire_watch::refuse_guest_read(state, mapping_id, "sampled_merge") {
++        return false;
++    }
+     let readback = match crate::backend::vulkan::engine::read_target(identity) {
+         Ok(rb) => rb,
+         Err(e) => {
+@@ -12185,6 +12293,107 @@ mod vulkan_split_tests {
+         map_one_gva_page(&mut host, 5);
+         assert_eq!(gen_of(&mut host), gen_a);
+     }
++
++    /// A condemned surface's `LOAD` is seeded from nothing, its pages are not
++    /// handed to the GPU, and no merge writes into them, while the host cache
++    /// holds a frame and the pages hold another owner's bytes. Uncondemned,
++    /// the same surface is seeded from the cache, so the refusal is the
++    /// condemnation's and not the fixture's.
++    #[test]
++    fn a_condemned_surface_is_never_seeded_imported_or_merged_from_its_pages() {
++        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
++        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
++        use crate::runtime::host::HostMemory;
++        use crate::runtime::mapper::wire_watch::{test_condemn, with_switches};
++
++        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
++        let mut host = FakeHost::new();
++        host.stable_map_pages = true;
++        // Unique among the tests: `first_sight` latches for the process.
++        let mid = 919u32;
++        let pfn = 0x2bu32;
++        let gpa = (pfn as u64) << PAGE_SHIFT_X86;
++        // The bytes the pages' next owner left in them.
++        host.map_range(gpa, 0x4000, 0xEE);
++        state.map_surface(mid);
++        {
++            let m = state.mappings.get_mut(&mid).expect("mapped above");
++            m.mapped = true;
++            m.mapping_internal = 0x77;
++            m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
++        }
++        let (w, h) = (4u32, 2u32);
++        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
++        crate::runtime::surface_cache::store(
++            &mut state,
++            mid,
++            w,
++            h,
++            [0xAA, 0xBB, 0xCC, 0xFF].repeat((w * h) as usize),
++        );
++        let format = gva_resident_format(MTL_FORMAT_BGRA8_UNORM);
++        assert!(
++            matches!(
++                resolve_type11_load_seed(&mut state, &mut host, mid, w, h, format),
++                Some(Type11LoadSeed::Host(..))
++            ),
++            "uncondemned, the cache seeds the LOAD"
++        );
++
++        with_switches(true, true, || {
++            test_condemn(&mut state, mid);
++            let cap = crate::observe::sink::FailCapture::start();
++            assert!(
++                resolve_type11_load_seed(&mut state, &mut host, mid, w, h, format).is_none(),
++                "neither the cache's copy nor the pages may seed a condemned surface"
++            );
++            assert!(mapping_window_guest_runs(&mut state, &mut host, mid, 0, 32).is_none());
++            let identity = crate::runtime::present_identity::surface_identity(&state, mid, w, h);
++            assert!(!merge_guest_writes_into_pages(
++                &mut state,
++                &mut host,
++                mid,
++                w,
++                h,
++                &identity,
++                &[(0, 0x1000)],
++            ));
++            assert!(
++                cap.lines()
++                    .iter()
++                    .all(|l| !l.contains("sampled_resident_merge_fail")),
++                "the merge never started: {:?}",
++                cap.lines()
++            );
++            for site in ["load_seed", "guest_runs", "sampled_merge"] {
++                let needle = format!("wire_guard_read_refused mapping={mid} site={site} n=1 ");
++                let lines: Vec<String> = cap
++                    .lines()
++                    .into_iter()
++                    .filter(|l| l.contains(&needle))
++                    .collect();
++                assert_eq!(lines.len(), 1, "{site}: {:?}", cap.lines());
++            }
++        });
++        let mut page = [0u8; 4];
++        host.read_gpa(gpa, &mut page)
++            .expect("the page is guest RAM");
++        assert_eq!(page, [0xEE; 4], "nothing was written into the pages either");
++    }
++
++    /// What a condemned surface takes as its image: a ready device-allocation
++    /// resident, for a use that can take a resident directly. A guest-allocation
++    /// resident is the pages themselves, and no resident is no image.
++    #[test]
++    fn a_condemned_surface_takes_only_a_device_resident_it_can_bind_directly() {
++        use crate::backend::vulkan::engine::ResidentContentBacking::{
++            DeviceAllocation, GuestAllocation, NotReady,
++        };
++        assert!(condemned_sample_takes_resident(DeviceAllocation, true));
++        assert!(!condemned_sample_takes_resident(DeviceAllocation, false));
++        assert!(!condemned_sample_takes_resident(GuestAllocation, true));
++        assert!(!condemned_sample_takes_resident(NotReady, true));
++    }
+ }
+ 
+ /// Whether the CLEAR-seed Store at the head of a draw chain runs, for this
+diff --git a/crates/reims-vgpu/src/runtime/mapper/mod.rs b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+index dc28fa2c..ff535595 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/mod.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+@@ -2023,6 +2023,12 @@ pub fn mapping_page_gpas<H: HostMemory + HostOps>(
+     host: &mut H,
+     mapping_id: u32,
+ ) -> Option<Vec<u64>> {
++    // A condemned incarnation's pages belong to someone else now: no list of
++    // them goes to a reader, nor to anything else. See
++    // [`wire_watch::refuse_guest_read`].
++    if wire_watch::refuse_guest_read(state, mapping_id, "page_list") {
++        return None;
++    }
+     if !{ revalidate_mapping_pages(state, host, mapping_id) } {
+         return None;
+     }
+@@ -2180,6 +2186,10 @@ pub fn ensure_contig_view_with_pages<H: HostMemory + HostOps>(
+     host: &mut H,
+     mapping_id: u32,
+ ) -> Option<(usize, usize, std::sync::Arc<[u64]>)> {
++    // Nor a view of them, cached or new; see [`mapping_page_gpas`].
++    if wire_watch::refuse_guest_read(state, mapping_id, "contig_view") {
++        return None;
++    }
+     // Always revalidate before returning a cached contig (ReplacePhysical /
+     // recycle must not leave a live view over freelist PFNs).
+     if !revalidate_mapping_pages(state, host, mapping_id) {
+@@ -2253,6 +2263,10 @@ pub fn ensure_contig_import_with_footprint<H: HostMemory + HostOps>(
+     std::sync::Arc<crate::runtime::guest_ram::GuestRamImport>,
+     crate::runtime::guest_ram::GuestPageFootprint,
+ )> {
++    // The GPU would read the pages through it; see [`mapping_page_gpas`].
++    if wire_watch::refuse_guest_read(state, mapping_id, "contig_import") {
++        return None;
++    }
+     if !host.map_pages_stable() {
+         return None;
+     }
+@@ -2502,6 +2516,9 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
+         // Puts bytes into guest pages the hypervisor's dirty bitmap cannot
+         // witness. The read direction shares this walk and writes nothing.
+         state.note_host_wrote_mapping(mapping_id);
++    } else if wire_watch::refuse_guest_read(state, mapping_id, site) {
++        // A condemned incarnation's pages hold another owner's bytes.
++        return false;
+     }
+     let page_size = state.page_size();
+     let len = copy.len();
+diff --git a/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs b/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
+index 2c6d9fea..e58b5430 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
+@@ -85,8 +85,16 @@
+ //! A positive count is not a permission: it is read, then the write happens,
+ //! and the guest can complete the descriptor in between, so the guard only
+ //! stops writes after a drop it has seen. A render target the GPU writes in
+-//! guest memory (`REIMS_VGPU_SHARED_TARGET`) is not seen at all. A reader of the
+-//! mapping reads whatever the guest pages hold.
++//! guest memory (`REIMS_VGPU_SHARED_TARGET`) is not seen at all.
++//!
++//! A condemned incarnation's pages are read no more either
++//! ([`refuse_guest_read`]). The guest gives them to someone else, and on 27.2 it
++//! did within seconds: a sampled bind of the condemned display surface merged
++//! its resident into them (`sampled_resident_merge_fail mid=2 … stage=writeback`)
++//! and the screen filled with another owner's bytes. From the condemnation on,
++//! the resident this device rendered is the only copy of the surface: a bind or
++//! a `LOAD` takes it as it is, and every path that would read, seed from or
++//! merge into the pages is refused instead (`wire_guard_read_refused`, by site).
+ 
+ use std::collections::{BTreeMap, BTreeSet, VecDeque};
+ 
+@@ -531,6 +539,9 @@ struct Watched {
+     condemned: Option<Condemned>,
+     /// A count went positive again after the condemnation; said once.
+     recovered_said: bool,
++    /// Reads of the condemned pages refused, by site.
++    reads_refused: BTreeMap<String, u64>,
++    read_lines: u32,
+ }
+ 
+ /// A mapping incarnation the guest unwired while it was still mapped.
+@@ -592,6 +603,8 @@ impl Watched {
+             sampled_us: None,
+             condemned: None,
+             recovered_said: false,
++            reads_refused: BTreeMap::new(),
++            read_lines: 0,
+         }
+     }
+ }
+@@ -610,6 +623,7 @@ struct Cost {
+     condemned: u64,
+     debts_dropped: u64,
+     swaps_refused: u64,
++    reads_refused: u64,
+ }
+ 
+ /// The watch's state for one boot. Lives in [`DeviceState`] and is replaced
+@@ -692,7 +706,7 @@ impl WireWatch {
+         format!(
+             "wire_watch_cost boot={boot} watched={} samples={} reads={} unreadable={} us={} \
+              transitions={} anomalies={} guard_refused={} condemned={} debts_dropped={} \
+-             swaps_refused={} peeks={} unstamped_dropped={} kernel={}",
++             swaps_refused={} reads_refused={} peeks={} unstamped_dropped={} kernel={}",
+             self.watched.len(),
+             c.samples,
+             c.reads,
+@@ -704,6 +718,7 @@ impl WireWatch {
+             c.condemned,
+             c.debts_dropped,
+             c.swaps_refused,
++            c.reads_refused,
+             c.peeks,
+             c.unstamped_dropped,
+             match self.kernel {
+@@ -1640,13 +1655,14 @@ pub fn on_unmap<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H, mapp
+         if let Some(w) = ww.watched.remove(&mapping_id) {
+             crate::observe::off(format!(
+                 "wire_watch unmap mapping={mapping_id} surface_wire={} table_wire={} pages={} \
+-                 writes={} writes_after_anomaly={} anomalous={:?} seq={}",
++                 writes={} writes_after_anomaly={} anomalous={:?} reads_refused={:?} seq={}",
+                 w.last.surface as i32,
+                 w.last.table as i32,
+                 w.pages,
+                 w.writes,
+                 w.writes_after_anomaly,
+                 w.anomalous,
++                w.reads_refused,
+                 event.seq
+             ));
+         }
+@@ -1739,6 +1755,95 @@ pub fn before_write<H: HostMemory + HostOps>(
+     })
+ }
+ 
++// MARK: - Hooks: reads
++
++/// Whether `mapping_id`'s current incarnation is one the guard condemned, or
++/// one that withdrew its page claims after being condemned.
++///
++/// Its pages are then the guest's to hand to someone else, so they hold no
++/// part of this surface: the resident this device rendered is its only copy.
++/// Asked by every path that would read them, seed from them or merge into them;
++/// [`refuse_guest_read`] is the same question with the refusal said.
++pub fn guest_pages_condemned(state: &DeviceState, mapping_id: u32) -> bool {
++    let Some(m) = state.mappings.get(&mapping_id) else {
++        return false;
++    };
++    if crate::runtime::surface_quarantine::entry_withdrawn(m) {
++        return true;
++    }
++    // The incarnation, not the id: a new MappingInternal under the same id is
++    // another surface, read like any other.
++    guard_enabled()
++        && m.mapping_internal != 0
++        && state
++            .wire_watch
++            .watched
++            .get(&mapping_id)
++            .is_some_and(|w| w.condemned.is_some() && w.internal == m.mapping_internal)
++}
++
++/// Right before a read of `mapping_id`'s guest pages at `site`. `true` when the
++/// read must not happen, having said so: the incarnation is condemned (see
++/// [`guest_pages_condemned`]), and the caller uses the resident as it is or
++/// reads nothing.
++///
++/// Every refusal is counted, per mapping and site; a line is written at the
++/// first refusal of each site and at each power of two after it, at most
++/// [`LINES_PER_MAPPING`] per mapping.
++pub fn refuse_guest_read(state: &mut DeviceState, mapping_id: u32, site: &str) -> bool {
++    if !guest_pages_condemned(state, mapping_id) {
++        return false;
++    }
++    crate::runtime::drain::note_store_route("wire_guard_read_refused");
++    let ww = &mut state.wire_watch;
++    ww.cost.reads_refused += 1;
++    let Some(w) = ww.watched.get_mut(&mapping_id) else {
++        // Withdrawn with no watch entry left to count on; refused all the same.
++        return true;
++    };
++    let at_site = {
++        let n = w.reads_refused.entry(site.to_string()).or_insert(0);
++        *n += 1;
++        *n
++    };
++    let total: u64 = w.reads_refused.values().sum();
++    if at_site.is_power_of_two() && w.read_lines < LINES_PER_MAPPING {
++        w.read_lines += 1;
++        crate::observe::fail(format!(
++            "wire_guard_read_refused mapping={mapping_id} site={site} n={at_site} total={total} \
++             condemned_seq={} t_us={} (the guest unwired this incarnation while it was mapped and \
++             its pages are someone else's now; nothing is read from them, and its resident is the \
++             only copy of the surface)",
++            w.condemned.as_ref().map_or(0, |c| c.seq),
++            now_us()
++        ));
++    }
++    true
++}
++
++/// Condemn `mapping_id`'s current incarnation without the kernel and the counts
++/// a real condemnation reads, for a test of a reader that must refuse it.
++#[cfg(test)]
++pub(crate) fn test_condemn(state: &mut DeviceState, mapping_id: u32) {
++    let internal = state
++        .mappings
++        .get(&mapping_id)
++        .map(|m| m.mapping_internal)
++        .expect("a mapping to condemn");
++    assert_ne!(
++        internal, 0,
++        "an incarnation is named by its MappingInternal"
++    );
++    let mut w = Watched::pending(internal);
++    w.condemned = Some(Condemned {
++        seq: 1,
++        t_us: now_us(),
++        field: "surface",
++        horizon: Vec::new(),
++    });
++    state.wire_watch.watched.insert(mapping_id, w);
++}
++
+ // MARK: - Hooks: display
+ 
+ /// What became of a display present packet.
+diff --git a/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs b/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs
+index f4d5104d..aa88b4a7 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs
+@@ -1294,3 +1294,113 @@ fn without_wire_evidence_both_sides_stay_quarantined() {
+         });
+     }
+ }
++
++// MARK: - Reads of a condemned incarnation
++
++/// After the drop, the bytes another owner left in mapping 2's pages reach no
++/// reader: each read path refuses by site and leaves its buffer as it was.
++/// Before the drop the same read reaches the pages, which is what makes the
++/// refusals mean something, and a new incarnation under the id is read again.
++#[test]
++fn a_condemned_incarnations_pages_are_never_read() {
++    use crate::runtime::mapper::{ensure_contig_view, mapping_page_gpas, read_mapping_bytes};
++    use crate::runtime::mapping_write::{read_raw_rows, read_rect_raw_at, Rect, SurfaceWindow};
++    use crate::runtime::scanout::read_mapping_bgra8;
++
++    with_switches(true, true, || {
++        let (mut state, mut host) = fixture(EXPECTED_KERNEL_VERSION);
++        on_map(&mut state, &host, MID);
++        // What the next owner of the pages wrote into them.
++        for &gpa in &G {
++            host.write_gpa(gpa, &[0xEE; 64]).unwrap();
++        }
++        let mut before = [0x11u8; 16];
++        assert!(read_mapping_bytes(
++            &mut state,
++            &mut host,
++            MID,
++            0,
++            &mut before
++        ));
++        assert_eq!(
++            before, [0xEE; 16],
++            "before the drop the read reaches the pages"
++        );
++        assert!(!guest_pages_condemned(&state, MID));
++
++        let cap = crate::observe::FailCapture::start();
++        set_surface_wire(&mut host, 0);
++        tick(&mut state, &host);
++        assert!(guest_pages_condemned(&state, MID));
++        assert!(is_withdrawn(&state, MID));
++
++        let mut buf = [0x11u8; 16];
++        assert!(!read_mapping_bytes(&mut state, &mut host, MID, 0, &mut buf));
++        assert!(mapping_page_gpas(&mut state, &mut host, MID).is_none());
++        assert!(ensure_contig_view(&mut state, &mut host, MID).is_none());
++        let window = SurfaceWindow {
++            base_off: 0,
++            bpr: 8,
++            span_end: 16,
++            bpp: 4,
++        };
++        let rect = Rect {
++            origin_x: 0,
++            origin_y: 0,
++            width: 2,
++            height: 2,
++        };
++        assert!(!read_rect_raw_at(
++            &mut state, &mut host, MID, window, rect, &mut buf, 8
++        ));
++        assert!(!read_raw_rows(
++            &mut state, &mut host, MID, &mut buf, 8, 8, 2, 2
++        ));
++        assert!(!read_mapping_bgra8(
++            &mut state, &mut host, MID, &mut buf, 8, 2, 2
++        ));
++        assert_eq!(buf, [0x11; 16], "not one byte of the other owner's");
++        for site in [
++            "mapping_read",
++            "page_list",
++            "contig_view",
++            "read_rect",
++            "read_raw_rows",
++            "paint_mapping",
++        ] {
++            let lines = lines_with(
++                &cap,
++                &format!("wire_guard_read_refused mapping=2 site={site} "),
++            );
++            assert_eq!(lines.len(), 1, "{site}: {:?}", cap.lines());
++            assert!(lines[0].contains(" n=1 "), "{}", lines[0]);
++        }
++        assert_eq!(state.wire_watch.cost.reads_refused, 6);
++        // A refusal repeats silently until its site's next power of two.
++        assert!(!read_mapping_bytes(&mut state, &mut host, MID, 0, &mut buf));
++        assert!(!read_mapping_bytes(&mut state, &mut host, MID, 0, &mut buf));
++        assert!(!read_mapping_bytes(&mut state, &mut host, MID, 0, &mut buf));
++        assert_eq!(
++            lines_with(&cap, "wire_guard_read_refused mapping=2 site=mapping_read ").len(),
++            3,
++            "n=1, 2 and 4"
++        );
++
++        // UNMAP ends the incarnation; a new MappingInternal is read as any other.
++        on_unmap(&mut state, &host, MID);
++        assert!(state.unmap_surface(MID));
++        let again = Surface {
++            mi: MI + 0x1000,
++            ..old_surface()
++        };
++        put_surface(&mut host, &again, 1);
++        for &gpa in &G {
++            host.write_gpa(gpa, &[0x5A; 64]).unwrap();
++        }
++        adopt(&mut state, &again);
++        on_map(&mut state, &host, MID);
++        assert!(!guest_pages_condemned(&state, MID));
++        assert!(read_mapping_bytes(&mut state, &mut host, MID, 0, &mut buf));
++        assert_eq!(buf, [0x5A; 16]);
++    });
++}
+diff --git a/crates/reims-vgpu/src/runtime/mapping_write/mod.rs b/crates/reims-vgpu/src/runtime/mapping_write/mod.rs
+index a52f919a..c5b8da11 100644
+--- a/crates/reims-vgpu/src/runtime/mapping_write/mod.rs
++++ b/crates/reims-vgpu/src/runtime/mapping_write/mod.rs
+@@ -370,7 +370,8 @@ fn contig_for_write<H: HostMemory + HostOps>(
+         ));
+         return None;
+     }
+-    let view = contig_for_span(state, host, mapping_id, span_end)?;
++    // Before the view: a condemned incarnation is refused as a write here, and
++    // the view would refuse it again as a read.
+     if !mapper::wire_watch::before_write(
+         state,
+         &*host,
+@@ -380,6 +381,7 @@ fn contig_for_write<H: HostMemory + HostOps>(
+     ) {
+         return None;
+     }
++    let view = contig_for_span(state, host, mapping_id, span_end)?;
+     // Every raw-pointer write in this file goes through here, and none of them
+     // goes through `mapper::write_mapping_bytes` — they poke rows straight into
+     // the view. So this is where those writes enter `observe::footprint`, and
+@@ -960,7 +962,11 @@ pub fn write_bgra8_from_resident_gpu<M: HostMemory + HostOps>(
+             format,
+         });
+     };
+-    let shared_backing = if host.map_pages_stable() {
++    // A condemned incarnation is refused below as a write; it takes no view of
++    // its pages on the way there.
++    let shared_backing = if host.map_pages_stable()
++        && !mapper::wire_watch::guest_pages_condemned(state, mapping_id)
++    {
+         mapper::ensure_contig_view(state, host, mapping_id).map(|(ptr, len)| {
+             crate::backend::vulkan::engine::GuestTargetBacking {
+                 allocation_host_ptr: ptr,
+@@ -2043,6 +2049,11 @@ pub fn read_raw_rows<M: HostMemory + HostOps>(
+     width: u32,
+     height: u32,
+ ) -> bool {
++    // A condemned incarnation's pages hold another owner's bytes; see
++    // `mapper::wire_watch::refuse_guest_read`.
++    if mapper::wire_watch::refuse_guest_read(state, mapping_id, "read_raw_rows") {
++        return false;
++    }
+     if !scanout_extent_ok(width, height) || row_bytes == 0 || dst_stride < row_bytes {
+         return false;
+     }
+@@ -2199,6 +2210,11 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
+     dst: &mut [u8],
+     dst_stride: u32,
+ ) -> bool {
++    // A condemned incarnation's pages hold another owner's bytes; see
++    // `mapper::wire_watch::refuse_guest_read`.
++    if mapper::wire_watch::refuse_guest_read(state, mapping_id, "read_rect") {
++        return false;
++    }
+     let SurfaceWindow {
+         base_off,
+         bpr: surface_bpr,
+diff --git a/crates/reims-vgpu/src/runtime/scanout/mod.rs b/crates/reims-vgpu/src/runtime/scanout/mod.rs
+index 00024dc4..98957e85 100644
+--- a/crates/reims-vgpu/src/runtime/scanout/mod.rs
++++ b/crates/reims-vgpu/src/runtime/scanout/mod.rs
+@@ -964,6 +964,12 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
+         false
+     };
+ 
++    // A condemned incarnation's pages hold another owner's bytes: painting them
++    // shows that owner's memory. Its resident is shown, or nothing.
++    if crate::runtime::mapper::wire_watch::refuse_guest_read(state, mapping_id, "paint_mapping") {
++        return false;
++    }
++
+     // Deferred-writeback flush-on-access: scanout reads guest pages through a
+     // raw contig view below, which bypasses the hooked readers — land any
+     // resident-authoritative window (compute or render Store) first.
+-- 
+2.43.0
+

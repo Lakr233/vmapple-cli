@@ -1,0 +1,167 @@
+From 26a02c4b44bc366d8e5d80249fb1073d818e37c7 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Sun, 8 Nov 2026 10:42:19 +0800
+Subject: [PATCH] Draw surfaces whose pages the guest has not touched yet
+
+macOS 13 decodes its wallpaper with compute into a 6016 by 6016 surface that
+is mapped while about half of its page table entries are still invalid, and
+samples the decoded tiles as RGBA8 views over each tile's 1024-wide luma plane.
+
+- Resolve a mapping with invalid entries, keep the holes, and resolve again
+  later instead of refusing it.
+- Start a storage window over holes from zero instead of failing the guest
+  read, and resolve the mapping again before the writeback.
+- Match a view to the one plane whose rows hold the same bytes when no plane
+  has the view's own geometry.
+
+With this the Ventura wallpaper draws; before, the desktop was black.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/contract/iosurface_pages.rs           | 32 ++++++++++++++++---
+ .../src/runtime/compute_exec/mod.rs           | 28 +++++++++++++++-
+ crates/reims-vgpu/src/runtime/mapper/mod.rs   |  8 +++--
+ 3 files changed, 61 insertions(+), 7 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/contract/iosurface_pages.rs b/crates/reims-vgpu/src/contract/iosurface_pages.rs
+index 63ad8d09..488d95c2 100644
+--- a/crates/reims-vgpu/src/contract/iosurface_pages.rs
++++ b/crates/reims-vgpu/src/contract/iosurface_pages.rs
+@@ -514,6 +514,27 @@ pub fn sample_window_from_device_desc(
+                             }
+                         }
+                     }
++                    // No plane has the view's own geometry: try a view that
++                    // reinterprets one plane's rows, like a 1024-wide luma
++                    // plane sampled as 256 RGBA8 texels per row. The rows must
++                    // hold the same bytes, and only one plane may qualify.
++                    if matches == 0 {
++                        for p in 0..surf
++                            .plane_count
++                            .min(reims_vgpu_wire::device_desc::TYPE4_PLANE_CAP as u8)
++                        {
++                            if let Some((cand, _)) = device_desc_plane(desc, p as u32) {
++                                if cand.height == height
++                                    && cand.bytes_per_element != 0
++                                    && u64::from(cand.width) * u64::from(cand.bytes_per_element)
++                                        == u64::from(width) * u64::from(bpp)
++                                {
++                                    matches += 1;
++                                    plane = cand;
++                                }
++                            }
++                        }
++                    }
+                     if matches == 1 {
+                         if let Some(w) =
+                             sample_window_from_device_plane(&plane, pixel_format, width, height)
+@@ -778,10 +799,13 @@ fn read_table_entries(
+     for i in 0..pages {
+         let entry = read_u32_at(mem, table_kva, (i as u64) * U32_SIZE as u64)
+             .ok_or(Status::ErrPageTableRead("iosurface_page_table_entry_read"))?;
+-        let gpa = entry_gpa_shift(entry, page_shift)
+-            .ok_or(Status::ErrPageEntry("iosurface_page_table_entry_invalid"))?;
+-        if !mem.is_ram_gpa(gpa) {
+-            return Err(Status::ErrPageEntry("iosurface_page_table_gpa_not_ram"));
++        // A page the guest has not touched yet has no frame. Keep the entry, so
++        // the mapping resolves now and readers see the hole; a later resolve
++        // picks the frame up once the guest has written it.
++        if let Some(gpa) = entry_gpa_shift(entry, page_shift) {
++            if !mem.is_ram_gpa(gpa) {
++                return Err(Status::ErrPageEntry("iosurface_page_table_gpa_not_ram"));
++            }
+         }
+         entries.push(entry);
+     }
+diff --git a/crates/reims-vgpu/src/runtime/compute_exec/mod.rs b/crates/reims-vgpu/src/runtime/compute_exec/mod.rs
+index 8327cb9a..9409fb20 100644
+--- a/crates/reims-vgpu/src/runtime/compute_exec/mod.rs
++++ b/crates/reims-vgpu/src/runtime/compute_exec/mod.rs
+@@ -2192,6 +2192,9 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
+         #[cfg(feature = "backend-vulkan")]
+         let mut seed_generation = m.content_generation;
+         let pages_n = m.page_entries.len();
++        let page_holes = m.page_entries.iter().any(|&entry| {
++            crate::contract::iosurface_pages::entry_gpa_shift(entry, state.page_shift).is_none()
++        });
+         // Wire type-4 `length` (page-aligned getResidentSize), stashed as device_desc.alloc_size.
+         // Independent of plane w/h and of MapMemory2 IOAccelMemory length — measure-only.
+         let wire_len = crate::contract::iosurface_pages::decode_device_surface(&m.device_desc)
+@@ -2318,7 +2321,13 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
+         // renders its wallpaper and backdrops into such surfaces and only ever
+         // samples them on the GPU. It starts from zero, lives in the engine,
+         // and is never written back.
+-        let private = page_bytes < span_end && is_storage && pages_n == 0;
++        // Pages the guest never touched are holes in the page table; a surface
++        // the GPU fills is mostly holes until something on the CPU reads it.
++        let private = is_storage && page_bytes < span_end && pages_n == 0;
++        // A storage window over pages the guest has not touched yet cannot be
++        // seeded from them; it starts from zero, and the writeback lands it
++        // once the guest has wired the pages for the GPU.
++        let unseeded = is_storage && !private && page_holes;
+         if private && serve.is_none() {
+             crate::observe::off(format!(
+                 "compute_stage_tex type11_private mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} span_end={span_end}"
+@@ -2333,6 +2342,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
+         let mut bytes = vec![0u8; need];
+         if serve.is_none()
+             && !private
++            && !unseeded
+             && !mapping_write::read_rect_raw_at(
+                 state,
+                 host,
+@@ -2945,6 +2955,22 @@ fn writeback_texture<M: HostMemory + HostOps>(
+             height,
+             bpp,
+         } => {
++            // Pages that were holes when the window was staged may be wired by
++            // now; take the page table again before writing.
++            let _ = crate::runtime::mapper::ensure_resolved_for_scanout(state, host, *mapping_id);
++            if let Some(m) = state.mappings.get(mapping_id) {
++                let holes = m
++                    .page_entries
++                    .iter()
++                    .filter(|&&e| crate::contract::iosurface_pages::entry_gpa_shift(e, state.page_shift).is_none())
++                    .count();
++                if holes > 0 {
++                    crate::observe::off(format!(
++                        "compute_writeback_tex holes mid={mapping_id} holes={holes} of={}",
++                        m.page_entries.len()
++                    ));
++                }
++            }
+             let tight = width.saturating_mul(*bpp);
+             if !mapping_write::write_full_rect_raw_at(
+                 state,
+diff --git a/crates/reims-vgpu/src/runtime/mapper/mod.rs b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+index bb84dc65..8843b55e 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/mod.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+@@ -976,18 +976,22 @@ pub fn ensure_resolved_for_scanout<H: HostMemory + HostOps>(
+     host: &H,
+     mapping_id: u32,
+ ) -> bool {
+-    let (mapped, has_internal, empty_pages, has_geom) = match state.mappings.get(&mapping_id) {
++    let page_shift = state.page_shift;
++    let (mapped, has_internal, empty_pages, has_geom, has_holes) = match state.mappings.get(&mapping_id) {
+         Some(m) => (
+             m.mapped,
+             m.mapping_internal != 0,
+             m.page_entries.is_empty(),
+             m.has_geom,
++            m.page_entries.iter().any(|&e| {
++                crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift).is_none()
++            }),
+         ),
+         None => return false,
+     };
+     let needs = mapped
+         && has_internal
+-        && (empty_pages || !has_geom || !pages_cover_geom(state, mapping_id));
++        && (empty_pages || has_holes || !has_geom || !pages_cover_geom(state, mapping_id));
+     if needs {
+         resolve_mapping_backing(state, host, mapping_id)
+     } else {
+-- 
+2.43.0
+

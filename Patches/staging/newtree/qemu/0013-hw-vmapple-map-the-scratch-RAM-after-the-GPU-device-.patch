@@ -1,0 +1,41 @@
+From d4dd35b455001687849e50c980e37a02c49d9cc7 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 13:53:23 +0800
+Subject: [PATCH 13/14] hw/vmapple: map the scratch RAM after the GPU device
+ takes its memory map
+
+---
+ hw/vmapple/vmapple.c | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/hw/vmapple/vmapple.c b/hw/vmapple/vmapple.c
+index 3f91da3db4..a72e1ead62 100644
+--- a/hw/vmapple/vmapple.c
++++ b/hw/vmapple/vmapple.c
+@@ -745,17 +745,18 @@ static void mach_vmapple_init(MachineState *machine)
+     memory_region_add_subregion(sysmem, vms->memmap[VMAPPLE_MEM].base,
+                                 machine->ram);
+ 
+-    memory_region_init_ram(&vms->scratch_mr, NULL, "avp-scratch",
+-                           vms->memmap[VMAPPLE_SCRATCH].size, &error_fatal);
+-    memory_region_add_subregion(sysmem, vms->memmap[VMAPPLE_SCRATCH].base,
+-                                &vms->scratch_mr);
+-
+     create_gic(vms, sysmem);
+     create_gicv2m(vms);
+     create_bdif(vms, sysmem);
+     create_pvpanic(vms, sysmem);
+     create_aes(vms, sysmem);
+     create_gfx(vms, sysmem);
++    /* After the GPU: its memory map is the flat view at its realize, and
++     * this anonymous RAM has no file the library can map on Linux. */
++    memory_region_init_ram(&vms->scratch_mr, NULL, "avp-scratch",
++                           vms->memmap[VMAPPLE_SCRATCH].size, &error_fatal);
++    memory_region_add_subregion(sysmem, vms->memmap[VMAPPLE_SCRATCH].base,
++                                &vms->scratch_mr);
+     create_uart(vms, VMAPPLE_UART, sysmem, serial_hd(0));
+     create_rtc(vms);
+     create_pcie(vms);
+-- 
+2.43.0
+

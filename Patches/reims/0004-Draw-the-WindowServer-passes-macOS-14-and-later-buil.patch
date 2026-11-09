@@ -1,0 +1,874 @@
+From a65a79513f724f02af08b7795d90c296c62492e7 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Sun, 8 Nov 2026 10:42:19 +0800
+Subject: [PATCH] Draw the WindowServer passes macOS 14 and later build
+
+Nearly every WindowServer pass on 14.6.1, 15.6.1 and 26.6.2 attaches a
+type-9 texture as colour 1 and fetches it in the fragment shader:
+
+- Type 9 is a memoryless texture. Its descriptor is the 44-byte record a
+  type-2 descriptor carries after its level records (format at +14,
+  extent at +16, samples at +32, storage mode 0x30 at +34). It resolves to
+  a render target with no mapping and no guest VA, keyed by texture ref,
+  cleared at the start of each Metal pass and loaded across the draws of
+  one pass, never seeded from or written back to the guest.
+- Framebuffer fetch now covers any colour attachment: a bit per
+  attachment, input attachment N at binding 192+N, GENERAL layout for
+  each fetched attachment.
+
+Compute pipeline property 10 (value 2, set by a macOS 15 Core Image
+kernel) is taken as a hint instead of refusing the pipeline.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/backend/vulkan/engine/caches.rs       | 62 +++++++++-----
+ .../src/backend/vulkan/engine/exec.rs         | 55 ++++++++-----
+ .../src/backend/vulkan/engine/types.rs        | 23 +++---
+ .../src/runtime/decode/resource/mod.rs        | 51 +++++++++++-
+ .../src/runtime/decode/resource/tests.rs      | 16 ++++
+ crates/reims-vgpu/src/runtime/draw/mod.rs     | 22 ++++-
+ .../src/runtime/draw/render_target.rs         | 81 ++++++++++++++++++-
+ crates/reims-vgpu/src/runtime/draw/tests.rs   |  2 +
+ crates/reims-vgpu/src/runtime/draw/vulkan.rs  | 32 +++++---
+ crates/reims-vgpu/src/runtime/exec/mod.rs     |  1 +
+ crates/reims-vgpu/src/runtime/exec/tests.rs   |  1 +
+ 11 files changed, 276 insertions(+), 70 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs b/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
+index 745d8292..f7054ec8 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
+@@ -197,11 +197,12 @@ pub(crate) struct PassKey {
+     /// pass); the depth attachment is always appended AFTER color + secondaries
+     /// so slot 0 stays the primary color (the zero-copy readback assumes this).
+     pub depth: Option<DepthAttachKey>,
+-    /// Attachment 0 is ALSO referenced as a subpass input (framebuffer fetch).
+-    /// Both references use GENERAL layout and the subpass carries a BY_REGION
+-    /// self-dependency — the Vulkan feedback-loop form MoltenVK lowers to Metal
+-    /// programmable blending. `false` keeps the pass byte-identical.
+-    pub color_input: bool,
++    /// Bit N: colour attachment N is ALSO referenced as a subpass input
++    /// (framebuffer fetch), at input attachment index N. Both references use
++    /// GENERAL layout and the subpass carries a BY_REGION self-dependency — the
++    /// Vulkan feedback-loop form MoltenVK lowers to Metal programmable
++    /// blending. `0` keeps the pass byte-identical.
++    pub color_inputs: u8,
+     /// Bit N says colour attachment N is also sampled through
+     /// `VK_EXT_attachment_feedback_loop_layout`. The decoded render pass has at
+     /// most eight colour attachments, so the wire-derived attachment table is
+@@ -224,7 +225,7 @@ impl PassKey {
+             secondary: [SecondaryAttachKey::default(); MAX_SECONDARY_ATTACH],
+             secondary_count: 0,
+             depth: None,
+-            color_input: false,
++            color_inputs: 0,
+             feedback_colors: 0,
+             sample_count: 1,
+             multisample_resolve: false,
+@@ -289,10 +290,14 @@ impl PassKey {
+         FramebufferCompatibilityKey(key)
+     }
+ 
++    pub(crate) fn color_fetched(self, index: usize) -> bool {
++        index < 8 && self.color_inputs & (1 << index) != 0
++    }
++
+     pub(crate) fn color_layout(self, index: usize) -> vk::ImageLayout {
+         if self.color_feedback(index) {
+             color_feedback_layout()
+-        } else if index == 0 && (self.color_input || self.host_accessible_color0) {
++        } else if self.color_fetched(index) || (index == 0 && self.host_accessible_color0) {
+             vk::ImageLayout::GENERAL
+         } else {
+             // The same layout the pass exits at, so an ordinary pass performs no
+@@ -418,7 +423,7 @@ impl PassCompatibilityKey {
+             secondary,
+             secondary_count,
+             depth,
+-            color_input,
++            color_inputs,
+             feedback_colors,
+             sample_count,
+             multisample_resolve,
+@@ -439,7 +444,7 @@ impl PassCompatibilityKey {
+         if host_accessible_color0 != them.host_accessible_color0 {
+             return Some(PassCompatField::HostAccessibleColor0);
+         }
+-        if color_input != them.color_input {
++        if color_inputs != them.color_inputs {
+             return Some(PassCompatField::ColorInput);
+         }
+         if feedback_colors != them.feedback_colors {
+@@ -1873,16 +1878,29 @@ impl ObjectCaches {
+                 .attachment(index)
+                 .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+         });
+-        let input_ref = [vk::AttachmentReference::default()
+-            .attachment(0)
+-            .layout(key.color_layout(0))];
++        // Input attachment index N is colour attachment N, the way the
++        // translator numbers `dest_N`; a colour slot nothing fetches is a gap.
++        let input_ref: Vec<vk::AttachmentReference> = (0..8 - key.color_inputs.leading_zeros()
++            as usize)
++            .map(|index| {
++                if key.color_fetched(index) {
++                    vk::AttachmentReference::default()
++                        .attachment(index as u32)
++                        .layout(key.color_layout(index))
++                } else {
++                    vk::AttachmentReference::default()
++                        .attachment(vk::ATTACHMENT_UNUSED)
++                        .layout(vk::ImageLayout::UNDEFINED)
++                }
++            })
++            .collect();
+         let mut subpass_desc = vk::SubpassDescription::default()
+             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+             .color_attachments(&color_ref);
+         if !resolve_ref.is_empty() {
+             subpass_desc = subpass_desc.resolve_attachments(&resolve_ref);
+         }
+-        if key.color_input {
++        if !input_ref.is_empty() {
+             subpass_desc = subpass_desc.input_attachments(&input_ref);
+         }
+         if let Some(depth_ref) = &depth_ref {
+@@ -1902,12 +1920,12 @@ impl ObjectCaches {
+             .dependency_flags(vk::DependencyFlags::BY_REGION);
+         let mut deps: Vec<vk::SubpassDependency> = external_dependencies(
+             key.depth.is_some(),
+-            key.color_input,
++            key.color_inputs != 0,
+             key.host_accessible_color0,
+             pass_exit_scope_narrow(),
+         )
+         .to_vec();
+-        if key.color_input {
++        if key.color_inputs != 0 {
+             deps.push(fetch_dep);
+         }
+         deps.push(color_feedback_self_dependency(key.color_layout(0)));
+@@ -2714,7 +2732,7 @@ mod object_cache_tests {
+         assert_ne!(clear.compatibility(), different_format.compatibility());
+ 
+         let mut different_subpass = load;
+-        different_subpass.color_input = true;
++        different_subpass.color_inputs = 1;
+         assert_ne!(clear.compatibility(), different_subpass.compatibility());
+ 
+         let mut different_depth = load;
+@@ -2771,7 +2789,7 @@ mod object_cache_tests {
+             ("depth", |k| k.depth = None, Some(PassCompatField::Depth)),
+             ("host accessible", |k| k.host_accessible_color0 = true,
+              Some(PassCompatField::HostAccessibleColor0)),
+-            ("color input", |k| k.color_input = true, Some(PassCompatField::ColorInput)),
++            ("color input", |k| k.color_inputs = 1, Some(PassCompatField::ColorInput)),
+             // Feedback is a property of the draw, and it makes two passes
+             // incompatible only on the arm where it still moves a layout. On the
+             // shipping arm `compatibility` erases it, which is what stops a
+@@ -2821,7 +2839,7 @@ mod object_cache_tests {
+         assert_ne!(plain.compatibility(), transported.compatibility());
+ 
+         let mut input = transported;
+-        input.color_input = true;
++        input.color_inputs = 1;
+         assert_ne!(
+             plain.framebuffer_compatibility(),
+             input.framebuffer_compatibility()
+@@ -3461,7 +3479,7 @@ mod object_cache_tests {
+         key.host_accessible_color0 = true;
+         for color_input in [false, true] {
+             for feedback in [false, true] {
+-                key.color_input = color_input;
++                key.color_inputs = u8::from(color_input);
+                 key.feedback_colors = u8::from(feedback);
+                 assert_eq!(
+                     key.color_layout(0),
+@@ -3493,7 +3511,7 @@ mod object_cache_tests {
+     #[test]
+     fn feedback_attachment_layout_is_derived_consistently_from_the_mask() {
+         let mut key = PassKey::single(true, vk::Format::R8G8B8A8_UNORM);
+-        key.color_input = true;
++        key.color_inputs = 1;
+         key.feedback_colors = (1 << 0) | (1 << 3);
+ 
+         for index in 0..=MAX_SECONDARY_ATTACH {
+@@ -3575,12 +3593,12 @@ mod object_cache_tests {
+     fn pass_dependency_count(key: PassKey) -> usize {
+         external_dependencies(
+             key.depth.is_some(),
+-            key.color_input,
++            key.color_inputs != 0,
+             key.host_accessible_color0,
+             pass_exit_scope_narrow(),
+         )
+         .len()
+-            + usize::from(key.color_input)
++            + usize::from(key.color_inputs != 0)
+             + 1
+     }
+ 
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs b/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
+index 917cda41..791dfdbb 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
+@@ -2850,7 +2850,7 @@ pub(crate) unsafe fn execute_draw_inner(
+         req.storage_buffers.len()
+             + req.sampled_images.len()
+             + req.samplers.len()
+-            + req.color_input as usize,
++            + req.color_inputs.count_ones() as usize,
+     );
+     for b in &req.storage_buffers {
+         layout_bindings.push(BindingSig {
+@@ -2876,9 +2876,9 @@ pub(crate) unsafe fn execute_draw_inner(
+             count: 1,
+         });
+     }
+-    if req.color_input {
++    for index in (0..8u32).filter(|index| req.color_inputs & (1 << index) != 0) {
+         layout_bindings.push(BindingSig {
+-            binding: super::types::COLOR_INPUT_BINDING,
++            binding: super::types::COLOR_INPUT_BINDING + index,
+             ty: vk::DescriptorType::INPUT_ATTACHMENT.as_raw() as u32,
+             stages: vk::ShaderStageFlags::FRAGMENT.as_raw(),
+             count: 1,
+@@ -2966,7 +2966,7 @@ pub(crate) unsafe fn execute_draw_inner(
+         };
+     }
+     pass_key.secondary_count = req.secondary_targets.len() as u8;
+-    pass_key.color_input = req.color_input;
++    pass_key.color_inputs = req.color_inputs;
+     for resource in &req.sampled_images {
+         if let Some(index) =
+             feedback_color_index(req, resource, ctx.features.attachment_feedback_loop_layout)
+@@ -3038,12 +3038,12 @@ pub(crate) unsafe fn execute_draw_inner(
+                 },
+             ));
+         }
+-        if !req.secondary_targets.is_empty() || req.color_input {
++        if !req.secondary_targets.is_empty() || req.color_inputs != 0 {
+             return Err(DrawError::Unsupported(
+                 super::reason::DrawReason::MultisampleResolveShapeUnsupported {
+                     color_targets: 1u32.saturating_add(req.secondary_targets.len() as u32),
+                     depth: req.depth.is_some(),
+-                    color_input: req.color_input,
++                    color_input: req.color_inputs != 0,
+                 },
+             ));
+         }
+@@ -3440,7 +3440,7 @@ pub(crate) unsafe fn execute_draw_inner(
+     // slot's cached framebuffer was built against. One predicate, because the
+     // two answers it feeds have to agree: which pass the slot is ensured under,
+     // and whether the draw builds (and later disposes) a framebuffer of its own.
+-    let ordinary_ad_hoc_framebuffer = is_mrt || req.depth.is_some() || req.color_input;
++    let ordinary_ad_hoc_framebuffer = is_mrt || req.depth.is_some() || req.color_inputs != 0;
+     let ad_hoc_framebuffer = ordinary_ad_hoc_framebuffer || req.multisample_resolve;
+     let (primary_pass, primary_pass_compatibility) = if ad_hoc_framebuffer {
+         let mut color_only = PassKey::single(pass_key.load_seed, pass_key.color0_format);
+@@ -3460,6 +3460,9 @@ pub(crate) unsafe fn execute_draw_inner(
+         vk::Image,
+         super::pools::ResidentAccess,
+     )> = Vec::new();
++    // The ad-hoc framebuffer's views in attachment order, which is what a
++    // fetched secondary's input descriptor points at.
++    let mut ad_hoc_views: Vec<vk::ImageView> = Vec::new();
+     // This draw's depth attachment, when it has one. The framebuffer is always
+     // this draw's own and is always disposed after submit; the image behind it
+     // is only owned here when the pass named no guest depth texture to key a
+@@ -3546,6 +3549,7 @@ pub(crate) unsafe fn execute_draw_inner(
+                 if let Some(d) = depth_attachment.as_ref() {
+                     transient_depth = Some((d.owned, fb));
+                 }
++                ad_hoc_views = views;
+                 (primary_image, fb, primary_access, primary_view)
+             } else {
+                 (primary_image, primary_slot_fb, primary_access, primary_view)
+@@ -3582,6 +3586,7 @@ pub(crate) unsafe fn execute_draw_inner(
+                 if let Some(d) = depth_attachment.as_ref() {
+                     transient_depth = Some((d.owned, fb));
+                 }
++                ad_hoc_views = views;
+                 (
+                     pool_image,
+                     fb,
+@@ -4125,9 +4130,23 @@ pub(crate) unsafe fn execute_draw_inner(
+     // Framebuffer fetch: the input attachment IS the color target's view;
+     // derive the same layout as the subpass reference. A draw that also
+     // samples the target upgrades both from GENERAL to the feedback layout.
+-    let color_input_info = vk::DescriptorImageInfo::default()
+-        .image_view(target_view)
+-        .image_layout(pass_key.color_layout(0));
++    // A fetched secondary reads its own view out of the ad-hoc framebuffer.
++    let color_input_infos: Vec<(u32, vk::DescriptorImageInfo)> = (0..8usize)
++        .filter(|&index| pass_key.color_fetched(index))
++        .map(|index| {
++            let view = if index == 0 {
++                target_view
++            } else {
++                ad_hoc_views.get(index).copied().unwrap_or(target_view)
++            };
++            (
++                super::types::COLOR_INPUT_BINDING + index as u32,
++                vk::DescriptorImageInfo::default()
++                    .image_view(view)
++                    .image_layout(pass_key.color_layout(index)),
++            )
++        })
++        .collect();
+     let dst_set = dset.unwrap_or_default();
+     let mut descriptor_writes = Vec::new();
+     for (i, (binding, _, _)) in storage_slots.iter().enumerate() {
+@@ -4158,13 +4177,13 @@ pub(crate) unsafe fn execute_draw_inner(
+                 .image_info(std::slice::from_ref(&sampler_infos[i])),
+         );
+     }
+-    if req.color_input {
++    for (binding, info) in &color_input_infos {
+         descriptor_writes.push(
+             vk::WriteDescriptorSet::default()
+                 .dst_set(dst_set)
+-                .dst_binding(super::types::COLOR_INPUT_BINDING)
++                .dst_binding(*binding)
+                 .descriptor_type(vk::DescriptorType::INPUT_ATTACHMENT)
+-                .image_info(std::slice::from_ref(&color_input_info)),
++                .image_info(std::slice::from_ref(info)),
+         );
+     }
+     if dset.is_some() {
+@@ -5181,14 +5200,14 @@ pub(crate) unsafe fn execute_draw_inner(
+                 layout: info.image_layout,
+             },
+         ));
+-        if req.color_input {
++        for (binding, info) in &color_input_infos {
+             push_state.push(super::pools::PushDescriptorBinding::Image {
+-                binding: super::types::COLOR_INPUT_BINDING,
++                binding: *binding,
+                 array_element: 0,
+                 ty: vk::DescriptorType::INPUT_ATTACHMENT,
+-                sampler: color_input_info.sampler,
+-                view: color_input_info.image_view,
+-                layout: color_input_info.image_layout,
++                sampler: info.sampler,
++                view: info.image_view,
++                layout: info.image_layout,
+             });
+         }
+         if pools.push_descriptors_changed(pipeline_layout, counters) {
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/types.rs b/crates/reims-vgpu/src/backend/vulkan/engine/types.rs
+index 90fc8afe..c675b4fa 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/types.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/types.rs
+@@ -559,13 +559,15 @@ pub struct DrawRequest {
+     /// buffer, byte-identical to the pre-depth 2D path. Set only for a draw that
+     /// bound a non-trivial `MTLDepthStencilState` (see `runtime::draw`).
+     pub depth: Option<DepthState>,
+-    /// Fragment shader reads its destination pixel (Metal framebuffer fetch:
+-    /// an `air.render_target` INPUT param, translated as a `SubpassData` image
+-    /// at [`COLOR_INPUT_BINDING`]). The engine then references attachment 0 as
+-    /// a subpass input (GENERAL layout, BY_REGION self-dependency) and writes
+-    /// an INPUT_ATTACHMENT descriptor pointing at the color target's view.
+-    /// `false` (default) keeps the pass byte-identical to the pre-fetch engine.
+-    pub color_input: bool,
++    /// Colour attachments the fragment shader reads its destination pixel
++    /// from (Metal framebuffer fetch: an `air.render_target` INPUT param
++    /// `dest_N`, translated as a `SubpassData` image at
++    /// [`COLOR_INPUT_BINDING`]` + N` with input attachment index N). Bit N
++    /// makes attachment N a subpass input as well (GENERAL layout, BY_REGION
++    /// self-dependency) and writes an INPUT_ATTACHMENT descriptor pointing at
++    /// that attachment's view. `0` (default) keeps the pass byte-identical to
++    /// the pre-fetch engine.
++    pub color_inputs: u8,
+     /// The preceding engine request belongs to this draw's Metal render
+     /// encoder. Used only when its Vulkan pass is still open and identical.
+     pub continues_render_pass: bool,
+@@ -682,12 +684,13 @@ pub fn viewport_slot_count(req: &DrawRequest) -> usize {
+     req.viewports.len().max(req.scissors.len()).max(1)
+ }
+ 
+-/// Descriptor binding of the attachment-0 framebuffer-fetch input attachment.
++/// Descriptor binding of the attachment-0 framebuffer-fetch input attachment;
++/// attachment N reads at this plus N.
+ ///
+ /// This is the *device's* ColorInput band base, not the translator's: the band
+ /// moved up when the texture band was widened to Metal's 128 entries
+ /// (`runtime::spirv_bind::widen_sampled_bands` rewrites `dest_N` from the
+-/// translator's `96+N` to `192+N`). Only `dest_0` is supported. Kept equal to
++/// translator's `96+N` to `192+N`). Kept equal to
+ /// `runtime::spirv_bind::COLOR_INPUT_BINDING_BASE` by a unit test there, because
+ /// the two constants live on opposite sides of the runtime/engine layering.
+ /// Both fragment relocations preserve it.
+@@ -2523,7 +2526,7 @@ mod tests {
+         assert!(draw.target_identity.is_none());
+         assert!(draw.depth.is_none());
+         assert!(!draw.skip_readback);
+-        assert!(!draw.color_input);
++        assert_eq!(draw.color_inputs, 0);
+ 
+         let compute = ComputeRequest::default();
+         assert_eq!(compute.grid, [0, 0, 0]);
+diff --git a/crates/reims-vgpu/src/runtime/decode/resource/mod.rs b/crates/reims-vgpu/src/runtime/decode/resource/mod.rs
+index fac8904f..3dcb9aef 100644
+--- a/crates/reims-vgpu/src/runtime/decode/resource/mod.rs
++++ b/crates/reims-vgpu/src/runtime/decode/resource/mod.rs
+@@ -79,6 +79,11 @@ pub const OBJECT_TYPE_TEXTURE_VARIANT: u8 = 3;
+ pub const OBJECT_TYPE_FUNCTION: u8 = 6;
+ pub const OBJECT_TYPE_TYPE7: u8 = 7;
+ pub const OBJECT_TYPE_TEXTURE_VIEW: u8 = 8;
++/// A texture with no backing at all, `MTLStorageModeMemoryless`. Its
++/// descriptor is the 44-byte record a type-2 descriptor carries after its
++/// level records, and nothing else. macOS 14 and later attach one as colour 1
++/// of nearly every WindowServer pass.
++pub const OBJECT_TYPE_MEMORYLESS_TEXTURE: u8 = 9;
+ pub const OBJECT_TYPE_IOSURFACE: u8 = 11;
+ 
+ /// Type-7 first dword subtypes.
+@@ -1753,6 +1758,44 @@ pub fn decode_buffer_descriptor(bytes: &[u8]) -> Result<BufferDescriptor, Decode
+     })
+ }
+ 
++/// A type-9 texture: the geometry of a texture that lives only in tile memory.
++///
++/// Measured on macOS 15.6.1, every one of these reads
++/// `01000000 2c000000 <ref> 4205 <format> <width> <height> <depth>
++/// <levels:u16> <array:u16> <samples:u16> 0030 …`. The same record sits at
++/// offset 72 of a type-2 descriptor, where the last field reads `0020`: the
++/// `MTLResourceOptions` storage mode, private there and memoryless here.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct MemorylessTextureDescriptor {
++    pub pixel_format: u16,
++    pub width: u32,
++    pub height: u32,
++    pub depth: u32,
++    pub sample_count: u32,
++}
++
++pub const MEMORYLESS_DESC_LEN: usize = 36;
++const MEMORYLESS_DESC_PIXEL_FORMAT: usize = 14;
++const MEMORYLESS_DESC_WIDTH: usize = 16;
++const MEMORYLESS_DESC_HEIGHT: usize = 20;
++const MEMORYLESS_DESC_DEPTH: usize = 24;
++const MEMORYLESS_DESC_SAMPLE_COUNT: usize = 32;
++
++pub fn decode_memoryless_texture_descriptor(
++    bytes: &[u8],
++) -> Result<MemorylessTextureDescriptor, DecodeStatus> {
++    if bytes.len() < MEMORYLESS_DESC_LEN {
++        return Err(DecodeStatus::ErrShort("res_memoryless_desc_short"));
++    }
++    Ok(MemorylessTextureDescriptor {
++        pixel_format: ld16(&bytes[MEMORYLESS_DESC_PIXEL_FORMAT..]),
++        width: ld32(&bytes[MEMORYLESS_DESC_WIDTH..]),
++        height: ld32(&bytes[MEMORYLESS_DESC_HEIGHT..]),
++        depth: ld32(&bytes[MEMORYLESS_DESC_DEPTH..]).max(1),
++        sample_count: u32::from(ld16(&bytes[MEMORYLESS_DESC_SAMPLE_COUNT..])).max(1),
++    })
++}
++
+ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, DecodeStatus> {
+     if bytes.len() < TEXTURE_DESC_GEOMETRY_LEN {
+         return Err(DecodeStatus::ErrShort("res_texture_desc_short"));
+@@ -2289,6 +2332,11 @@ const COMPUTE_PIPELINE_TAG_THREADGROUP_MULTIPLE: u8 = 0x01;
+ /// [`RENDER_PIPELINE_TAG_LABEL`] at a different index, for the reason that
+ /// constant's doc gives.
+ const COMPUTE_PIPELINE_TAG_LABEL: u8 = 0x02;
++/// Property 10 of the compute descriptor, value 2 on every record seen. A
++/// macOS 15 Core Image kernel (`k7x1RGBA14X1Yh`) sets it beside the label and
++/// the threadgroup hint; refusing it lost every frame drawn through that
++/// kernel. Not identified, and taken as a compiler hint like its neighbours.
++const COMPUTE_PIPELINE_TAG_10: u8 = 0x0a;
+ /// `MTLComputePipelineDescriptor.stageInputDescriptor` — a byte offset from the
+ /// end of the 16-byte type-7 header to a nested property list, in the same units
+ /// as [`PIPELINE_TAG_VERTEX_DESCRIPTOR_OFFSET`] and
+@@ -2385,9 +2433,10 @@ const RENDER_PIPELINE_TAGS_BENIGN: [u8; 3] = [
+ ];
+ /// The compute half of [`RENDER_PIPELINE_TAGS_BENIGN`]; same rule, and listed
+ /// apart for the same reason `COMPUTE_PIPELINE_TAGS_CONSUMED` is.
+-const COMPUTE_PIPELINE_TAGS_BENIGN: [u8; 2] = [
++const COMPUTE_PIPELINE_TAGS_BENIGN: [u8; 3] = [
+     COMPUTE_PIPELINE_TAG_THREADGROUP_MULTIPLE,
+     COMPUTE_PIPELINE_TAG_LABEL,
++    COMPUTE_PIPELINE_TAG_10,
+ ];
+ 
+ /// A pipeline-descriptor field this decoder does not read **and has not
+diff --git a/crates/reims-vgpu/src/runtime/decode/resource/tests.rs b/crates/reims-vgpu/src/runtime/decode/resource/tests.rs
+index b43eb985..9c59f843 100644
+--- a/crates/reims-vgpu/src/runtime/decode/resource/tests.rs
++++ b/crates/reims-vgpu/src/runtime/decode/resource/tests.rs
+@@ -3155,3 +3155,19 @@ fn a_layout_table_past_u16_reports_its_real_length() {
+         assert_eq!(icb_layout_table_len(tg_start, tg_start - 8, stride), 0);
+     }
+ }
++
++/// The type-9 descriptor macOS 15.6.1 attaches as colour 1 of its WindowServer
++/// passes, byte for byte.
++#[test]
++fn a_memoryless_texture_decodes_its_geometry_and_format() {
++    let hex = "010000002c0000000a00000042057300c0030000180000000100000001000100010030000000000000000000";
++    let bytes: Vec<u8> = (0..hex.len())
++        .step_by(2)
++        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
++        .collect();
++    let tex = decode_memoryless_texture_descriptor(&bytes).expect("decodes");
++    assert_eq!(tex.pixel_format, 0x73);
++    assert_eq!((tex.width, tex.height, tex.depth), (960, 24, 1));
++    assert_eq!(tex.sample_count, 1);
++    assert!(decode_memoryless_texture_descriptor(&bytes[..20]).is_err());
++}
+diff --git a/crates/reims-vgpu/src/runtime/draw/mod.rs b/crates/reims-vgpu/src/runtime/draw/mod.rs
+index 433e0993..34a3e181 100644
+--- a/crates/reims-vgpu/src/runtime/draw/mod.rs
++++ b/crates/reims-vgpu/src/runtime/draw/mod.rs
+@@ -42,9 +42,6 @@ use crate::observe::Decline;
+ // longer downgrade at all: they carry the source format through to the bind.
+ #[cfg(feature = "backend-vulkan")]
+ use crate::runtime::census::srgb_census;
+-// Only `vulkan` and the tests read it, through this module's `use super::*`;
+-// the Metal arm tests the band instead (`load_action_in_contract`).
+-#[cfg(any(test, feature = "backend-vulkan"))]
+ use crate::contract::pass_action::MTL_LOAD_ACTION_DONT_CARE;
+ #[cfg(any(
+     feature = "backend-vulkan",
+@@ -815,6 +812,10 @@ pub struct ColorRtRequest {
+     /// Multisample attachment discarded into this request's single-sample
+     /// target at pass end. Zero for an ordinary colour attachment.
+     pub multisample_source_ref: u32,
++    /// A type-9 memoryless texture: `mapping_id` and `target_gva` are both
++    /// zero, and the attachment is a host image keyed by `texture_ref` that is
++    /// never seeded from or written back to the guest.
++    pub memoryless: bool,
+ }
+ 
+ /// One `setVisibilityResultMode:offset:`, as the encoder state it is.
+@@ -4332,6 +4333,7 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
+         row_stride: bpr,
+         format: fmt,
+         sample_count: _,
++        memoryless: _,
+     }) = lookup_render_target(state, host, task_id, *att)
+     else {
+         return lost("render_target_unresolved");
+@@ -4452,6 +4454,7 @@ pub fn color_target_request<M: HostMemory + HostOps>(
+         clear_color: [0.0; 4],
+         target_seed_rgba: None,
+         multisample_source_ref: 0,
++        memoryless: rt.memoryless,
+     };
+     Some(DrawEncodeRequest {
+         task_id,
+@@ -4588,6 +4591,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
+             row_stride: bpr,
+             format: mfmt,
+             sample_count: target_sample_count,
++            memoryless,
+         } = target;
+         #[cfg(feature = "backend-vulkan")]
+         let attachment_sample_count = pipeline_sample_count.unwrap_or(target_sample_count);
+@@ -4630,7 +4634,16 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
+         let mut load_action = att.load_action;
+         let mut clear_color = att.clear_color;
+         let mut seed = None;
+-        if let Some(cl) = clears.iter().find(|a| a.texture_ref == att.texture_ref) {
++        if memoryless {
++            // Nothing to seed from: a memoryless attachment starts cleared or
++            // undefined, and Metal refuses a LOAD on one.
++            if let Some(cl) = clears.iter().find(|a| a.texture_ref == att.texture_ref) {
++                load_action = MTL_LOAD_ACTION_CLEAR;
++                clear_color = cl.clear_color;
++            } else if load_action != MTL_LOAD_ACTION_CLEAR {
++                load_action = MTL_LOAD_ACTION_DONT_CARE;
++            }
++        } else if let Some(cl) = clears.iter().find(|a| a.texture_ref == att.texture_ref) {
+             // Clear-only stream record for this attachment: real Metal Clear.
+             load_action = MTL_LOAD_ACTION_CLEAR;
+             clear_color = cl.clear_color;
+@@ -4710,6 +4723,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
+             clear_color,
+             target_seed_rgba: seed,
+             multisample_source_ref,
++            memoryless,
+         });
+     }
+     if colors.is_empty() {
+diff --git a/crates/reims-vgpu/src/runtime/draw/render_target.rs b/crates/reims-vgpu/src/runtime/draw/render_target.rs
+index 458f6477..0b1fa0c9 100644
+--- a/crates/reims-vgpu/src/runtime/draw/render_target.rs
++++ b/crates/reims-vgpu/src/runtime/draw/render_target.rs
+@@ -58,6 +58,9 @@
+ //! background noise.
+ 
+ use super::*;
++use crate::runtime::decode::resource::{
++    decode_memoryless_texture_descriptor, OBJECT_TYPE_MEMORYLESS_TEXTURE,
++};
+ /// The colour render target's base format for a **type-4** surface, or nothing.
+ ///
+ /// On this arm `m.format == 0` is not "unset", it is a decoded refusal:
+@@ -354,6 +357,10 @@ pub(super) struct ResolvedRenderTarget {
+     /// Vulkan encode replaces this provisional single-sample value with the
+     /// bound pipeline's raster sample count before constructing an image.
+     pub(super) sample_count: u32,
++    /// A type-9 texture: no mapping and no guest VA, only a host image that
++    /// lives for the pass. Metal lets such an attachment neither load nor
++    /// store, so nothing is seeded into it and nothing is written back.
++    pub(super) memoryless: bool,
+ }
+ 
+ /// Why a colour attachment's `texture_ref` could not be turned into somewhere
+@@ -463,6 +470,14 @@ pub(super) enum RenderTargetCause {
+     NoListEntry,
+     /// Something is under the ref and it is not a texture.
+     WrongType { object_type: u8 },
++    /// A mip>0 view of a memoryless texture.
++    MemorylessMipView { level: u32 },
++    /// The type-9 entry's descriptor bytes could not be read.
++    MemorylessDescRead,
++    /// The type-9 descriptor is shorter than its geometry.
++    MemorylessDescDecode { len: usize },
++    /// The memoryless texture's format is not one Metal can render into.
++    MemorylessFormat { fmt: u16 },
+     /// The texture entry's descriptor bytes could not be read.
+     LinearDescRead,
+     /// The bytes were read and are not a texture descriptor. Carries the
+@@ -547,6 +562,10 @@ impl crate::observe::Decline for RenderTargetRefusal {
+             C::Type4Format { .. } => "rt_type4_format",
+             C::NoListEntry => crate::observe::ladder_slug!("rt", no_list_entry),
+             C::WrongType { .. } => crate::observe::ladder_slug!("rt", wrong_type),
++            C::MemorylessMipView { .. } => "rt_memoryless_mip_view",
++            C::MemorylessDescRead => "rt_memoryless_desc_read",
++            C::MemorylessDescDecode { .. } => "rt_memoryless_desc_decode",
++            C::MemorylessFormat { .. } => "rt_memoryless_format",
+             C::LinearDescRead => crate::observe::ladder_slug!("rt_linear", desc_read),
+             C::LinearDescDecode { .. } => crate::observe::ladder_slug!("rt_linear", desc_decode),
+             C::LinearDescIncomplete { .. } => "rt_linear_desc_incomplete",
+@@ -569,7 +588,9 @@ impl crate::observe::Decline for RenderTargetRefusal {
+         use RenderTargetCause as C;
+         let mut v = vec![("base", self.base_ref.to_string())];
+         match self.cause {
+-            C::Type11MipView { level } | C::LinearLevelGva { level } => {
++            C::Type11MipView { level }
++            | C::LinearLevelGva { level }
++            | C::MemorylessMipView { level } => {
+                 v.push(("level", level.to_string()))
+             }
+             C::LevelOverflow {
+@@ -594,7 +615,9 @@ impl crate::observe::Decline for RenderTargetRefusal {
+                 v.push(("mid", mapping_id.to_string()));
+                 v.push(("fmt", format!("{fmt:#x}")));
+             }
+-            C::Type5DescDecode { len } => v.push(("desc_len", len.to_string())),
++            C::Type5DescDecode { len } | C::MemorylessDescDecode { len } => {
++                v.push(("desc_len", len.to_string()))
++            }
+             C::Type4MipView { surface_id, level } => {
+                 v.push(("sid", surface_id.to_string()));
+                 v.push(("level", level.to_string()));
+@@ -645,7 +668,9 @@ impl crate::observe::Decline for RenderTargetRefusal {
+                 v.push(("dims", format!("{width}x{height}")));
+                 v.push(("bpr", row_stride.to_string()));
+             }
+-            C::LinearFormat { fmt } => v.push(("fmt", format!("{fmt:#x}"))),
++            C::LinearFormat { fmt } | C::MemorylessFormat { fmt } => {
++                v.push(("fmt", format!("{fmt:#x}")))
++            }
+             C::LinearLevelStride { row_stride } => v.push(("bpr", row_stride.to_string())),
+             C::LinearLevelSpan { row_stride, height } => {
+                 v.push(("bpr", row_stride.to_string()));
+@@ -691,6 +716,7 @@ impl crate::observe::Decline for RenderTargetRefusal {
+             | C::Type5DescRead
+             | C::Type5SurfaceZero
+             | C::NoListEntry
++            | C::MemorylessDescRead
+             | C::LinearDescRead => {}
+         }
+         v
+@@ -877,6 +903,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
+             row_stride: 0,
+             format: fmt,
+             sample_count: 1,
++            memoryless: false,
+         });
+     }
+     // x86 Ventura/Tahoe type-4 surface/backing (present IOSurface). Object-list
+@@ -957,10 +984,55 @@ fn resolve_render_target<M: HostMemory + HostOps>(
+             row_stride: 0,
+             format: fmt,
+             sample_count: 1,
++            memoryless: false,
+         });
+     }
+-    // type-2/3 linear GVA (wallpaper/background layers, UI intermediate RTs).
+     let entry = live.ok_or(C::NoListEntry.at(resolved_ref))?;
++    // Type-9 memoryless: geometry and format only, rendered into a host image
++    // that exists for the pass.
++    if entry.object_type == OBJECT_TYPE_MEMORYLESS_TEXTURE {
++        if level != 0 {
++            return Err(C::MemorylessMipView { level }.at(resolved_ref));
++        }
++        let desc_bytes = objects::read_descriptor(state, host, task_id, &entry)
++            .ok_or(C::MemorylessDescRead.at(resolved_ref))?;
++        let tex = decode_memoryless_texture_descriptor(&desc_bytes).map_err(|_| {
++            C::MemorylessDescDecode {
++                len: desc_bytes.len(),
++            }
++            .at(resolved_ref)
++        })?;
++        let fmt = effective_view_sample_format(tex.pixel_format, view_fmt_override)
++            .unwrap_or(tex.pixel_format);
++        if pixel_format::render_target_bpp(fmt).is_none() {
++            return Err(C::MemorylessFormat { fmt }.at(resolved_ref));
++        }
++        if tex.width == 0 || tex.height == 0 {
++            return Err(C::ZeroExtent {
++                width: tex.width,
++                height: tex.height,
++            }
++            .at(resolved_ref));
++        }
++        let row_stride = pixel_format::tight_row_bytes(tex.width, fmt).ok_or(
++            C::RowTight {
++                width: tex.width,
++                fmt,
++            }
++            .at(resolved_ref),
++        )?;
++        return Ok(ResolvedRenderTarget {
++            mapping_id: 0,
++            target_gva: 0,
++            width: tex.width,
++            height: tex.height,
++            row_stride,
++            format: fmt,
++            sample_count: tex.sample_count,
++            memoryless: true,
++        });
++    }
++    // type-2/3 linear GVA (wallpaper/background layers, UI intermediate RTs).
+     if entry.object_type != OBJECT_TYPE_TEXTURE && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
+     {
+         return Err(C::WrongType {
+@@ -1104,6 +1176,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
+         row_stride: bpr,
+         format: fmt,
+         sample_count: 1,
++        memoryless: false,
+     })
+ }
+ 
+diff --git a/crates/reims-vgpu/src/runtime/draw/tests.rs b/crates/reims-vgpu/src/runtime/draw/tests.rs
+index e61f1734..eb6718c1 100644
+--- a/crates/reims-vgpu/src/runtime/draw/tests.rs
++++ b/crates/reims-vgpu/src/runtime/draw/tests.rs
+@@ -5957,6 +5957,7 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
+         clear_color: [0.0; 4],
+         target_seed_rgba: None,
+         multisample_source_ref: 0,
++        memoryless: false,
+     };
+ 
+     let armed = sync_store_allowed_pages(&state, &host, 1, Some(&c0), true)
+@@ -6164,6 +6165,7 @@ fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
+         clear_color: [0.0; 4],
+         target_seed_rgba: None,
+         multisample_source_ref: 0,
++        memoryless: false,
+     };
+     // Full height, left half only: the partial store the Load seed forces, and
+     // it crosses the page boundary at row 64.
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index 1b0c63d8..a5c01f54 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -6278,6 +6278,16 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
+                 c.width,
+                 c.height,
+             )
++        } else if c.memoryless {
++            // No guest destination to follow, so the texture ref names it, as
++            // it names a depth attachment. Its content never outlives the pass.
++            TargetIdentity::Texture {
++                ref_: c.texture_ref,
++                width: c.width,
++                height: c.height,
++                generation: 0,
++                stencil: false,
++            }
+         } else {
+             crate::runtime::census::present_proxy::note_secondary_mrt_drop(
+                 crate::runtime::census::present_proxy::MrtDrop::NoIdentity,
+@@ -7070,27 +7080,27 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+         };
+ 
+         // Framebuffer fetch (`air.render_target` INPUT param `dest_N` →
+-        // reflection `ColorInput` at binding 96+N): the engine supports the
+-        // attachment-0 fetch as a Vulkan subpass input. `dest_N>0` (fetching a
+-        // secondary MRT attachment) has no engine path yet — fail visibly, never
+-        // execute a shader whose destination read would be unbound.
+-        let frag_color_input = {
++        // reflection `ColorInput`): the engine reads colour attachment N as
++        // Vulkan subpass input N. A `dest_N` naming an attachment this pass
++        // does not have fails visibly — never execute a shader whose
++        // destination read would be unbound. macOS 14 and later fetch a
++        // memoryless `dest_1` in most WindowServer composites.
++        let frag_color_inputs = {
+             use metal2vulkan::reflect::ResourceKind;
+-            let mut fetch0 = false;
++            let mut fetched = 0u8;
+             for rb in &f_shader.reflection.bindings {
+                 if rb.kind == ResourceKind::ColorInput {
+-                    if rb.metal_index == 0 {
+-                        fetch0 = true;
+-                    } else {
++                    if rb.metal_index as usize >= req.colors.len().min(8) {
+                         return Err(DrawError::DrawPreparation(
+                             DrawPreparationDecline::ColorInputMrtUnsupported {
+                                 destination_index: rb.metal_index,
+                             },
+                         ));
+                     }
++                    fetched |= 1 << rb.metal_index;
+                 }
+             }
+-            fetch0
++            fetched
+         };
+         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Sampled);
+         // The four `sampled_phase` spans below divide this phase's `sampled_us`,
+@@ -8158,7 +8168,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+         resources.vertex_attributes = attrs;
+         resources.storage_buffers = storage;
+         resources.sampled_images = images;
+-        resources.color_input = frag_color_input;
++        resources.color_inputs = frag_color_inputs;
+         resources.continues_render_pass = req.continues_render_pass;
+         resources.render_pass_continues = req.render_pass_continues;
+         resources.samplers = samplers;
+diff --git a/crates/reims-vgpu/src/runtime/exec/mod.rs b/crates/reims-vgpu/src/runtime/exec/mod.rs
+index 9bc41cb2..977af4a1 100644
+--- a/crates/reims-vgpu/src/runtime/exec/mod.rs
++++ b/crates/reims-vgpu/src/runtime/exec/mod.rs
+@@ -3788,6 +3788,7 @@ fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::Dra
+             clear_color: c.clear_color,
+             target_seed_rgba: None,
+             multisample_source_ref: c.multisample_source_ref,
++            memoryless: c.memoryless,
+         })
+         .collect();
+     draw::DrawEncodeRequest {
+diff --git a/crates/reims-vgpu/src/runtime/exec/tests.rs b/crates/reims-vgpu/src/runtime/exec/tests.rs
+index 3d16d6c6..e15ceca8 100644
+--- a/crates/reims-vgpu/src/runtime/exec/tests.rs
++++ b/crates/reims-vgpu/src/runtime/exec/tests.rs
+@@ -2275,6 +2275,7 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
+             clear_color: [0.1, 0.2, 0.3, 1.0],
+             target_seed_rgba: Some(vec![0xbb; 16]),
+             multisample_source_ref: 0,
++            memoryless: false,
+         }],
+         ..Default::default()
+     };
+-- 
+2.43.0
+

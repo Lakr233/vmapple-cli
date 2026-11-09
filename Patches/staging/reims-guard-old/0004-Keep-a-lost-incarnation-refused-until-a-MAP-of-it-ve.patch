@@ -1,0 +1,572 @@
+From 2697f74352f5cec53c52ac41ec39fdde16e9b7b3 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 15:13:49 +0800
+Subject: [PATCH 4/4] Keep a lost incarnation refused until a MAP of it
+ verifies
+
+Codex's review of the previous commit: a MAP of the same
+MappingInternal replaced the lost entry with a fresh pending one before
+checking it, and the guard refused only lost or condemned entries. So a
+MAP whose check could not be read, or whose two reads disagreed, left a
+pending entry the guard let writes through; and one that failed its
+check (class, layout, a count at zero at MAP) removed the entry, and an
+unwatched mapping is unrefused too.
+
+The refusal is now a latch, Watched::unowned, set where the chain is
+lost and carried by a MAP of the same MappingInternal into its fresh
+entry. The guard refuses every write while it is set, in any phase. It
+is lifted only where that MAP's check passes: the whole chain,
+MappingInternal to IOSurface to both descriptors, read alike twice, and
+both counts positive, which a check made later than the MAP must show
+as well (OFF wire_guard_unowned_cleared ... reason=verified_map
+at=map|late surface_wire= table_wire=). Otherwise it stays:
+
+- not readable, or the two reads disagree: the entry stays pending and
+  refused, and is checked again at the next sample;
+- the check fails: the entry is not removed but goes back to lost, not
+  sampled and refused, until a later MAP verifies.
+
+Each is said at the MAP: OFF wire_guard_unowned_kept mapping= internal=
+lost= why=not_yet|inconclusive:<link>|<check reason>|wire_not_positive
+at=map. A condemned incarnation is still not cleared by a MAP of the
+same MappingInternal, and a lost one is no evidence for a mapping the
+surface quarantine would free. Phase::Lost now only means not sampled;
+the reason lives in the latch.
+
+Tests (lib, --test-threads=1): 2322 passed, 1 failed: the cursor test,
+which reads vendor/qemu/ui/cursor.c, absent from this worktree.
+runtime::mapper::wire_watch: 39 passed, 5 of them new, each on 13.6
+with mapping 2 lost and made again where it was. A MAP that cannot be
+read, one whose two reads disagree (and a write whose own check
+disagrees too), one whose IOSurface is 14.6.1's class, and one whose
+surface count reads 0 all keep its writes refused, and each is then
+lifted by a check that verifies. A MAP that verifies gives the writes
+back. The previous commit's lost test now expects reason=verified_map
+at=map. With the latch not carried across the MAP, the four refusal
+tests and that lost test fail, and the verified MAP still passes
+(checked).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/runtime/mapper/wire_watch.rs          | 123 ++++++---
+ .../src/runtime/mapper/wire_watch_tests.rs    | 237 +++++++++++++++++-
+ 2 files changed, 325 insertions(+), 35 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs b/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
+index e2aca547..9145c2cf 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
+@@ -102,10 +102,13 @@
+ //! (re-resolved, no other owner, its own counts read positive).
+ //!
+ //! A lost incarnation is not condemned, but its writes are refused too
+-//! (`wire_guard_unowned_refused`) until a fresh `MAP` checks it again: the
+-//! permission came from the `MAP`, and no `UNMAP` does not prove its pages are
+-//! still wired, since 13.6 completes both descriptors after an `UNMAP` that
+-//! failed or timed out.
++//! (`wire_guard_unowned_refused`): the permission came from the `MAP`, and no
++//! `UNMAP` does not prove its pages are still wired, since 13.6 completes both
++//! descriptors after an `UNMAP` that failed or timed out. The refusal is a
++//! latch that a later `MAP` of the same `MappingInternal` carries: it is lifted
++//! only once that `MAP`'s whole chain checks, read alike twice, with both
++//! counts positive. A `MAP` whose check fails, cannot be read, or reads two
++//! different chains leaves it refused.
+ //!
+ //! A positive count is not a permission: it is read, then the write happens,
+ //! and the guest can complete the descriptor in between, so the guard only
+@@ -609,9 +612,9 @@ enum Phase {
+     Pending,
+     Active,
+     /// Checked, and then read as something else than what was checked, with no
+-    /// `UNMAP` for it: not sampled any more, and the guard refuses writes into
+-    /// it until a fresh `MAP`. See [`lose`].
+-    Lost(Lost),
++    /// `UNMAP` for it; or lost before and its next `MAP` failed its check. Not
++    /// sampled any more. See [`lose`] and [`Watched::unowned`].
++    Lost,
+ }
+ 
+ /// Why an incarnation's chain stopped reading as the one checked at `MAP`.
+@@ -685,7 +688,11 @@ struct Watched {
+     /// Samples whose two reads of the chain disagreed, and the lines said.
+     inconclusive: u64,
+     inconclusive_lines: u32,
+-    /// Writes refused because the chain was lost; see [`Phase::Lost`].
++    /// Set when the chain was lost, and kept across a later `MAP` of the same
++    /// `MappingInternal` until that `MAP`'s chain checks with both counts
++    /// positive. While set, the guard refuses every write, in any phase.
++    unowned: Option<Lost>,
++    /// Writes refused because of it.
+     unowned_refused: u64,
+     /// `None` when the layout was checked after `MAP`, so the `MAP`-time value
+     /// was never seen.
+@@ -756,6 +763,7 @@ impl Watched {
+             checked: Chain::default(),
+             inconclusive: 0,
+             inconclusive_lines: 0,
++            unowned: None,
+             unowned_refused: 0,
+             at_map: None,
+             last: Counts::default(),
+@@ -1586,14 +1594,31 @@ fn activate<H: HostMemory + HostOps>(
+     let Some(w) = ww.watched.get(&mapping_id) else {
+         return;
+     };
+-    let internal = w.internal;
++    let (internal, unowned) = (w.internal, w.unowned);
++    let at = if at_map { "map" } else { "late" };
+     match check_mapping(rd, state, &image, mapping_id, internal, at_map) {
+-        Ok(Checked::NotYet) => {}
++        Ok(Checked::NotYet) => {
++            // Checked again at the next sample, refused meanwhile. Said once,
++            // at the `MAP`.
++            if at_map {
++                keep_unowned(ww, mapping_id, "not_yet", at);
++            }
++        }
+         Ok(Checked::Moved(link)) => {
+-            note_inconclusive(ww, mapping_id, link, if at_map { "map" } else { "late" });
++            note_inconclusive(ww, mapping_id, link, at);
++            if at_map {
++                keep_unowned(ww, mapping_id, &format!("inconclusive:{link}"), at);
++            }
+         }
+         Err((reason, seen)) => {
+-            ww.watched.remove(&mapping_id);
++            // Unwatched is unrefused, which an incarnation once lost must
++            // not become by failing a check: it stays, lost, and refused.
++            if unowned.is_some() {
++                let w = ww.watched.get_mut(&mapping_id).expect("looked up above");
++                w.phase = Phase::Lost;
++            } else {
++                ww.watched.remove(&mapping_id);
++            }
+             if ww.unverified.insert((mapping_id, internal)) {
+                 crate::observe::fail(format!(
+                     "wire_watch_layout_unverified scope=mapping mapping={mapping_id} \
+@@ -1601,6 +1626,7 @@ fn activate<H: HostMemory + HostOps>(
+                     image.kernel.macos, image.kernel.layout.name
+                 ));
+             }
++            keep_unowned(ww, mapping_id, reason, at);
+         }
+         Ok(Checked::Passed(chain)) => {
+             let counts = chain.counts();
+@@ -1640,6 +1666,22 @@ fn activate<H: HostMemory + HostOps>(
+             w.at_map = at_map.then_some(counts);
+             w.last = counts;
+             w.sampled_us = Some(now_us());
++            // A lost incarnation is owned again only on this chain, checked
++            // whole, with both descriptors wired; a late check is held to the
++            // counts a `MAP`-time one is.
++            if let Some(lost) = unowned {
++                if (counts.surface as i32) > 0 && (counts.table as i32) > 0 {
++                    w.unowned = None;
++                    crate::observe::off(format!(
++                        "wire_guard_unowned_cleared mapping={mapping_id} internal={internal:#x} \
++                         lost={} refused={} reason=verified_map at={at} surface_wire={} \
++                         table_wire={}",
++                        lost.reason, w.unowned_refused, counts.surface as i32, counts.table as i32
++                    ));
++                } else {
++                    keep_unowned(ww, mapping_id, "wire_not_positive", at);
++                }
++            }
+             // Checked after `MAP`, a count can already be wrong.
+             if !at_map {
+                 for field in [Field::Surface, Field::Table] {
+@@ -1683,13 +1725,14 @@ fn note_inconclusive(ww: &mut WireWatch, mapping_id: u32, link: &'static str, at
+ /// `UNMAP` is no proof its pages are still wired: 13.6 completes both
+ /// descriptors after an `UNMAP` that failed or timed out, and can then free the
+ /// `MappingInternal`. So the guard refuses writes into it from here until a
+-/// fresh `MAP` checks it again, or an `UNMAP` ends it.
++/// `MAP` of it checks whole with both counts positive, or an `UNMAP` ends it.
+ fn lose(ww: &mut WireWatch, mapping_id: u32, reason: &'static str, seen: String, at: &str) {
+     let Some(w) = ww.watched.get_mut(&mapping_id) else {
+         return;
+     };
+     let t_us = now_us();
+-    w.phase = Phase::Lost(Lost { reason, t_us });
++    w.phase = Phase::Lost;
++    w.unowned = Some(Lost { reason, t_us });
+     ww.cost.lost += 1;
+     let guard = guard_enabled();
+     crate::observe::fail(format!(
+@@ -1700,13 +1743,29 @@ fn lose(ww: &mut WireWatch, mapping_id: u32, reason: &'static str, seen: String,
+         w.condemned.is_some() as u8,
+         if guard { "on" } else { "off" },
+         if guard {
+-            "writes into this incarnation are refused until a fresh MAP"
++            "writes into this incarnation are refused until a MAP of it verifies"
+         } else {
+             "the watch alone refuses nothing"
+         }
+     ));
+ }
+ 
++/// A `MAP` of a lost incarnation that did not verify: its writes stay
++/// refused. Said only of a lost one.
++fn keep_unowned(ww: &mut WireWatch, mapping_id: u32, why: &str, at: &str) {
++    let Some(w) = ww.watched.get(&mapping_id) else {
++        return;
++    };
++    let Some(lost) = w.unowned else {
++        return;
++    };
++    crate::observe::off(format!(
++        "wire_guard_unowned_kept mapping={mapping_id} internal={:#x} lost={} why={why} at={at} \
++         (this MAP did not verify the chain with both counts positive; writes stay refused)",
++        w.internal, lost.reason
++    ));
++}
++
+ // MARK: - Sampling
+ 
+ /// Read one watched mapping's counts and report what moved. `false` when the
+@@ -1743,7 +1802,7 @@ fn sample_one<H: HostMemory + HostOps>(
+             activate(ww, rd, state, mapping_id, false);
+             return false;
+         }
+-        Phase::Lost(_) => return false,
++        Phase::Lost => return false,
+         Phase::Active => {}
+     }
+     let Some(image) = ww.image() else {
+@@ -2070,6 +2129,7 @@ pub fn on_map<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H, mappin
+         return;
+     };
+     with_watch(state, host, |ww, rd, state| {
++        let mut fresh = Watched::pending(internal);
+         if let Some(old) = ww.watched.get(&mapping_id) {
+             // A MAP restating a condemned incarnation does not wash it.
+             if old.internal == internal && old.condemned.is_some() {
+@@ -2080,17 +2140,14 @@ pub fn on_map<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H, mappin
+                     "wire_watch retired mapping={mapping_id} reason=remapped internal={:#x}",
+                     old.internal
+                 ));
+-            } else if let Phase::Lost(lost) = old.phase {
+-                // The fresh ownership evidence a lost incarnation waits for:
+-                // the guest wired it again and said so. It is checked anew.
+-                crate::observe::off(format!(
+-                    "wire_guard_unowned_cleared mapping={mapping_id} internal={internal:#x} \
+-                     lost={} refused={} reason=fresh_map",
+-                    lost.reason, old.unowned_refused
+-                ));
++            } else {
++                // A lost incarnation stays refused through this MAP until its
++                // check lifts the refusal; see [`activate`].
++                fresh.unowned = old.unowned;
++                fresh.unowned_refused = old.unowned_refused;
+             }
+         }
+-        ww.watched.insert(mapping_id, Watched::pending(internal));
++        ww.watched.insert(mapping_id, fresh);
+         activate(ww, rd, state, mapping_id, true);
+     });
+ }
+@@ -2120,10 +2177,7 @@ pub fn on_unmap<H: HostMemory + HostOps>(state: &mut DeviceState, host: &H, mapp
+                 w.anomalous,
+                 w.reads_refused,
+                 event.seq,
+-                match w.phase {
+-                    Phase::Lost(lost) => lost.reason,
+-                    _ => "-",
+-                },
++                w.unowned.map_or("-", |lost| lost.reason),
+                 w.unowned_refused,
+                 w.inconclusive
+             ));
+@@ -2180,7 +2234,7 @@ pub fn before_write<H: HostMemory + HostOps>(
+         w.writes += 1;
+         w.last_write = Some(note);
+         let surface = w.last.surface as i32;
+-        let phase = w.phase;
++        let unowned = w.unowned;
+         if !w.anomalous.is_empty() {
+             w.writes_after_anomaly += 1;
+             if w.writes_after_anomaly.is_power_of_two() && w.lines_after_anomaly < LINES_PER_MAPPING
+@@ -2214,9 +2268,9 @@ pub fn before_write<H: HostMemory + HostOps>(
+             crate::runtime::drain::note_store_route("wire_guard_refused");
+             return false;
+         }
+-        // Not condemned, but no longer the incarnation its `MAP` checked: the
+-        // permission that `MAP` gave is not carried over. See [`lose`].
+-        let Phase::Lost(lost) = phase else {
++        // Not condemned, but lost, and no MAP of it has verified since: the
++        // permission its first `MAP` gave is not carried over. See [`lose`].
++        let Some(lost) = unowned else {
+             return true;
+         };
+         if !guard_enabled() {
+@@ -2230,7 +2284,7 @@ pub fn before_write<H: HostMemory + HostOps>(
+             crate::observe::fail(format!(
+                 "wire_guard_unowned_refused mapping={mapping_id} site={site} kind={kind:?} \
+                  lost={} n={} t_us={t_us} (this incarnation no longer reads as the one its MAP \
+-                 checked and no UNMAP has come; the write is refused until a fresh MAP)",
++                 checked and no UNMAP has come; the write is refused until a MAP of it verifies)",
+                 lost.reason, w.unowned_refused
+             ));
+         }
+@@ -2742,6 +2796,7 @@ fn verified_live<H: HostMemory + HostOps>(
+             && w.phase == Phase::Active
+             && w.condemned.is_none()
+             && w.anomalous.is_empty()
++            && w.unowned.is_none()
+             && (w.last.surface as i32) > 0
+             && (w.last.table as i32) > 0;
+         live.then(|| {
+diff --git a/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs b/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs
+index c8468181..cee2cafc 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/wire_watch_tests.rs
+@@ -2081,7 +2081,7 @@ fn a_lost_incarnation_is_refused_until_a_fresh_map_and_never_condemned() {
+             let cleared = lines_with(&cap, "wire_guard_unowned_cleared mapping=2 ");
+             assert_eq!(cleared.len(), 1, "{:?}", cap.lines());
+             assert!(
+-                cleared[0].contains("lost=mapping_internal refused=3 reason=fresh_map"),
++                cleared[0].contains("lost=mapping_internal refused=3 reason=verified_map at=map"),
+                 "{}",
+                 cleared[0]
+             );
+@@ -2184,3 +2184,238 @@ fn a_failed_13_6_unmap_condemns_and_the_condemnation_outlives_the_internal() {
+         ));
+     });
+ }
++
++// MARK: - A MAP of a lost incarnation
++
++/// Mapping 2 on 13.6, lost: its MappingInternal freed and handed to mapping 7
++/// before any drop was seen, then made again where it was, by the same
++/// IOSurface. The guest's next MAP of it comes next.
++fn lost_and_made_again() -> (DeviceState, FakeHost) {
++    let (mut state, mut host) = laid_out(KERNEL_VERSION_13_6, UNSHIFTED_13_6);
++    on_map(&mut state, &host, MID);
++    put32(&mut host, MI + MI_ID, 7);
++    put64(&mut host, MI + MI_OBJECT, OTHER_IOSURFACE);
++    tick(&mut state, &host);
++    assert_eq!(
++        state.wire_watch.watched[&MID].unowned.map(|l| l.reason),
++        Some("mapping_internal")
++    );
++    put32(&mut host, MI + MI_ID, MID);
++    put64(&mut host, MI + MI_OBJECT, IOSURFACE);
++    (state, host)
++}
++
++/// Swap mapping 2's IOSurface for the other surface's at the next read of its
++/// MappingInternal, and back at the next read of the other descriptor: the
++/// two reads of one check name different chains.
++fn arm_swap_and_back(host: &mut FakeHost) {
++    use crate::runtime::host::Rewire;
++    host.arm_rewire(Rewire {
++        on_read_gpa: MI + MI_ID,
++        on_read_len: 4,
++        pte_gpa: MI + MI_OBJECT,
++        bytes: OTHER_IOSURFACE.to_le_bytes().to_vec(),
++    });
++    host.arm_rewire(Rewire {
++        on_read_gpa: OTHER_IOMD + IOMD_WIRE_COUNT,
++        on_read_len: 4,
++        pte_gpa: MI + MI_OBJECT,
++        bytes: IOSURFACE.to_le_bytes().to_vec(),
++    });
++}
++
++/// After a MAP of a lost incarnation that did not verify: the refusal is
++/// kept, said for `why` at the MAP, and the next write is refused. Nothing is
++/// condemned and nothing is cleared.
++fn assert_still_refused(
++    state: &mut DeviceState,
++    host: &FakeHost,
++    cap: &crate::observe::FailCapture,
++    why: &str,
++) {
++    let kept = lines_with(cap, "wire_guard_unowned_kept mapping=2 ");
++    assert_eq!(kept.len(), 1, "{why}: {:?}", cap.lines());
++    assert!(
++        kept[0].contains(&format!("lost=mapping_internal why={why} at=map")),
++        "{}",
++        kept[0]
++    );
++    assert!(
++        !write_now(state, host, MID, "mapping_write", WriteKind::Cpu),
++        "{why}: a MAP that did not verify gives the writes back"
++    );
++    assert_eq!(
++        state.wire_watch.watched[&MID].unowned.map(|l| l.reason),
++        Some("mapping_internal"),
++        "{why}"
++    );
++    for quiet in ["wire_guard_unowned_cleared", "wire_guard_condemned"] {
++        assert!(
++            lines_with(cap, quiet).is_empty(),
++            "{quiet}: {:?}",
++            cap.lines()
++        );
++    }
++    assert!(
++        !lines_with(cap, "wire_guard_unowned_refused").is_empty(),
++        "{:?}",
++        cap.lines()
++    );
++}
++
++/// The MAP of a lost incarnation cannot be read: it stays refused, and so
++/// does a write while it still cannot. Once this MAP's chain reads whole with
++/// both counts positive, the refusal is lifted.
++#[test]
++fn an_unreadable_map_keeps_a_lost_incarnation_refused() {
++    with_switches(true, true, || {
++        let (mut state, mut host) = lost_and_made_again();
++        let cap = crate::observe::FailCapture::start();
++        host.kva_no_cpu = true;
++        on_map(&mut state, &host, MID);
++        assert_eq!(state.wire_watch.watched[&MID].phase, Phase::Pending);
++        assert_still_refused(&mut state, &host, &cap, "not_yet");
++        assert!(!write_now(
++            &mut state,
++            &host,
++            MID,
++            "gpu_writeback",
++            WriteKind::Gpu
++        ));
++
++        host.kva_no_cpu = false;
++        assert!(write_now(
++            &mut state,
++            &host,
++            MID,
++            "mapping_write",
++            WriteKind::Cpu
++        ));
++        assert!(cap
++            .lines()
++            .iter()
++            .any(|l| l.contains("wire_guard_unowned_cleared mapping=2 ")
++                && l.contains("reason=verified_map at=late surface_wire=1 table_wire=2")));
++    });
++}
++
++/// The two reads of the MAP's chain disagree, and so do those of the next
++/// write's: refused both times. A check whose reads agree lifts it.
++#[test]
++fn a_map_whose_two_reads_disagree_keeps_a_lost_incarnation_refused() {
++    with_switches(true, true, || {
++        let (mut state, mut host) = lost_and_made_again();
++        let cap = crate::observe::FailCapture::start();
++        arm_swap_and_back(&mut host);
++        on_map(&mut state, &host, MID);
++        assert_eq!(host.rewires_fired(), 2);
++        assert!(lines_with(&cap, "wire_watch inconclusive mapping=2 ")[0].contains("at=map"));
++        arm_swap_and_back(&mut host);
++        assert_still_refused(&mut state, &host, &cap, "inconclusive:mapping_internal");
++        assert_eq!(
++            host.rewires_fired(),
++            4,
++            "the write's own check was swapped too"
++        );
++
++        assert!(write_now(
++            &mut state,
++            &host,
++            MID,
++            "mapping_write",
++            WriteKind::Cpu
++        ));
++        assert_eq!(state.wire_watch.watched[&MID].unowned, None);
++    });
++}
++
++/// The MAP's IOSurface is not 13.6's IOSurface: the check refuses it, and the
++/// mapping it would have left unwatched, and so unrefused, stays lost and
++/// refused. Only a later MAP that verifies lifts it.
++#[test]
++fn a_map_of_another_class_keeps_a_lost_incarnation_refused() {
++    with_switches(true, true, || {
++        let (mut state, mut host) = lost_and_made_again();
++        let cap = crate::observe::FailCapture::start();
++        put64(&mut host, IOSURFACE, signed(KERNEL + 0xb0_fde8));
++        on_map(&mut state, &host, MID);
++        assert!(cap
++            .one("wire_watch_layout_unverified")
++            .contains("scope=mapping mapping=2 reason=iosurface_class "));
++        assert_eq!(state.wire_watch.watched[&MID].phase, Phase::Lost);
++        assert_still_refused(&mut state, &host, &cap, "iosurface_class");
++
++        put_iosurface(&mut host, &UNSHIFTED_13_6, IOSURFACE, SURFACE);
++        on_map(&mut state, &host, MID);
++        assert!(write_now(
++            &mut state,
++            &host,
++            MID,
++            "mapping_write",
++            WriteKind::Cpu
++        ));
++    });
++}
++
++/// The MAP's surface descriptor reads unwired: refused at the MAP, and the
++/// incarnation stays lost and refused until a MAP that verifies.
++#[test]
++fn a_map_with_a_count_at_zero_keeps_a_lost_incarnation_refused() {
++    with_switches(true, true, || {
++        let (mut state, mut host) = lost_and_made_again();
++        let cap = crate::observe::FailCapture::start();
++        set_surface_wire(&mut host, 0);
++        on_map(&mut state, &host, MID);
++        assert!(cap
++            .one("wire_watch_layout_unverified")
++            .contains("reason=map_wire_not_positive "));
++        assert_eq!(state.wire_watch.watched[&MID].phase, Phase::Lost);
++        assert_still_refused(&mut state, &host, &cap, "map_wire_not_positive");
++
++        set_surface_wire(&mut host, 1);
++        on_map(&mut state, &host, MID);
++        assert!(write_now(
++            &mut state,
++            &host,
++            MID,
++            "mapping_write",
++            WriteKind::Cpu
++        ));
++    });
++}
++
++/// The regression the latch must not break: a MAP of the lost incarnation
++/// whose whole chain verifies, both counts positive, gives its writes back.
++#[test]
++fn a_verified_map_gives_a_lost_incarnation_its_writes_back() {
++    with_switches(true, true, || {
++        let (mut state, host) = lost_and_made_again();
++        assert!(!write_now(
++            &mut state,
++            &host,
++            MID,
++            "mapping_write",
++            WriteKind::Cpu
++        ));
++        let cap = crate::observe::FailCapture::start();
++        on_map(&mut state, &host, MID);
++        assert_eq!(lines_with(&cap, "wire_watch map mapping=2 ").len(), 1);
++        assert!(lines_with(&cap, "wire_guard_unowned_kept").is_empty());
++        let w = &state.wire_watch.watched[&MID];
++        assert_eq!((w.phase, w.unowned), (Phase::Active, None));
++        assert!(write_now(
++            &mut state,
++            &host,
++            MID,
++            "mapping_write",
++            WriteKind::Cpu
++        ));
++        assert!(write_now(
++            &mut state,
++            &host,
++            MID,
++            "gpu_writeback",
++            WriteKind::Gpu
++        ));
++    });
++}
+-- 
+2.43.0
+

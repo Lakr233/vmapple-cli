@@ -1,0 +1,178 @@
+From 055b5f9d8b99b8fc8c566056535f62c34799a4c2 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 02:13:31 +0800
+Subject: [PATCH 22/24] Name the image a rendered surface's attachment is
+ created in
+
+A type-11 surface's resident identity took its format from
+store_texel_order, which answers only for the formats a byte copy can
+land (RGBA8, BGRA8, RGBA16Float and the ten-bit pair). The attachment
+image a pass renders into is created at the format the pass declares,
+through color_attachment. For every other renderable format the two
+disagreed: an R32Float surface claimed a BGRA8 resident over an
+R32_SFLOAT image, and a pass that later sampled the surface bound a
+BGRA8 view of it. Admitting R32Float as a render target made that
+reachable for R32Float surfaces; R8Unorm, R16Float, RG16Float, RG16Uint
+and RG32Float surfaces already had it.
+
+surface_format now asks color_attachment and folds the answer onto its
+allocation, the rule gva_resident_format already follows for GVA
+targets. The formats store_texel_order admits resolve to the same
+allocation as before; a declaration this device does not render still
+falls back to guest scanout order. No capability is asked here: a host
+that cannot render the format has its pass refused before any image is
+created. A Store of a surface whose format has no byte-copy layout still
+lands through the copying rail, which converts.
+
+This changes the identity, and so the registry key, of R8Unorm,
+R16Float, RG16Float, RG16Uint, RG32Float and R32Float surfaces. Their
+residents are created at their own format as before; only the format
+their key claims, and the view a sampled bind of them takes, changes.
+
+The alternative, admitting R32Float only on memoryless and heap
+targets, would need a second render-target table beside
+render_target_bpp and leave the same gap open for the other five
+formats.
+
+Tests: cargo test --release -p reims-vgpu --no-default-features
+--features backend-vulkan,host-window --lib, serially: 2214 passed, 1
+failed (the vendor/qemu cursor test, which this worktree cannot read).
+The new test sweeps every format color_attachment admits and requires
+the surface identity to name its allocation; it fails without the
+change, at R32Float among others. clippy (toolchain 1.99, Vulkan arm,
+-D warnings) reports nothing in the changed lines. No guest was booted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 6355677d4cb09de39e961cd026a9f18a3476d0ca)
+---
+ .../reims-vgpu/src/contract/pixel_format.rs   | 12 ++-
+ .../src/runtime/present_identity.rs           | 78 +++++++++++++++++--
+ 2 files changed, 75 insertions(+), 15 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/contract/pixel_format.rs b/crates/reims-vgpu/src/contract/pixel_format.rs
+index 853721a4..6a3391d3 100644
+--- a/crates/reims-vgpu/src/contract/pixel_format.rs
++++ b/crates/reims-vgpu/src/contract/pixel_format.rs
+@@ -1346,13 +1346,11 @@ pub fn render_target_bpp(format: u16) -> Option<u32> {
+ /// requires an admitted format to have a [`sampled_class`] naming the same
+ /// texel, and `RG16_FLOAT` has none.
+ ///
+-/// The packed ten-bit pair is here for more than speed. A type-11 surface's
+-/// resident identity takes its format from this answer
+-/// (`present_identity::surface_format`), while the attachment image is created
+-/// at the format the pass declares; a `BGR10A2Unorm` surface answered `None`
+-/// would claim a BGRA8 resident over an `A2R10G10B10` image, and the next
+-/// pass sampling that surface would bind a view of the wrong texel. Both words
+-/// are their Vulkan twins bit for bit, so the copy is exact.
++/// The packed ten-bit pair is here because both words are their Vulkan twins
++/// bit for bit, so the copy is exact and keeps all ten bits. A type-11
++/// surface's resident identity does not ask this function: it names the image
++/// its colour attachment is created in (`present_identity::surface_format`),
++/// whether or not a byte copy can land it.
+ ///
+ /// sRGB folds onto its linear sibling for the same reason [`sampled_class`]
+ /// folds it: the qualifier describes how a sampler interprets the bytes, not
+diff --git a/crates/reims-vgpu/src/runtime/present_identity.rs b/crates/reims-vgpu/src/runtime/present_identity.rs
+index 12c191b4..28d86dd3 100644
+--- a/crates/reims-vgpu/src/runtime/present_identity.rs
++++ b/crates/reims-vgpu/src/runtime/present_identity.rs
+@@ -29,19 +29,31 @@ use ash::vk;
+ /// The image format a resident for this mapping is created with.
+ ///
+ /// The guest's own declaration, taken from the single place the writeback also
+-/// reads it. A declaration with no linear Vulkan texel — a compressed or planar
+-/// plane, which nothing renders into — falls back to guest scanout order, which
+-/// is what this namespace answered for every mapping before it could answer at
+-/// all; the GPU writeback rail then refuses that pair by name and the copying
+-/// rail converts, exactly as it did.
++/// reads it, and folded onto the allocation a colour attachment of that format
++/// is created in — `draw::vulkan::gva_resident_format`'s rule, for the same
++/// reason. The attachment image follows the pass's declared format, so an
++/// identity that names any other format describes an image that does not exist:
++/// this used to ask `store_texel_order`, which answers only for the byte-copy
++/// formats, and every other renderable surface (`R8Unorm`, `R16Float`,
++/// `RG16Float`, `RG16Uint`, `RG32Float`, `R32Float`) claimed a BGRA8 resident
++/// over an image of its own width, and a pass sampling the surface bound a
++/// BGRA8 view of it.
++///
++/// A declaration this device does not render — a compressed or planar plane —
++/// falls back to guest scanout order, which is what this namespace answered for
++/// every mapping before it could answer at all; the GPU writeback rail then
++/// refuses that pair by name and the copying rail converts, exactly as it did.
++/// No capability is asked here: a host that cannot render the format refuses
++/// the pass before any image is created (`host_color_attachment`).
+ fn surface_format(state: &DeviceState, mapping_id: u32) -> vk::Format {
++    use crate::backend::vulkan::translate::pixel;
+     state
+         .mappings
+         .get(&mapping_id)
+         .map(crate::runtime::mapping_write::mapping_store_format)
+-        .and_then(crate::contract::pixel_format::store_texel_order)
+-        .map(crate::backend::vulkan::translate::pixel::vk_texel_layout)
+-        .unwrap_or(crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT)
++        .and_then(|format| pixel::color_attachment(format).ok())
++        .map(|(attachment, _)| pixel::ResidentFormat::of(attachment).allocation())
++        .unwrap_or(pixel::SCANOUT_FORMAT)
+ }
+ 
+ pub fn surface_identity(
+@@ -184,6 +196,56 @@ mod tests {
+         );
+     }
+ 
++    /// A surface the guest renders into names the image its attachment is
++    /// created in, for every renderable format and not only the byte-copy ones.
++    ///
++    /// The attachment image follows `color_attachment`; the identity used to
++    /// follow `store_texel_order`, which answers for fewer formats. An
++    /// `R32Float` surface therefore claimed a BGRA8 resident over an
++    /// `R32_SFLOAT` image, and a later pass sampling it bound a BGRA8 view.
++    #[test]
++    fn a_rendered_surface_names_the_image_its_attachment_is_created_in() {
++        use crate::backend::vulkan::translate::pixel;
++        use crate::contract::pixel_format::{
++            render_target_bpp, MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_R32_FLOAT,
++        };
++
++        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
++        assert!(state.map_surface(7));
++        let mut renderable = 0;
++        for format in 1..=u16::MAX {
++            let Ok((attachment, _)) = pixel::color_attachment(format) else {
++                continue;
++            };
++            assert!(render_target_bpp(format).is_some(), "{format:#x}");
++            renderable += 1;
++            {
++                let m = state.mappings.get_mut(&7).unwrap();
++                m.has_geom = true;
++                m.width = 64;
++                m.height = 32;
++                m.format = format;
++            }
++            assert_eq!(
++                surface_identity(&state, 7, 64, 32).resident_format(),
++                pixel::ResidentFormat::of(attachment).allocation(),
++                "{format:#x}"
++            );
++        }
++        assert!(renderable > 10, "the sweep must reach the renderable set");
++
++        let declare = |state: &mut DeviceState, format: u16| {
++            state.mappings.get_mut(&7).unwrap().format = format;
++            surface_identity(state, 7, 64, 32).resident_format()
++        };
++        assert_eq!(declare(&mut state, MTL_FORMAT_R32_FLOAT), vk::Format::R32_SFLOAT);
++        // sRGB still folds onto the allocation it shares with its linear sibling.
++        assert_eq!(
++            declare(&mut state, MTL_FORMAT_BGRA8_UNORM_SRGB),
++            pixel::SCANOUT_FORMAT
++        );
++    }
++
+     /// A compositor swapchain — several scanout buffers presenting at ONE
+     /// geometry — must get one resident each.
+     ///
+-- 
+2.43.0
+

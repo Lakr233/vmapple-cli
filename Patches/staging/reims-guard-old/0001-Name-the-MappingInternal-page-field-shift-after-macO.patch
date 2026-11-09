@@ -1,0 +1,125 @@
+From 481336688556cb894f22e5ff5ccf9449790aa447 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 14:46:33 +0800
+Subject: [PATCH 1/4] Name the MappingInternal page-field shift after macOS 15
+
+The 16 bytes the driver put in front of MappingInternal's page fields
+came with macOS 15, not 14: the 14.6.1 (23G93) kernelcache still keeps
+the page-table descriptor at +0x48 and the page count at +0x70, as 13.6
+does (~/forensics/layouts-old.txt on dgx). The constant was named after
+Sonoma and its comments said 14.
+
+MAPPING_INTERNAL_SONOMA_SHIFT is now MAPPING_INTERNAL_SEQUOIA_SHIFT, and
+the comments and the one test name that said macOS 14 say 15. Nothing
+reads differently.
+
+Not built on its own; built and tested with the two commits after it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/contract/iosurface_pages.rs           | 26 +++++++++----------
+ .../src/runtime/mapper/wire_watch.rs          |  8 +++---
+ 2 files changed, 17 insertions(+), 17 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/contract/iosurface_pages.rs b/crates/reims-vgpu/src/contract/iosurface_pages.rs
+index 57109931..5d4189c7 100644
+--- a/crates/reims-vgpu/src/contract/iosurface_pages.rs
++++ b/crates/reims-vgpu/src/contract/iosurface_pages.rs
+@@ -112,11 +112,11 @@ pub const MAPPING_INTERNAL_EXPECTED_SIZE: u32 = 0x200;
+ pub const MAPPING_INTERNAL_PAGE_FIELD_48: u64 = 0x48;
+ pub const MAPPING_INTERNAL_PAGE_FIELD_50: u64 = 0x50;
+ pub const MAPPING_INTERNAL_PAGE_COUNT: u64 = 0x70;
+-/// How far macOS 14 and later moved the page fields and the page count. The
+-/// tables they point to keep their own offsets: measured on 15.6.1, `+0x58`
+-/// then `+0xb8` and `+0x60` then `+0x28` reach the same valid entries, and
+-/// `+0x80` holds the page count.
+-pub const MAPPING_INTERNAL_SONOMA_SHIFT: u64 = 0x10;
++/// How far macOS 15 and later moved the page fields and the page count; 14.6.1
++/// still has them where 13.6 does. The tables they point to keep their own
++/// offsets: measured on 15.6.1, `+0x58` then `+0xb8` and `+0x60` then `+0x28`
++/// reach the same valid entries, and `+0x80` holds the page count.
++pub const MAPPING_INTERNAL_SEQUOIA_SHIFT: u64 = 0x10;
+ pub const MAPPING_PAGE_TABLE_FROM_F48: u64 = 0xb8;
+ pub const MAPPING_PAGE_TABLE_FROM_F50: u64 = 0x28;
+ 
+@@ -765,15 +765,15 @@ pub fn read_mapper_internal(
+             )?,
+         ))
+     };
+-    // The header up to the size word is the same on every release. macOS 14
++    // The header up to the size word is the same on every release. macOS 15
+     // and later put 16 more bytes in front of the page fields and leave
+     // `+0x48` and `+0x50` zero, which is what tells the two layouts apart.
+     let mut shift = 0;
+     let (mut field_48, mut field_50) = page_fields(0)?;
+     if !mem.is_kernel_va(field_48) && !mem.is_kernel_va(field_50) {
+-        let (moved_48, moved_50) = page_fields(MAPPING_INTERNAL_SONOMA_SHIFT)?;
++        let (moved_48, moved_50) = page_fields(MAPPING_INTERNAL_SEQUOIA_SHIFT)?;
+         if mem.is_kernel_va(moved_48) || mem.is_kernel_va(moved_50) {
+-            shift = MAPPING_INTERNAL_SONOMA_SHIFT;
++            shift = MAPPING_INTERNAL_SEQUOIA_SHIFT;
+             (field_48, field_50) = (moved_48, moved_50);
+         }
+     }
+@@ -1147,10 +1147,10 @@ mod tests {
+         assert_eq!(plan.entries, vec![0]);
+     }
+ 
+-    /// macOS 14 and later leave `+0x48` and `+0x50` zero and keep the page
++    /// macOS 15 and later leave `+0x48` and `+0x50` zero and keep the page
+     /// fields and the page count 16 bytes further on.
+     #[test]
+-    fn the_sonoma_layout_reads_the_page_fields_sixteen_bytes_on() {
++    fn the_sequoia_layout_reads_the_page_fields_sixteen_bytes_on() {
+         let internal = 0xffff_fe00_0001_0000u64;
+         let field_58 = 0xffff_fe00_0002_0000u64;
+         let table = 0xffff_fe00_0003_0000u64;
+@@ -1162,15 +1162,15 @@ mod tests {
+         mem.put_u64(internal + MAPPING_INTERNAL_PAGE_FIELD_50, 0);
+         mem.put_u64(internal + MAPPING_INTERNAL_PAGE_COUNT, 0);
+         mem.put_u64(
+-            internal + MAPPING_INTERNAL_PAGE_FIELD_48 + MAPPING_INTERNAL_SONOMA_SHIFT,
++            internal + MAPPING_INTERNAL_PAGE_FIELD_48 + MAPPING_INTERNAL_SEQUOIA_SHIFT,
+             field_58,
+         );
+         mem.put_u64(
+-            internal + MAPPING_INTERNAL_PAGE_FIELD_50 + MAPPING_INTERNAL_SONOMA_SHIFT,
++            internal + MAPPING_INTERNAL_PAGE_FIELD_50 + MAPPING_INTERNAL_SEQUOIA_SHIFT,
+             0,
+         );
+         mem.put_u64(
+-            internal + MAPPING_INTERNAL_PAGE_COUNT + MAPPING_INTERNAL_SONOMA_SHIFT,
++            internal + MAPPING_INTERNAL_PAGE_COUNT + MAPPING_INTERNAL_SEQUOIA_SHIFT,
+             1,
+         );
+         let fields = read_mapper_internal(&mem, internal, false, 0).expect("fields read");
+diff --git a/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs b/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
+index c62ee34b..051707cf 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/wire_watch.rs
+@@ -196,8 +196,8 @@ const KERNEL_SCAN_BYTES: u64 = 256 << 20;
+ 
+ /// `IOSurfaceParavirtMappingInternal`, 27.2 and 26.6.2. `+0x10` is the
+ /// driver's own `refs * 4 | wired` word, `+0x20` the surface descriptor,
+-/// `+0x58` the page-table descriptor (macOS 14 and later moved the page fields
+-/// by [`iosurface_pages::MAPPING_INTERNAL_SONOMA_SHIFT`]).
++/// `+0x58` the page-table descriptor (macOS 15 and later moved the page fields
++/// by [`iosurface_pages::MAPPING_INTERNAL_SEQUOIA_SHIFT`]).
+ const MI_STATE: u64 = 0x10;
+ const MI_SURFACE_IOMD: u64 = 0x20;
+ const MI_ID: u64 = iosurface_pages::MAPPING_INTERNAL_ID;
+@@ -205,9 +205,9 @@ const MI_SIZE: u64 = iosurface_pages::MAPPING_INTERNAL_SIZE;
+ const MI_FIELD_48: u64 = iosurface_pages::MAPPING_INTERNAL_PAGE_FIELD_48;
+ const MI_FIELD_50: u64 = iosurface_pages::MAPPING_INTERNAL_PAGE_FIELD_50;
+ const MI_TABLE_IOMD: u64 = iosurface_pages::MAPPING_INTERNAL_PAGE_FIELD_48
+-    + iosurface_pages::MAPPING_INTERNAL_SONOMA_SHIFT;
++    + iosurface_pages::MAPPING_INTERNAL_SEQUOIA_SHIFT;
+ const MI_PAGE_COUNT: u64 =
+-    iosurface_pages::MAPPING_INTERNAL_PAGE_COUNT + iosurface_pages::MAPPING_INTERNAL_SONOMA_SHIFT;
++    iosurface_pages::MAPPING_INTERNAL_PAGE_COUNT + iosurface_pages::MAPPING_INTERNAL_SEQUOIA_SHIFT;
+ /// One read covers every field above.
+ const MI_WINDOW: std::ops::Range<u64> = MI_STATE..MI_PAGE_COUNT + 8;
+ 
+-- 
+2.43.0
+

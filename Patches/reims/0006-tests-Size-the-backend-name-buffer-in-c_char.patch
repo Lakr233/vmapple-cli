@@ -1,0 +1,28 @@
+From 42d183d8595881b8e602cae54927c84be6287370 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Sun, 8 Nov 2026 10:42:19 +0800
+Subject: [PATCH] tests: Size the backend name buffer in c_char
+
+c_char is u8 on arm64 Linux, so the i8 buffer did not compile there.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/reims-vgpu/src/qemu/abi.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/crates/reims-vgpu/src/qemu/abi.rs b/crates/reims-vgpu/src/qemu/abi.rs
+index 75b757d7..ffdede1f 100644
+--- a/crates/reims-vgpu/src/qemu/abi.rs
++++ b/crates/reims-vgpu/src/qemu/abi.rs
+@@ -1087,7 +1087,7 @@ mod tests {
+ 
+     #[test]
+     fn backend_name_metal_default() {
+-        let mut buf = [0i8; 32];
++        let mut buf = [0 as std::ffi::c_char; 32];
+         assert_eq!(
+             unsafe { reims_vgpu_qemu_backend_name(buf.as_mut_ptr(), buf.len()) },
+             REIMS_VGPU_QEMU_OK
+-- 
+2.43.0
+

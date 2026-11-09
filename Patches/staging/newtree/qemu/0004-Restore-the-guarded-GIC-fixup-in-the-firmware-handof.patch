@@ -1,0 +1,162 @@
+From fe999a99f6d9ef38a1b72c55b24a12e9fdb93917 Mon Sep 17 00:00:00 2001
+From: Icegrave0391 <chuqiz@comp.nus.edu.sg>
+Date: Thu, 10 Sep 2026 19:43:46 +0800
+Subject: [PATCH 04/14] Restore the guarded GIC fixup in the firmware handoff
+
+Rewrite and verify the known Ventura GIC store pair before entering XNU. Refuse to retire no-syndrome stores when the QEMU memory transaction fails.
+---
+ target/arm/kvm.c | 109 ++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 104 insertions(+), 5 deletions(-)
+
+diff --git a/target/arm/kvm.c b/target/arm/kvm.c
+index 0b58bd3bc0..868badeee1 100644
+--- a/target/arm/kvm.c
++++ b/target/arm/kvm.c
+@@ -1497,13 +1497,16 @@ static void kvm_arm_vm_state_change(void *opaque, bool running, RunState state)
+  *
+  * Apple's firmware builds its boot-info structure and device tree in guest RAM
+  * after QEMU hands control over. macOS needs the verbose boot arguments written
+- * into the boot-info and the CPU timebase-frequency set to the host counter
+- * frequency. QEMU performs both at the firmware entry point instead of through
+- * an external GDB session; opt in with QEMU_VMAPPLE_HANDOFF=1.
++ * into the boot-info, the CPU timebase-frequency set to the host counter
++ * frequency, and one GIC store in the kernel rewritten so KVM can decode it
++ * (see vmapple_patch_gic_store). QEMU performs all three at the firmware entry
++ * point instead of through an external GDB session; opt in with
++ * QEMU_VMAPPLE_HANDOFF=1.
+  */
+ #define VMAPPLE_HANDOFF_PC           UINT64_C(0xaca00000)
+ #define VMAPPLE_HANDOFF_BOOTARGS_OFF 108
+ #define VMAPPLE_HANDOFF_BOOTARGS_LEN 608
++#define VMAPPLE_GIC_SCAN_WINDOW      (128u * 1024u * 1024u)
+ 
+ static bool vmapple_handoff_armed;
+ static bool vmapple_handoff_stepped;
+@@ -1573,6 +1576,89 @@ static bool vmapple_patch_node(uint8_t *tree, uint32_t size, uint32_t offset,
+     return true;
+ }
+ 
++/*
++ * XNU's GIC bring-up stores to a redistributor register with a pre-indexed
++ * form, str w9, [x8, #128]!. KVM cannot describe that access to user space
++ * (ESR_EL2.ISV == 0), and because the vGIC lives in the kernel QEMU cannot
++ * perform the store on the guest's behalf either. Rewrite the pair so the first
++ * store keeps a plain offset and the second absorbs the lost writeback:
++ *
++ *     b8080d09  str w9, [x8, #128]!   ->  b9008109  str w9, [x8, #128]
++ *     b9008109  str w9, [x8, #128]    ->  b9010109  str w9, [x8, #256]
++ *
++ * The four-word signature must occur exactly once in the 128 MiB window that
++ * follows physical_base, matching the previous GDB handoff. Returns true when
++ * both words were written and read back.
++ */
++static bool vmapple_patch_gic_store(uint64_t pbase)
++{
++    static const uint32_t signature[4] = {
++        0x12afc009, 0xb8080d09, 0x52a10009, 0xb9008109
++    };
++    static const struct {
++        uint64_t offset;
++        uint32_t insn;
++    } fixups[] = {
++        { 0, 0xb9008109 },
++        { 8, 0xb9010109 },
++    };
++    uint8_t needle[sizeof(signature)];
++    uint8_t *window;
++    uint64_t off, hit = 0, addr;
++    int count = 0;
++    size_t i;
++
++    for (i = 0; i < ARRAY_SIZE(signature); i++) {
++        stl_le_p(needle + 4 * i, signature[i]);
++    }
++    window = g_try_malloc(VMAPPLE_GIC_SCAN_WINDOW);
++    if (!window) {
++        error_report("vmapple handoff: cannot allocate GIC scan window");
++        return false;
++    }
++    if (address_space_read(&address_space_memory, pbase, MEMTXATTRS_UNSPECIFIED,
++                           window, VMAPPLE_GIC_SCAN_WINDOW) != MEMTX_OK) {
++        error_report("vmapple handoff: cannot read %u MiB at 0x%" PRIx64,
++                     VMAPPLE_GIC_SCAN_WINDOW >> 20, pbase);
++        g_free(window);
++        return false;
++    }
++    for (off = 0; off + sizeof(needle) <= VMAPPLE_GIC_SCAN_WINDOW; off += 4) {
++        if (!memcmp(window + off, needle, sizeof(needle))) {
++            hit = off;
++            count++;
++        }
++    }
++    g_free(window);
++    if (count != 1) {
++        error_report("vmapple handoff: GIC store signature found %d times "
++                     "(expected 1); leaving the kernel unpatched", count);
++        return false;
++    }
++
++    addr = pbase + hit + 4;
++    for (i = 0; i < ARRAY_SIZE(fixups); i++) {
++        uint8_t enc[4], back[4];
++
++        stl_le_p(enc, fixups[i].insn);
++        if (address_space_write_rom(&address_space_memory,
++                                    addr + fixups[i].offset,
++                                    MEMTXATTRS_UNSPECIFIED, enc,
++                                    sizeof(enc)) != MEMTX_OK ||
++            address_space_read(&address_space_memory, addr + fixups[i].offset,
++                               MEMTXATTRS_UNSPECIFIED, back,
++                               sizeof(back)) != MEMTX_OK ||
++            memcmp(enc, back, sizeof(enc)) != 0) {
++            error_report("vmapple handoff: GIC store patch at 0x%" PRIx64
++                         " did not stick", addr + fixups[i].offset);
++            return false;
++        }
++    }
++    info_report("vmapple handoff: GIC store pair rewritten at 0x%" PRIx64,
++                addr);
++    return true;
++}
++
+ static void vmapple_handoff_apply(CPUState *cs)
+ {
+     ARMCPU *cpu = ARM_CPU(cs);
+@@ -1627,6 +1713,8 @@ static void vmapple_handoff_apply(CPUState *cs)
+     g_free(tree);
+     info_report("vmapple handoff: %d timebase properties set to %u Hz",
+                 patched, freq);
++
++    vmapple_patch_gic_store(pbase);
+ }
+ 
+ static void vmapple_handoff_arm(CPUState *cs)
+@@ -1691,12 +1779,23 @@ static bool kvm_arm_emulate_nisv_store(ARMCPU *cpu, uint64_t fault_ipa)
+      * The effective address is a guest VA that maps to the faulting IPA; the
+      * MMU already resolved it, so write the device through fault_ipa and update
+      * the base register with the register-file address.
++     *
++     * This only works for targets QEMU itself implements. Regions owned by an
++     * in-kernel device (for example the KVM vGIC) have no MemoryRegionOps here
++     * and reject the access; retiring the store anyway would silently drop the
++     * guest's write, so refuse and let the caller raise a visible abort.
+      */
+     writeback = base + offset;
+     mask = size == 3 ? UINT64_MAX : (UINT64_C(1) << (8 << size)) - 1;
+     value = env->xregs[rt] & mask;
+-    address_space_rw(&address_space_memory, fault_ipa, MEMTXATTRS_UNSPECIFIED,
+-                     (uint8_t *)&value, 1 << size, true);
++    if (address_space_rw(&address_space_memory, fault_ipa,
++                         MEMTXATTRS_UNSPECIFIED, (uint8_t *)&value,
++                         1 << size, true) != MEMTX_OK) {
++        error_report("no-syndrome MMIO store at 0x%" PRIx64 " targets a region "
++                     "QEMU does not implement (in-kernel device?); not retired",
++                     fault_ipa);
++        return false;
++    }
+     env->xregs[rn] = writeback;
+     env->pc += 4;
+     return true;
+-- 
+2.43.0
+

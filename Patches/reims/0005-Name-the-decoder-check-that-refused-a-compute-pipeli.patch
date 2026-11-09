@@ -1,0 +1,41 @@
+From 28e4771a0aa98791e48f4f12970b0a53b748b744 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Sun, 8 Nov 2026 10:42:19 +0800
+Subject: [PATCH] Name the decoder check that refused a compute pipeline
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../reims-vgpu/src/runtime/compute_exec/mod.rs  | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/compute_exec/mod.rs b/crates/reims-vgpu/src/runtime/compute_exec/mod.rs
+index 9409fb20..e041609c 100644
+--- a/crates/reims-vgpu/src/runtime/compute_exec/mod.rs
++++ b/crates/reims-vgpu/src/runtime/compute_exec/mod.rs
+@@ -1033,11 +1033,18 @@ pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
+                 return None;
+             }
+         };
+-    let Ok(decoded) = decode_type7_descriptor(&desc) else {
+-        return miss(
+-            crate::observe::ladder_slug!("", desc_decode),
+-            format!("desc_len={}", desc.len()),
+-        );
++    let decoded = match decode_type7_descriptor(&desc) {
++        Ok(decoded) => decoded,
++        Err(status) => {
++            return miss(
++                crate::observe::ladder_slug!("", desc_decode),
++                format!(
++                    "desc_len={} decode={}",
++                    desc.len(),
++                    crate::observe::Decline::slug(&status)
++                ),
++            )
++        }
+     };
+     match decoded {
+         ResourceDescriptor::ComputePipeline(cp) if cp.kernel_func_ref != 0 => {
+-- 
+2.43.0
+

@@ -1,0 +1,158 @@
+From ca5240b2685c4b7c4e8fe2070ff3c0e24295dca1 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Sun, 8 Nov 2026 10:42:19 +0800
+Subject: [PATCH] compute: Write RGBA16Unorm storage images
+
+macOS 26 Setup Assistant writes an RGBA16Unorm texture from a kernel
+(1696 refused dispatches per boot as linear_tex_fmt_storage). SPIR-V names
+it Rgba16, an extended format, so the module gains
+StorageImageExtendedFormats the way Rg16f already does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/reims-vgpu/src/backend/metal/format.rs          |  1 +
+ .../reims-vgpu/src/backend/vulkan/translate/pixel.rs   | 10 ++++------
+ crates/reims-vgpu/src/contract/pixel_format.rs         |  3 +++
+ crates/reims-vgpu/src/runtime/compute_exec/mod.rs      |  6 ++++--
+ crates/reims-vgpu/src/runtime/spirv_bind.rs            |  5 +++++
+ 5 files changed, 17 insertions(+), 8 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/backend/metal/format.rs b/crates/reims-vgpu/src/backend/metal/format.rs
+index ffd4b201..117df8fc 100644
+--- a/crates/reims-vgpu/src/backend/metal/format.rs
++++ b/crates/reims-vgpu/src/backend/metal/format.rs
+@@ -58,6 +58,7 @@ pub fn storage_image_format(selector: StorageImageSelector) -> (MTLPixelFormat,
+         S::Rg8Unorm => (MTLPixelFormat::RG8Unorm, 2),
+         S::Rgba32Uint => (MTLPixelFormat::RGBA32Uint, 16),
+         S::R32Uint => (MTLPixelFormat::R32Uint, 4),
++        S::Rgba16Unorm => (MTLPixelFormat::RGBA16Unorm, 8),
+     }
+ }
+ 
+diff --git a/crates/reims-vgpu/src/backend/vulkan/translate/pixel.rs b/crates/reims-vgpu/src/backend/vulkan/translate/pixel.rs
+index 6600ae31..f0403017 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/translate/pixel.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/translate/pixel.rs
+@@ -592,6 +592,7 @@ pub fn storage_image_from_selector(selector: StorageImageSelector) -> StorageIma
+         S::Rg8Unorm => StorageImageFormat::Rg8Unorm,
+         S::Rgba32Uint => StorageImageFormat::Rgba32Uint,
+         S::R32Uint => StorageImageFormat::R32Uint,
++        S::Rgba16Unorm => StorageImageFormat::Rgba16Unorm,
+     }
+ }
+ 
+@@ -1072,12 +1073,9 @@ mod tests {
+ 
+         // Sampled-only means sampled-only: none of the members this rail adds
+         // over the storage one may be reached as a storage image, because Vulkan
+-        // mandates none of them for `STORAGE_IMAGE`.
+-        for mtl in [
+-            p::MTL_FORMAT_R16_UNORM,
+-            p::MTL_FORMAT_RG16_UNORM,
+-            p::MTL_FORMAT_RGBA16_UNORM,
+-        ] {
++        // mandates none of them for `STORAGE_IMAGE`. RGBA16Unorm is the
++        // exception macOS 26 asked for; it is an extended storage format.
++        for mtl in [p::MTL_FORMAT_R16_UNORM, p::MTL_FORMAT_RG16_UNORM] {
+             assert!(
+                 storage_image(mtl).is_err(),
+                 "{mtl:#x} is sampled-only and must not be admitted as a storage image"
+diff --git a/crates/reims-vgpu/src/contract/pixel_format.rs b/crates/reims-vgpu/src/contract/pixel_format.rs
+index 58e2b463..12543575 100644
+--- a/crates/reims-vgpu/src/contract/pixel_format.rs
++++ b/crates/reims-vgpu/src/contract/pixel_format.rs
+@@ -181,6 +181,7 @@ pub enum StorageImageSelector {
+     Rg8Unorm = 10,
+     Rgba32Uint = 11,
+     R32Uint = 12,
++    Rgba16Unorm = 13,
+ }
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -1146,6 +1147,7 @@ pub fn storage_selector(format: u16) -> Option<StorageImageSelector> {
+         MTL_FORMAT_RGBA8_UINT => StorageImageSelector::Rgba8Uint,
+         MTL_FORMAT_RGBA8_SINT => StorageImageSelector::Rgba8Sint,
+         MTL_FORMAT_RGBA16_UINT => StorageImageSelector::Rgba16Uint,
++        MTL_FORMAT_RGBA16_UNORM => StorageImageSelector::Rgba16Unorm,
+         MTL_FORMAT_RGBA16_FLOAT => StorageImageSelector::Rgba16Float,
+         MTL_FORMAT_RGBA32_UINT => StorageImageSelector::Rgba32Uint,
+         MTL_FORMAT_RGBA32_FLOAT => StorageImageSelector::Rgba32Float,
+@@ -2639,6 +2641,7 @@ mod tests {
+             (MTL_FORMAT_RGBA8_UINT, RGBA8_BPP),
+             (MTL_FORMAT_RGBA8_SINT, RGBA8_BPP),
+             (MTL_FORMAT_RGBA16_UINT, RGBA16_BPP),
++            (MTL_FORMAT_RGBA16_UNORM, RGBA16_BPP),
+             (MTL_FORMAT_RGBA16_FLOAT, RGBA16F_BPP),
+             (MTL_FORMAT_RGBA32_UINT, RGBA32_BPP),
+             (MTL_FORMAT_RGBA32_FLOAT, RGBA32F_BPP),
+diff --git a/crates/reims-vgpu/src/runtime/compute_exec/mod.rs b/crates/reims-vgpu/src/runtime/compute_exec/mod.rs
+index e041609c..f9445a0b 100644
+--- a/crates/reims-vgpu/src/runtime/compute_exec/mod.rs
++++ b/crates/reims-vgpu/src/runtime/compute_exec/mod.rs
+@@ -4454,6 +4454,7 @@ fn spirv_image_format_to_engine_storage(
+         S::Rg8Unorm => V::Rg8Unorm,
+         S::Rgba32Uint => V::Rgba32Uint,
+         S::R32Float => V::R32Float,
++        S::Rgba16Unorm => V::Rgba16Unorm,
+         S::R32ui => V::R32Uint,
+         // Format-less (`Unknown`) storage images carry no engine texel format —
+         // their view format comes from the guest surface, resolved by the caller.
+@@ -4554,7 +4555,8 @@ fn specialized_storage_image_format(
+         | S::Rgba8Unorm
+         | S::Rg16Float
+         | S::R8Unorm
+-        | S::Rg8Unorm => 0,
++        | S::Rg8Unorm
++        | S::Rgba16Unorm => 0,
+         S::Rgba32Uint | S::Rgba16Uint | S::Rgba8Uint | S::R32ui => 1,
+         S::Rgba8Sint => 2,
+         // A shader that itself declared `Unknown` (format-less) storage is not a
+@@ -4601,7 +4603,6 @@ fn specialized_storage_image_format(
+         | V::Rgb9e5Ufloat
+         | V::R16Unorm
+         | V::Rg16Unorm
+-        | V::Rgba16Unorm
+         // The packed 32-bit colour formats join them: Vulkan mandates no
+         // `STORAGE_IMAGE` support for any of the three, and one of them is not
+         // in the mandatory table at all.
+@@ -4612,6 +4613,7 @@ fn specialized_storage_image_format(
+         }
+         V::Rgba32Float => (0, S::Rgba32Float),
+         V::Rgba16Float => (0, S::Rgba16Float),
++        V::Rgba16Unorm => (0, S::Rgba16Unorm),
+         V::R16Float => (0, S::R16Float),
+         // Bgra8Unorm normally returns above (Unknown/B8G8R8A8 view, or the
+         // degraded Rgba8Unorm) before reaching here; this arm is only the
+diff --git a/crates/reims-vgpu/src/runtime/spirv_bind.rs b/crates/reims-vgpu/src/runtime/spirv_bind.rs
+index 50bb4925..880bb13f 100644
+--- a/crates/reims-vgpu/src/runtime/spirv_bind.rs
++++ b/crates/reims-vgpu/src/runtime/spirv_bind.rs
+@@ -266,6 +266,9 @@ pub enum StorageImageAccess {
+ pub enum ImageFormat {
+     Rgba32Float,
+     Rgba16Float,
++    /// SPIR-V `Rgba16` (enum value 10), the storage view of a guest
++    /// `MTLPixelFormatRGBA16Unorm` surface. An extended format.
++    Rgba16Unorm,
+     R16Float,
+     Rgba16Uint,
+     Rgba8Uint,
+@@ -310,6 +313,7 @@ impl ImageFormat {
+             3 => Self::R32Float,
+             4 => Self::Rgba8Unorm,
+             7 => Self::Rg16Float,
++            10 => Self::Rgba16Unorm,
+             9 => Self::R16Float,
+             13 => Self::Rg8Unorm,
+             15 => Self::R8Unorm,
+@@ -330,6 +334,7 @@ impl ImageFormat {
+             Self::Rgba8Unorm => 4,
+             Self::Rg16Float => 7,
+             Self::R16Float => 9,
++            Self::Rgba16Unorm => 10,
+             Self::Rg8Unorm => 13,
+             Self::R8Unorm => 15,
+             Self::Rgba8Sint => 23,
+-- 
+2.43.0
+

@@ -1,0 +1,159 @@
+From 32b580df6a9e16f598789a82f776d0c014bcbd15 Mon Sep 17 00:00:00 2001
+From: Icegrave0391 <chuqiz@comp.nus.edu.sg>
+Date: Fri, 11 Sep 2026 00:11:46 +0800
+Subject: [PATCH 05/14] Initialize VMApple PAC context on secondary vCPUs
+
+Hold the BQL for cross-vCPU handoff breakpoint updates. Restore and read back the boot CPU PAC context on CPU_INITIALIZE without disabling authentication.
+
+Validated the native arm64 build and checkpatch, then observed a Ventura 13.6 eight-vCPU boot on GB10 without the prior AUTDA exception loop. Dynamic key switching and broader Safari rendering correctness remain unverified.
+---
+ target/arm/kvm.c | 95 +++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 89 insertions(+), 6 deletions(-)
+
+diff --git a/target/arm/kvm.c b/target/arm/kvm.c
+index 868badeee1..a3ab349163 100644
+--- a/target/arm/kvm.c
++++ b/target/arm/kvm.c
+@@ -658,8 +658,8 @@ int kvm_arch_init(MachineState *ms, KVMState *s)
+ 
+     if (g_getenv("QEMU_VMAPPLE_PAC_DEFAULTS")) {
+         struct kvm_smccc_filter filter = {
+-            .base = 0xc1000001,
+-            .nr_functions = 1,
++            .base = 0xc1000000,
++            .nr_functions = 2,
+             .action = KVM_SMCCC_FILTER_FWD_TO_USER,
+         };
+         struct kvm_device_attr attr = {
+@@ -1721,10 +1721,12 @@ static void vmapple_handoff_arm(CPUState *cs)
+ {
+     int err;
+ 
+-    if (vmapple_handoff_armed || !g_getenv("QEMU_VMAPPLE_HANDOFF") ||
+-        cs->cpu_index != 0) {
++    if (cs->cpu_index != 0 || vmapple_handoff_armed ||
++        !g_getenv("QEMU_VMAPPLE_HANDOFF")) {
+         return;
+     }
++    /* Breakpoint updates use run_on_cpu() for every vCPU, requiring the BQL. */
++    BQL_LOCK_GUARD();
+     vmapple_handoff_armed = true;
+     err = kvm_insert_breakpoint(cs, GDB_BREAKPOINT_HW, VMAPPLE_HANDOFF_PC, 4);
+     info_report("vmapple handoff: arm cpu=%d err=%d max_hw_bps=%d",
+@@ -1879,7 +1881,8 @@ static bool kvm_arm_handle_debug(ARMCPU *cpu,
+ 
+     switch (hsr_ec) {
+     case EC_SOFTWARESTEP:
+-        if (vmapple_handoff_stepping) {
++        if (cs->cpu_index == 0 && vmapple_handoff_stepping) {
++            BQL_LOCK_GUARD();
+             /*
+              * Finished stepping over the first, boot-info-less pass at the
+              * handoff entry; re-arm so the real pass (x1 != 0) is caught.
+@@ -1909,8 +1912,10 @@ static bool kvm_arm_handle_debug(ARMCPU *cpu,
+         }
+         break;
+     case EC_BREAKPOINT:
+-        if (g_getenv("QEMU_VMAPPLE_HANDOFF") &&
++        if (cs->cpu_index == 0 && g_getenv("QEMU_VMAPPLE_HANDOFF") &&
+             env->pc == VMAPPLE_HANDOFF_PC) {
++            /* KVM exits lack the BQL required by cross-vCPU debug work. */
++            BQL_LOCK_GUARD();
+             if (env->xregs[1] != 0) {
+                 vmapple_handoff_apply(cs);
+                 vmapple_handoff_disarm(cs);
+@@ -1964,6 +1969,77 @@ static bool kvm_arm_handle_debug(ARMCPU *cpu,
+     return false;
+ }
+ 
++/*
++ * XNU invokes VMApple CPU_INITIALIZE after a secondary CPU's PSCI reset.
++ * KVM resets that CPU's architectural PAC registers; leaving this hypercall
++ * unhandled gives different CPUs incompatible keys for shared kernel objects.
++ * Their first AUTDA failure can recurse until the exception stack is exhausted.
++ *
++ * Preserve the boot CPU's actual firmware-initialized keys and restore that
++ * initial context on secondary CPUs. This does not disable authentication or
++ * implement the separate VMApple per-task key-switching hypercalls.
++ */
++static int vmapple_initialize_pac(CPUState *cs)
++{
++    static const uint64_t registers[] = {
++        ARM64_SYS_REG(3, 0, 2, 1, 0), /* APIAKeyLo_EL1 */
++        ARM64_SYS_REG(3, 0, 2, 1, 1), /* APIAKeyHi_EL1 */
++        ARM64_SYS_REG(3, 0, 2, 1, 2), /* APIBKeyLo_EL1 */
++        ARM64_SYS_REG(3, 0, 2, 1, 3), /* APIBKeyHi_EL1 */
++        ARM64_SYS_REG(3, 0, 2, 2, 0), /* APDAKeyLo_EL1 */
++        ARM64_SYS_REG(3, 0, 2, 2, 1), /* APDAKeyHi_EL1 */
++        ARM64_SYS_REG(3, 0, 2, 2, 2), /* APDBKeyLo_EL1 */
++        ARM64_SYS_REG(3, 0, 2, 2, 3), /* APDBKeyHi_EL1 */
++        ARM64_SYS_REG(3, 0, 2, 3, 0), /* APGAKeyLo_EL1 */
++        ARM64_SYS_REG(3, 0, 2, 3, 1), /* APGAKeyHi_EL1 */
++    };
++    static uint64_t boot_keys[ARRAY_SIZE(registers)];
++    static bool ready;
++    int ret;
++    size_t i;
++
++    BQL_LOCK_GUARD();
++    if (cs->cpu_index == 0) {
++        ready = false;
++        for (i = 0; i < ARRAY_SIZE(registers); i++) {
++            ret = kvm_get_one_reg(cs, registers[i], &boot_keys[i]);
++            if (ret) {
++                error_report("VMApple CPU_INITIALIZE: cannot read boot PAC "
++                             "register %zu: %s", i, strerror(-ret));
++                return ret;
++            }
++        }
++        ready = true;
++        info_report("VMApple CPU_INITIALIZE: boot PAC context captured");
++        return 0;
++    }
++    if (!ready) {
++        error_report("VMApple CPU_INITIALIZE cpu=%d before boot PAC context",
++                     cs->cpu_index);
++        return -EINVAL;
++    }
++    for (i = 0; i < ARRAY_SIZE(registers); i++) {
++        uint64_t actual;
++
++        ret = kvm_set_one_reg(cs, registers[i], &boot_keys[i]);
++        if (!ret) {
++            ret = kvm_get_one_reg(cs, registers[i], &actual);
++            if (!ret && actual != boot_keys[i]) {
++                ret = -EIO;
++            }
++        }
++        if (ret) {
++            error_report("VMApple CPU_INITIALIZE cpu=%d: PAC register %zu "
++                         "restore failed: %s", cs->cpu_index, i,
++                         strerror(-ret));
++            return ret;
++        }
++    }
++    info_report("VMApple CPU_INITIALIZE cpu=%d: PAC context restored",
++                cs->cpu_index);
++    return 0;
++}
++
+ int kvm_arch_handle_exit(CPUState *cs, struct kvm_run *run)
+ {
+     ARMCPU *cpu = ARM_CPU(cs);
+@@ -1972,6 +2048,13 @@ int kvm_arch_handle_exit(CPUState *cs, struct kvm_run *run)
+     switch (run->exit_reason) {
+     case KVM_EXIT_HYPERCALL:
+         if (g_getenv("QEMU_VMAPPLE_PAC_DEFAULTS") &&
++            run->hypercall.nr == 0xc1000000) {
++            ret = vmapple_initialize_pac(cs);
++            if (ret) {
++                return ret;
++            }
++            run->hypercall.ret = 0;
++        } else if (g_getenv("QEMU_VMAPPLE_PAC_DEFAULTS") &&
+             run->hypercall.nr == 0xc1000001) {
+             /* Diagnostic response only; no architectural key registers change. */
+             static unsigned int reported;
+-- 
+2.43.0
+

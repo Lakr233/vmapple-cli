@@ -1,0 +1,1223 @@
+From 76425557fd06f552de3c5886752a6a59978bdb06 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Mon, 9 Nov 2026 01:50:55 +0800
+Subject: [PATCH 20/24] Render into and sample ten-bit RGB and BGR
+
+macOS 26 and 27 render panel and icon layers into buffer-backed
+RGB10A2Unorm textures and WindowServer surfaces into BGR10A2Unorm
+IOSurfaces. Neither was a render target. The refusal is reported once
+per attachment; one 27.2 boot reported 207 buffer-texture attachments
+(rt_buffer_texture_format fmt=0x5a) and 7 type-11 ones (rt_type11_format
+fmt=0x5e), one 26.6.2 boot 192 and 29. The pass that sampled a refused
+surface then had nothing to read: the CPU reader declined format 94
+(capture_convert_to_rgba) and the draw lost the texture
+(texture_resolve_missing).
+
+Both formats are now in render_target_bpp and store_texel_order.
+RGB10A2Unorm renders through A2B10G10R10_UNORM_PACK32 and BGR10A2Unorm
+through A2R10G10B10_UNORM_PACK32, the same words, so the resident, the
+GPU byte-copy Store and the sampler all hold the guest's texel, and a
+type-11 surface's resident identity names the format its image is
+created in. A2R10G10B10 is optional as a colour attachment in Vulkan, so
+the primary and secondary attachment resolution asks the published
+device capability and refuses the pass by name (NoColorAttachmentFormat,
+mrt_drop_unknown_format) where the host declines it. The GB10 host
+reports COLOR_ATTACHMENT and BLEND for both.
+
+The CPU rails read and write the words through one TenBitOrder: the
+Load seed expansion, the readback narrowing, the Store converter, and
+texel_to_rgba8 for the scanout capture and the type-11 memo rung. The
+narrowing keeps the top eight bits and replicates alpha; the widening
+replicates the top two bits, so every eight-bit value round-trips. The
+reading arm is marked lossy, so no cost floor sends a sampled bind to
+it, and narrows_to_unorm8 reports it. The CPU-origin sampled loaders
+upload the word natively when the host filters both formats
+(NativeUploads::ten_bit). The buffer-texture loader's own ten-bit
+narrowing is gone; the shared converter computes the same bytes.
+
+Three engine paths took four bytes a texel to mean eight-bit colour: the
+readback narrowing, the leased readback and the CPU seed staging. They
+now ask is_four_byte_color, so a ten-bit resident (and an RG16Float or
+RG16Uint one, which had the same problem) is narrowed or widened instead
+of read as four bytes of colour.
+
+The approach follows steelbrain/reims-vgpu PR 95 (c559ed91) and PR 104
+(a4e3ded6, 226fe047) and aquarat 6eff30be19 and d647200cdc, written
+again for this tree.
+
+Tests: cargo test --release -p reims-vgpu --no-default-features
+--features backend-vulkan,host-window --lib, serially: 2212 passed, 1
+failed. The failure is
+the_cursor_bound_matches_the_sprite_size_qemu_will_allocate, which
+reads vendor/qemu/ui/cursor.c; this worktree does not check out
+vendor/qemu, and the test fails the same way on the base. New tests cover
+both formats as type-11 render targets, the word layouts in both orders,
+CPU reads and writes of known words, the seed/readback/Store round trip,
+the narrowed readback, the native sampled upload and the capability
+refusal; the admission and readback tests were checked to fail with
+their change removed. clippy (toolchain 1.99, Vulkan arm, -D warnings)
+reports nothing in the changed lines and 53 lints in unchanged code. The
+x86 and Metal clippy arms were not run: their targets are not installed
+on this host. No guest was booted with this change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 499b0927f046879c86b2688c4893128deb94aa63)
+---
+ .../src/backend/vulkan/engine/exec.rs         |   8 +-
+ .../src/backend/vulkan/engine/mod.rs          |  98 ++++-
+ .../src/backend/vulkan/translate/pixel.rs     |  41 +-
+ .../src/backend/vulkan/translate/reason.rs    |   5 +-
+ .../reims-vgpu/src/contract/pixel_format.rs   | 362 ++++++++++++++++--
+ .../src/runtime/census/present_proxy.rs       |   3 +-
+ crates/reims-vgpu/src/runtime/draw/mod.rs     |  39 +-
+ .../src/runtime/draw/render_target.rs         |  50 +++
+ crates/reims-vgpu/src/runtime/draw/tests.rs   |  36 ++
+ .../src/runtime/draw/texture_view.rs          |  10 +
+ crates/reims-vgpu/src/runtime/draw/vulkan.rs  |  49 ++-
+ 11 files changed, 622 insertions(+), 79 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs b/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
+index c446126b..3f243d89 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
+@@ -3374,13 +3374,15 @@ pub(crate) unsafe fn execute_draw_inner(
+     // buffer→image copy converts nothing and reads the *image's* texel width
+     // per pixel, so staging an RGBA8 seed under a wider attachment would read
+     // past the slot and seed the frame with whatever followed it. The wide arm
+-    // below restates the seed as the attachment's texels first; the four-byte
++    // below restates the seed as the attachment's texels first; the eight-bit
+     // arm is unchanged, which is every attachment this device had until render
+-    // targets began following the guest's declared format.
++    // targets began following the guest's declared format. Four bytes is not
++    // eight bits: a packed ten-bit or two-channel half-float attachment is as
++    // wide as RGBA8 and still needs its seed restated.
+     phase.enter(super::draw_phase::Phase::StageSeed);
+     let seed_wide = seed_bytes.and_then(|rgba8| {
+         let layout = crate::backend::vulkan::translate::pixel::texel_layout_of(color0_format)?;
+-        if layout.bytes_per_texel() == crate::contract::pixel_format::RGBA8_BPP {
++        if layout.is_four_byte_color() {
+             return None;
+         }
+         Some((rgba8, layout))
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs b/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
+index bc845b59..951e11d8 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
+@@ -477,6 +477,14 @@ impl DeviceCapabilitySnapshot {
+         (self.0 & (1_u64 << CAP_PUBLISHED_BIT) != 0)
+             .then_some(self.0 & (1_u64 << (CAP_SAMPLED_FILTER_SHIFT + layout.index() as u32)) != 0)
+     }
++
++    fn render_target_layout_supported_if_published(
++        self,
++        layout: crate::contract::pixel_format::TexelLayout,
++    ) -> Option<bool> {
++        (self.0 & (1_u64 << CAP_PUBLISHED_BIT) != 0)
++            .then_some(self.render_target_layout_supported(layout))
++    }
+ }
+ 
+ static DEVICE_CAPABILITIES: AtomicU64 = AtomicU64::new(DeviceCapabilitySnapshot::CONSERVATIVE.0);
+@@ -551,6 +559,36 @@ mod device_capability_snapshot_tests {
+         );
+         assert!(!narrowed.deferred_gpu_only_content_allowed());
+     }
++
++    /// A colour attachment is refused only on a device's own word: a host that
++    /// published no `A2R10G10B10` attachment support declines `BGR10A2Unorm`
++    /// targets, the same host renders its required red-low twin, and a snapshot
++    /// no device has published yet declines nothing.
++    #[test]
++    fn only_a_published_device_declines_a_render_target_layout() {
++        let mut features = crate::backend::vulkan::caps::device_features::DeviceFeatures {
++            max_image_dimension_2d: 16_384,
++            ..Default::default()
++        };
++        features.color_attachment_blend[TexelLayout::Rgb10a2Unorm.index()] = true;
++        let snapshot = DeviceCapabilitySnapshot::from_parts(
++            &features,
++            crate::backend::vulkan::caps::DriverQuirk::default(),
++        );
++        assert_eq!(
++            snapshot.render_target_layout_supported_if_published(TexelLayout::Bgr10a2Unorm),
++            Some(false)
++        );
++        assert_eq!(
++            snapshot.render_target_layout_supported_if_published(TexelLayout::Rgb10a2Unorm),
++            Some(true)
++        );
++        assert_eq!(
++            DeviceCapabilitySnapshot::CONSERVATIVE
++                .render_target_layout_supported_if_published(TexelLayout::Bgr10a2Unorm),
++            None
++        );
++    }
+ }
+ 
+ /// Generation of the resident registry resource handles refer into.
+@@ -2151,6 +2189,24 @@ pub fn render_target_layout_supported(layout: crate::contract::pixel_format::Tex
+     device_capabilities().render_target_layout_supported(layout)
+ }
+ 
++/// Whether the resolved device has said it cannot render to and blend into
++/// this layout, so a draw must not create a colour attachment at it.
++///
++/// The refusing half of [`render_target_layout_supported`], for the one caller
++/// that has no fallback to narrow to: the attachment a pass renders through is
++/// created at the format the guest declared, and Vulkan leaves colour-attachment
++/// support optional for some renderable formats (`A2R10G10B10_UNORM_PACK32`,
++/// which `BGR10A2Unorm` renders through, is one). Asked only of a published
++/// snapshot: before a device has answered there is nothing to refuse on, and
++/// the device that will create the image is the one that answers.
++pub fn render_target_layout_declined(layout: crate::contract::pixel_format::TexelLayout) -> bool {
++    use crate::contract::pixel_format::TexelLayout;
++    if matches!(layout, TexelLayout::Rgba8 | TexelLayout::Bgra8) {
++        return false;
++    }
++    device_capabilities().render_target_layout_supported_if_published(layout) == Some(false)
++}
++
+ pub fn deferred_gpu_only_content_allowed() -> bool {
+     device_capabilities().deferred_gpu_only_content_allowed()
+ }
+@@ -3021,8 +3077,12 @@ pub fn read_target_leased(identity: &TargetIdentity) -> Result<Option<LeasedFram
+     // so unlike `read_target_inner` it has nowhere to narrow a wide resident to
+     // — the bytes the caller reads are the slot's. Bounded rather than
+     // converted, and named so a firing says which rail could not serve.
++    //
++    // Bounded on the colour order, not the width: a packed ten-bit or
++    // two-channel half-float texel is four bytes too, and the caller would read
++    // its word as four eight-bit channels.
+     let (snap, layout) = readback_snapshot(pools, identity)?;
+-    if layout.bytes_per_texel() != RESIDENT_READ_BYTES_PER_TEXEL {
++    if !layout.is_four_byte_color() {
+         return Err(DrawError::TargetRead(
+             reason::TargetReadDecline::TexelNotFourBytes {
+                 format: snap.format,
+@@ -4368,6 +4428,11 @@ fn readback_bytes_per_texel(format: ash::vk::Format) -> u32 {
+ /// Returns the bytes and the channel order they are in — `narrow_texel_to_rgba8`
+ /// produces semantic RGBA8 whatever the resident's order was, so a narrowed
+ /// frame owes no exchange and says so.
++///
++/// Only the two eight-bit colour orders pass through untouched. Four bytes a
++/// texel is not the test: a packed ten-bit word or a two-channel half-float
++/// texel is four bytes too, and handing one on would have its consumer read the
++/// word as four eight-bit channels.
+ fn narrow_readback_to_rgba8(
+     out: Vec<u8>,
+     layout: crate::contract::pixel_format::TexelLayout,
+@@ -4375,7 +4440,7 @@ fn narrow_readback_to_rgba8(
+     pixels: u64,
+     bgra: bool,
+ ) -> Result<(Vec<u8>, bool), DrawError> {
+-    if layout.bytes_per_texel() == RESIDENT_READ_BYTES_PER_TEXEL {
++    if layout.is_four_byte_color() {
+         return Ok((out, bgra));
+     }
+     let count = u32::try_from(pixels).unwrap_or(u32::MAX);
+@@ -5618,12 +5683,12 @@ mod readback_width_tests {
+                         (PIXELS * u64::from(RESIDENT_READ_BYTES_PER_TEXEL)) as usize,
+                         "{layout:?}: a consumer of drawn pixels reads RGBA8"
+                     );
+-                    // A four-byte layout is handed back untouched, so it keeps
+-                    // the order it was read in; a narrowed one is semantic RGBA8
+-                    // and owes no exchange. Both rails pass this straight on.
++                    // An eight-bit colour order is handed back untouched, so it
++                    // keeps the order it was read in; a narrowed one is semantic
++                    // RGBA8 and owes no exchange. Both rails pass this straight on.
+                     assert_eq!(
+                         bgra,
+-                        layout.bytes_per_texel() == RESIDENT_READ_BYTES_PER_TEXEL,
++                        layout.is_four_byte_color(),
+                         "{layout:?}: reported the wrong channel order for its rail"
+                     );
+                 }
+@@ -5645,6 +5710,27 @@ mod readback_width_tests {
+             }
+         }
+     }
++
++    /// A packed ten-bit resident is four bytes a texel and still not RGBA8, so
++    /// a readback of one is narrowed channel by channel rather than handed on
++    /// as four bytes of colour. Both Vulkan words, with red in the low field
++    /// for `A2B10G10R10` and blue there for `A2R10G10B10`.
++    #[test]
++    fn a_ten_bit_readback_is_narrowed_not_passed_through() {
++        // Low field full, green half, high field empty, alpha full.
++        let word: u32 = 0x3ff | (0x200 << 10) | (0b11 << 30);
++        for (layout, want) in [
++            (TexelLayout::Rgb10a2Unorm, [0xff, 0x80, 0x00, 0xff]),
++            (TexelLayout::Bgr10a2Unorm, [0x00, 0x80, 0xff, 0xff]),
++        ] {
++            let format = crate::backend::vulkan::translate::pixel::vk_texel_layout(layout);
++            let (pixels, bgra) =
++                narrow_readback_to_rgba8(word.to_le_bytes().to_vec(), layout, format, 1, true)
++                    .expect("a renderable layout narrows");
++            assert_eq!(pixels, want, "{layout:?}");
++            assert!(!bgra, "{layout:?}: narrowed bytes are semantic RGBA8");
++        }
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/reims-vgpu/src/backend/vulkan/translate/pixel.rs b/crates/reims-vgpu/src/backend/vulkan/translate/pixel.rs
+index e5762f9c..7218d13c 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/translate/pixel.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/translate/pixel.rs
+@@ -1935,9 +1935,9 @@ mod tests {
+                 p::MTL_FORMAT_BGRA8_UNORM,
+                 p::MTL_FORMAT_BGRA8_UNORM_SRGB,
+                 // The packed 32-bit colour family, whose channel boundaries are
+-                // not byte boundaries — so the CPU rung could not have served
+-                // them at all and the refusal was the whole loss. `BGR10A2Unorm`
+-                // is the member a guest was measured binding.
++                // not byte boundaries — so the CPU rung could serve at most an
++                // eight-bit reading of them, and `RG11B10Float` not even that.
++                // `BGR10A2Unorm` is the member a guest was measured binding.
+                 p::MTL_FORMAT_RGB10A2_UNORM,
+                 p::MTL_FORMAT_RG11B10_FLOAT,
+                 p::MTL_FORMAT_BGR10A2_UNORM,
+@@ -1982,6 +1982,13 @@ mod tests {
+                 p::MTL_FORMAT_RGBA8_UNORM_SRGB,
+                 p::MTL_FORMAT_BGRA8_UNORM,
+                 p::MTL_FORMAT_BGRA8_UNORM_SRGB,
++                // The packed ten-bit pair macOS 26 and 27 render into:
++                // buffer-backed `RGB10A2Unorm` textures and `BGR10A2Unorm`
++                // IOSurfaces. `A2B10G10R10_UNORM_PACK32` is a required colour
++                // attachment; `A2R10G10B10_UNORM_PACK32` is not, so the draw
++                // asks the host before it attaches one.
++                p::MTL_FORMAT_RGB10A2_UNORM,
++                p::MTL_FORMAT_BGR10A2_UNORM,
+                 // Admitted since the two arms became one answer. The contract
+                 // has said a half-float render target is renderable since one
+                 // could be created at that format; only this side still refused
+@@ -1992,6 +1999,34 @@ mod tests {
+         );
+     }
+ 
++    /// The packed ten-bit render targets attach, sample and land through one
++    /// Vulkan word each: `RGB10A2Unorm` through `A2B10G10R10_UNORM_PACK32` and
++    /// `BGR10A2Unorm` through `A2R10G10B10_UNORM_PACK32`, the same bits in the
++    /// same order as the guest's. A byte copy out of the resident therefore is
++    /// the guest's texel, and so is a sample of it.
++    #[test]
++    fn a_ten_bit_render_target_is_its_guest_word_on_every_rail() {
++        for (mtl, vk_format, layout) in [
++            (
++                p::MTL_FORMAT_RGB10A2_UNORM,
++                vk::Format::A2B10G10R10_UNORM_PACK32,
++                TexelLayout::Rgb10a2Unorm,
++            ),
++            (
++                p::MTL_FORMAT_BGR10A2_UNORM,
++                vk::Format::A2R10G10B10_UNORM_PACK32,
++                TexelLayout::Bgr10a2Unorm,
++            ),
++        ] {
++            assert_eq!(color_attachment(mtl), Ok((vk_format, None)), "{mtl:#x}");
++            assert_eq!(texel_layout_of(vk_format), Some(layout), "{mtl:#x}");
++            assert_eq!(sampled_pixels(mtl).unwrap().0, layout, "{mtl:#x}");
++            assert_eq!(p::store_texel_order(mtl), Some(layout), "{mtl:#x}");
++            assert_eq!(vk_texel_layout(layout), vk_format, "{mtl:#x}");
++            assert!(!has_bgra_order(vk_format), "{mtl:#x} is not an eight-bit order");
++        }
++    }
++
+     /// An integer texel is declared, translates, and is refused by every rail
+     /// that would have to give it a meaning — each by its own name.
+     ///
+diff --git a/crates/reims-vgpu/src/backend/vulkan/translate/reason.rs b/crates/reims-vgpu/src/backend/vulkan/translate/reason.rs
+index 13685485..84d993dc 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/translate/reason.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/translate/reason.rs
+@@ -91,8 +91,9 @@ pub enum TranslateReason {
+     /// understood, this rail just does not carry it.
+     NoSampledLayout(u16),
+     /// The format is defined by the contract but is not one the engine can use
+-    /// as a colour attachment. Distinct from [`Self::UnknownPixelFormat`] for
+-    /// the same reason.
++    /// as a colour attachment: outside the renderable set, or inside it with a
++    /// Vulkan format the host published no colour-attachment support for.
++    /// Distinct from [`Self::UnknownPixelFormat`] for the same reason.
+     NoColorAttachmentFormat(u16),
+     /// The format is defined by the contract but the compute rail carries no
+     /// storage-image layout for it. Same shape as [`Self::NoSampledLayout`]:
+diff --git a/crates/reims-vgpu/src/contract/pixel_format.rs b/crates/reims-vgpu/src/contract/pixel_format.rs
+index e5d7fb3e..d0fe2172 100644
+--- a/crates/reims-vgpu/src/contract/pixel_format.rs
++++ b/crates/reims-vgpu/src/contract/pixel_format.rs
+@@ -123,8 +123,10 @@ pub const MTL_FORMAT_BGRA8_UNORM_SRGB: u16 = 0x51;
+ /// the same order, so the guest's own word is sampled unchanged. Converting one
+ /// to unorm8 instead would throw away the two bits of colour resolution the
+ /// guest chose the format for, which is [`TexelLayout::R16Unorm`]'s argument at
+-/// a different bit depth — and [`texel_to_rgba8`] has no arm that could do it
+-/// anyway.
++/// a different bit depth. [`texel_to_rgba8`] does carry an eight-bit arm for the
++/// two ten-bit orders, for the readers whose destination is eight bits anyway
++/// (the scanout capture), and [`TexelLayout::cpu_loader_arm_is_lossy`] keeps
++/// sampled binds off it.
+ ///
+ /// This device advertises `isRGB10A2GammaSupported` to the guest
+ /// (`model::regs::DEVICE_INFO_KEY_RGB10A2_GAMMA`), so a guest taking it at its
+@@ -214,6 +216,11 @@ pub enum SampledClass {
+     Bgra8Unorm,
+     Rgba16Float,
+     Rg16Float,
++    /// The packed ten-bit words. Their guest bytes are already the upload bytes
++    /// of `A2B10G10R10_UNORM_PACK32` / `A2R10G10B10_UNORM_PACK32`, so a loader
++    /// that carries the native layout hands them over unconverted.
++    Rgb10a2Unorm,
++    Bgr10a2Unorm,
+ }
+ 
+ /// The byte layout of one guest texel on the sampled rails, independent of any
+@@ -321,10 +328,11 @@ pub enum TexelLayout {
+     /// `MTLPixelFormatRGB10A2Unorm` and that Vulkan format are the same bits in
+     /// the same order, so the guest's word is sampled unchanged. Native for
+     /// [`Self::R16Unorm`]'s reason two bits down: an unorm8 conversion would
+-    /// discard the resolution the guest picked the format for, and
+-    /// [`texel_to_rgba8`] has no arm that could cut a non-byte channel boundary
+-    /// anyway. Four bytes wide and **not** a byte-order colour layout, so it
+-    /// stays out of the RGBA8-shaped loaders and `is_four_byte_color`.
++    /// discard the resolution the guest picked the format for, which is why
++    /// [`texel_to_rgba8`]'s arm for it is marked lossy. Four bytes wide and
++    /// **not** a byte-order colour layout, so it stays out of the RGBA8-shaped
++    /// loaders and `is_four_byte_color`, and a readback narrows it rather than
++    /// handing its words on as four bytes of colour.
+     Rgb10a2Unorm,
+     /// 4 bytes/texel — [`Self::Rgb10a2Unorm`] with the colour channels the
+     /// other way round in the word, sampled natively as
+@@ -448,14 +456,19 @@ impl TexelLayout {
+             // endorsement, and [`Self::cpu_loader_arm_is_lossy`] is where the
+             // endorsement is withheld.
+             Self::Rgba16Float | Self::Rg16Float => true,
++            // The packed ten-bit pair, on the half-float terms: the arm exists
++            // because the scanout capture and the type-11 memo rung have only an
++            // eight-bit destination, and it keeps the top eight of ten bits.
++            // Lossy, so no floor may send a sampled bind to it.
++            Self::Rgb10a2Unorm | Self::Bgr10a2Unorm => true,
+             // The two sixteen-bit normalized layouts join the floats here for
+             // the same reason and a different quantity: `texel_to_rgba8` has no
+             // arm for them because an arm would have to narrow ten bits of video
+             // luma to eight.
+             //
+-            // The three packed 32-bit colour layouts answer `false` for a third
+-            // reason: their channels do not sit on byte boundaries at all, so
+-            // there is nothing for a byte-shaped loader to pick up.
++            // `Rg11b10Float` answers `false` for a third reason: its channels
++            // are floats that do not sit on byte boundaries, and nothing that
++            // reads it has asked for an eight-bit answer.
+             Self::R16Float
+             | Self::R32Float
+             | Self::R16Unorm
+@@ -463,8 +476,6 @@ impl TexelLayout {
+             | Self::Rg16Uint
+             | Self::Rg32Float
+             | Self::Rgba16Unorm
+-            | Self::Rgb10a2Unorm
+-            | Self::Bgr10a2Unorm
+             | Self::Rg11b10Float => false,
+         }
+     }
+@@ -478,14 +489,15 @@ impl TexelLayout {
+     /// is clamped to `[0, 1]` and quantized to 256 levels, so a compositor
+     /// working in extended range has its highlights removed and a colour ramp
+     /// banded. That is not a slower way to the same pixels; it is different
+-    /// pixels.
++    /// pixels. The packed ten-bit arms drop the low two bits of every colour
++    /// channel, which bands a gradient the guest graded in ten.
+     ///
+     /// Every other arm is exact — `Rgba8` is an identity copy, `Bgra8` a
+     /// channel swap, `R8`/`Rg8` a zero-extend that the matching one- and
+     /// two-channel Vulkan formats sample to identically.
+     pub fn cpu_loader_arm_is_lossy(self) -> bool {
+         match self {
+-            Self::Rgba16Float | Self::Rg16Float => true,
++            Self::Rgba16Float | Self::Rg16Float | Self::Rgb10a2Unorm | Self::Bgr10a2Unorm => true,
+             Self::Rgba8
+             | Self::Bgra8
+             | Self::R8
+@@ -497,8 +509,6 @@ impl TexelLayout {
+             | Self::Rg16Uint
+             | Self::Rg32Float
+             | Self::Rgba16Unorm
+-            | Self::Rgb10a2Unorm
+-            | Self::Bgr10a2Unorm
+             | Self::Rg11b10Float => false,
+         }
+     }
+@@ -1161,6 +1171,8 @@ pub fn sampled_class(format: u16) -> Option<SampledClass> {
+         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => SampledClass::Bgra8Unorm,
+         MTL_FORMAT_RGBA16_FLOAT => SampledClass::Rgba16Float,
+         MTL_FORMAT_RG16_FLOAT => SampledClass::Rg16Float,
++        MTL_FORMAT_RGB10A2_UNORM => SampledClass::Rgb10a2Unorm,
++        MTL_FORMAT_BGR10A2_UNORM => SampledClass::Bgr10a2Unorm,
+         _ => return None,
+     })
+ }
+@@ -1247,6 +1259,16 @@ pub fn storage_selector(format: u16) -> Option<StorageImageSelector> {
+ /// that function's doc states: a missing arm there is a performance bug, not a
+ /// loss, and the byte-copy rail declines by name to the CPU converter above.
+ ///
++/// `RGB10A2_UNORM` and `BGR10A2_UNORM` are here because macOS 26 and 27 render
++/// into both: panel and icon layers in buffer-backed `RGB10A2Unorm` textures
++/// (about 200 `rt_buffer_texture_format fmt=0x5a` refusals a boot) and
++/// WindowServer surfaces in `BGR10A2Unorm` IOSurfaces (`rt_type11_format
++/// fmt=0x5e`, whose consumer then had nothing to sample). Their Vulkan twins are
++/// the same word, so the resident, the byte copy and the sampler all hold the
++/// guest's texel. `A2B10G10R10_UNORM_PACK32` is required for colour attachment
++/// and blend; `A2R10G10B10_UNORM_PACK32` is not, so the draw asks the host
++/// before attaching one and refuses by name where it cannot.
++///
+ /// sRGB variants share storage bpp with their unorm counterparts (Metal texture
+ /// view rules).
+ pub fn render_target_bpp(format: u16) -> Option<u32> {
+@@ -1259,6 +1281,7 @@ pub fn render_target_bpp(format: u16) -> Option<u32> {
+         MTL_FORMAT_R16_FLOAT => R16F_BPP,
+         MTL_FORMAT_RG32_FLOAT => RGBA16F_BPP,
+         MTL_FORMAT_R8_UNORM => R8_BPP,
++        MTL_FORMAT_RGB10A2_UNORM | MTL_FORMAT_BGR10A2_UNORM => RGBA8_BPP,
+         _ => return None,
+     })
+ }
+@@ -1311,6 +1334,14 @@ pub fn render_target_bpp(format: u16) -> Option<u32> {
+ /// requires an admitted format to have a [`sampled_class`] naming the same
+ /// texel, and `RG16_FLOAT` has none.
+ ///
++/// The packed ten-bit pair is here for more than speed. A type-11 surface's
++/// resident identity takes its format from this answer
++/// (`present_identity::surface_format`), while the attachment image is created
++/// at the format the pass declares; a `BGR10A2Unorm` surface answered `None`
++/// would claim a BGRA8 resident over an `A2R10G10B10` image, and the next
++/// pass sampling that surface would bind a view of the wrong texel. Both words
++/// are their Vulkan twins bit for bit, so the copy is exact.
++///
+ /// sRGB folds onto its linear sibling for the same reason [`sampled_class`]
+ /// folds it: the qualifier describes how a sampler interprets the bytes, not
+ /// how they are stored, and only the storage matters to a copy.
+@@ -1319,6 +1350,8 @@ pub fn store_texel_order(format: u16) -> Option<TexelLayout> {
+         MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => TexelLayout::Rgba8,
+         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => TexelLayout::Bgra8,
+         MTL_FORMAT_RGBA16_FLOAT => TexelLayout::Rgba16Float,
++        MTL_FORMAT_RGB10A2_UNORM => TexelLayout::Rgb10a2Unorm,
++        MTL_FORMAT_BGR10A2_UNORM => TexelLayout::Bgr10a2Unorm,
+         _ => return None,
+     })
+ }
+@@ -1580,6 +1613,115 @@ fn unorm8_to_f16_lut() -> &'static [u16; 256] {
+     })
+ }
+ 
++/// Which end of a packed ten-bit word red occupies.
++///
++/// `MTLPixelFormatRGB10A2Unorm` keeps red in bits 0–9, green in 10–19, blue in
++/// 20–29 and alpha in 30–31, which is `VK_FORMAT_A2B10G10R10_UNORM_PACK32`'s
++/// word. `MTLPixelFormatBGR10A2Unorm` exchanges red and blue and is
++/// `VK_FORMAT_A2R10G10B10_UNORM_PACK32`'s. Green and alpha sit in the same bits
++/// either way: the relation `Bgra8` has to `Rgba8`, one storage shape up.
++///
++/// These are the conversions for the rails that cannot copy the word as it is
++/// (a CPU `Load` seed, a readback narrowed for an eight-bit consumer, the CPU
++/// Store converter, the scanout capture). Every one goes through semantic RGBA8,
++/// so a word can cross from one order to the other only by being read in one
++/// and written in the other, never by being copied.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum TenBitOrder {
++    /// `RGB10A2Unorm`: red low, blue high.
++    Rgb,
++    /// `BGR10A2Unorm`: blue low, red high.
++    Bgr,
++}
++
++const TEN_BIT_LOW_SHIFT: u32 = 0;
++const TEN_BIT_GREEN_SHIFT: u32 = 10;
++const TEN_BIT_HIGH_SHIFT: u32 = 20;
++const TEN_BIT_ALPHA_SHIFT: u32 = 30;
++const TEN_BIT_COLOR_MASK: u32 = 0x3ff;
++const TEN_BIT_ALPHA_MASK: u32 = 0x3;
++/// `0b01` across a byte: the two-bit alpha times this reads `0b11` as `0xff`
++/// rather than `0xc0`.
++const TEN_BIT_ALPHA_REPLICATE: u8 = 0x55;
++
++// Three ten-bit colour fields and a two-bit alpha tile the word exactly.
++const _: () = assert!(
++    TEN_BIT_GREEN_SHIFT == TEN_BIT_LOW_SHIFT + TEN_BIT_COLOR_MASK.count_ones()
++        && TEN_BIT_HIGH_SHIFT == TEN_BIT_GREEN_SHIFT + TEN_BIT_COLOR_MASK.count_ones()
++        && TEN_BIT_ALPHA_SHIFT == TEN_BIT_HIGH_SHIFT + TEN_BIT_COLOR_MASK.count_ones()
++        && TEN_BIT_ALPHA_SHIFT + TEN_BIT_ALPHA_MASK.count_ones() == u32::BITS
++);
++
++impl TenBitOrder {
++    fn of_format(format: u16) -> Option<Self> {
++        match format {
++            MTL_FORMAT_RGB10A2_UNORM => Some(Self::Rgb),
++            MTL_FORMAT_BGR10A2_UNORM => Some(Self::Bgr),
++            _ => None,
++        }
++    }
++
++    fn red_shift(self) -> u32 {
++        match self {
++            Self::Rgb => TEN_BIT_LOW_SHIFT,
++            Self::Bgr => TEN_BIT_HIGH_SHIFT,
++        }
++    }
++
++    fn blue_shift(self) -> u32 {
++        match self {
++            Self::Rgb => TEN_BIT_HIGH_SHIFT,
++            Self::Bgr => TEN_BIT_LOW_SHIFT,
++        }
++    }
++
++    /// One word as semantic RGBA8: the top eight bits of each colour channel,
++    /// and the two alpha bits replicated across the byte.
++    fn word_to_rgba8(self, word: u32) -> [u8; COMPONENT_COUNT] {
++        let channel = |shift: u32| (((word >> shift) & TEN_BIT_COLOR_MASK) >> 2) as u8;
++        let mut rgba = [0u8; COMPONENT_COUNT];
++        rgba[COMPONENT_R] = channel(self.red_shift());
++        rgba[COMPONENT_G] = channel(TEN_BIT_GREEN_SHIFT);
++        rgba[COMPONENT_B] = channel(self.blue_shift());
++        rgba[COMPONENT_A] =
++            ((word >> TEN_BIT_ALPHA_SHIFT) & TEN_BIT_ALPHA_MASK) as u8 * TEN_BIT_ALPHA_REPLICATE;
++        rgba
++    }
++
++    /// Four semantic-RGBA8 channels as one word.
++    ///
++    /// Each colour channel gains two bits filled with its own top two, the unorm
++    /// widening that keeps both ends (`0` stays `0`, `255` becomes `1023`), so
++    /// [`Self::word_to_rgba8`] reads back exactly what was written. Alpha keeps
++    /// its top two bits, the inverse of the replication there.
++    fn rgba8_to_word(self, rgba: [u8; COMPONENT_COUNT]) -> u32 {
++        let channel = |v: u8| {
++            let v = u32::from(v);
++            (v << 2) | (v >> 6)
++        };
++        (u32::from(rgba[COMPONENT_A]) >> 6) << TEN_BIT_ALPHA_SHIFT
++            | channel(rgba[COMPONENT_R]) << self.red_shift()
++            | channel(rgba[COMPONENT_G]) << TEN_BIT_GREEN_SHIFT
++            | channel(rgba[COMPONENT_B]) << self.blue_shift()
++    }
++
++    fn expand_row(self, src_rgba: &[u8], dst: &mut [u8]) {
++        let (texels, _) = src_rgba.as_chunks::<4>();
++        let (words, _) = dst.as_chunks_mut::<4>();
++        for (texel, word) in texels.iter().zip(words) {
++            *word = self.rgba8_to_word(*texel).to_le_bytes();
++        }
++    }
++
++    fn narrow_row(self, src: &[u8], dst_rgba: &mut [u8]) {
++        let (words, _) = src.as_chunks::<4>();
++        let (texels, _) = dst_rgba.as_chunks_mut::<4>();
++        for (word, texel) in words.iter().zip(texels) {
++            *texel = self.word_to_rgba8(u32::from_le_bytes(*word));
++        }
++    }
++}
++
+ /// Restate a semantic-RGBA8 frame as `layout`'s own texels.
+ ///
+ /// The render-target seed's counterpart to [`convert_rgba8_to_row`], keyed on a
+@@ -1688,6 +1830,10 @@ pub fn expand_rgba8_to_texel(
+                 *d = src_rgba[i * RGBA8_BPP as usize + COMPONENT_R];
+             }
+         }
++        // The packed ten-bit attachments, each channel widened into the bits it
++        // gains rather than shifted into place; see [`TenBitOrder`].
++        TexelLayout::Rgb10a2Unorm => TenBitOrder::Rgb.expand_row(&src_rgba[..src_len], dst),
++        TexelLayout::Bgr10a2Unorm => TenBitOrder::Bgr.expand_row(&src_rgba[..src_len], dst),
+         // Not colour-attachment layouts this device creates a render target at,
+         // so a seed for one is a wiring error rather than a conversion. What
+         // decides that is `render_target_bpp`, whose doc states the obligation
+@@ -1699,19 +1845,13 @@ pub fn expand_rgba8_to_texel(
+         // the arm is trivial to add when one is. Admitting a layout costs three
+         // conversions and a census line, so they are added on measurement.
+         //
+-        // The three packed 32-bit colour layouts are here because
+-        // `render_target_bpp` does not admit their formats: no guest has been
+-        // observed declaring a render target in one, so there is no seed to
+-        // convert and an arm would be a conversion written against nothing. Add
+-        // both halves together if one is ever measured — the obligation
+-        // `render_target_bpp` states runs in that direction.
++        // `Rg11b10Float` is here because `render_target_bpp` does not admit its
++        // format: no guest has been observed declaring a render target in one.
+         TexelLayout::Rg8
+         | TexelLayout::R32Float
+         | TexelLayout::R16Unorm
+         | TexelLayout::Rg16Unorm
+         | TexelLayout::Rgba16Unorm
+-        | TexelLayout::Rgb10a2Unorm
+-        | TexelLayout::Bgr10a2Unorm
+         | TexelLayout::Rg11b10Float => return false,
+     }
+     true
+@@ -1826,13 +1966,15 @@ pub fn narrow_texel_to_rgba8(
+                 dst_rgba[d + COMPONENT_A] = UNORM8_MAX;
+             }
+         }
++        // The inverses of `expand_rgba8_to_texel`'s ten-bit arms: the top eight
++        // bits of each colour channel, two-bit alpha replicated out.
++        TexelLayout::Rgb10a2Unorm => TenBitOrder::Rgb.narrow_row(&src[..src_len], dst_rgba),
++        TexelLayout::Bgr10a2Unorm => TenBitOrder::Bgr.narrow_row(&src[..src_len], dst_rgba),
+         TexelLayout::Rg8
+         | TexelLayout::R32Float
+         | TexelLayout::R16Unorm
+         | TexelLayout::Rg16Unorm
+         | TexelLayout::Rgba16Unorm
+-        | TexelLayout::Rgb10a2Unorm
+-        | TexelLayout::Bgr10a2Unorm
+         | TexelLayout::Rg11b10Float => return false,
+     }
+     true
+@@ -1881,6 +2023,14 @@ pub fn texel_to_rgba8(format: u16, src: &[u8]) -> Option<[u8; 4]> {
+             rgba[COMPONENT_G] = lut[ld16(&src[2..4]) as usize];
+             rgba[COMPONENT_A] = UNORM8_MAX;
+         }
++        // Lossy in the low two bits of each colour channel; see
++        // [`TexelLayout::cpu_loader_arm_is_lossy`] for what keeps sampled binds
++        // off this arm. A scanout capture lands in an eight-bit console buffer,
++        // so the two bits go there whatever reads them.
++        MTL_FORMAT_RGB10A2_UNORM | MTL_FORMAT_BGR10A2_UNORM => {
++            let order = TenBitOrder::of_format(format)?;
++            rgba = order.word_to_rgba8(u32::from_le_bytes([src[0], src[1], src[2], src[3]]));
++        }
+         _ => return None,
+     }
+     Some(rgba)
+@@ -1937,6 +2087,14 @@ pub fn rgba8_to_texel(format: u16, rgba: [u8; 4], dst: &mut [u8]) -> bool {
+             let lut = unorm8_to_f16_lut();
+             st16(&mut dst[0..2], lut[rgba[COMPONENT_R] as usize]);
+         }
++        // The CPU Store converter for the packed ten-bit targets: the guest's
++        // word, in the guest's channel order, from a semantic-RGBA8 frame.
++        MTL_FORMAT_RGB10A2_UNORM | MTL_FORMAT_BGR10A2_UNORM => {
++            let Some(order) = TenBitOrder::of_format(format) else {
++                return false;
++            };
++            dst[..4].copy_from_slice(&order.rgba8_to_word(rgba).to_le_bytes());
++        }
+         _ => return false,
+     }
+     true
+@@ -1977,11 +2135,21 @@ fn row_walk_backward(
+ /// they do not escape it, and the callers that convert a sampled texture are
+ /// expected to say so — see `runtime::draw::note_sampled_narrowing`.
+ ///
++/// The packed ten-bit pair narrows without clamping: every value fits, and two
++/// bits of each colour channel are dropped. Smaller, still a loss, and still
++/// silent unless named here.
++///
+ /// Asked of the **guest's** `MTLPixelFormat`, which is the only place the
+ /// original width is still known: past the conversion every texel is four bytes
+ /// and nothing downstream can tell a narrowed one from a native one.
+ pub fn narrows_to_unorm8(format: u16) -> bool {
+-    matches!(format, MTL_FORMAT_RGBA16_FLOAT | MTL_FORMAT_RG16_FLOAT)
++    matches!(
++        format,
++        MTL_FORMAT_RGBA16_FLOAT
++            | MTL_FORMAT_RG16_FLOAT
++            | MTL_FORMAT_RGB10A2_UNORM
++            | MTL_FORMAT_BGR10A2_UNORM
++    )
+ }
+ 
+ pub fn convert_row_to_rgba8(format: u16, src: &[u8], pixels: u32, dst_rgba: &mut [u8]) -> bool {
+@@ -3231,12 +3399,19 @@ mod tests {
+             );
+             // The sampled table is the independent statement of the same byte
+             // layout, so a disagreement here is one of the two being wrong.
++            // Named arm by arm. A `_ => Bgra8Unorm` default stood here, which was
++            // true only while BGRA8 was the one remaining member.
+             assert_eq!(
+                 sampled_class(fmt),
+                 Some(match order {
+                     TexelLayout::Rgba8 => SampledClass::Rgba8Unorm,
++                    TexelLayout::Bgra8 => SampledClass::Bgra8Unorm,
+                     TexelLayout::Rgba16Float => SampledClass::Rgba16Float,
+-                    _ => SampledClass::Bgra8Unorm,
++                    TexelLayout::Rgb10a2Unorm => SampledClass::Rgb10a2Unorm,
++                    TexelLayout::Bgr10a2Unorm => SampledClass::Bgr10a2Unorm,
++                    other => {
++                        panic!("{fmt:#x} is copied as {other:?}, which no sampled class names")
++                    }
+                 }),
+                 "{fmt:#x} is read as one layout by the sampler and copied as another"
+             );
+@@ -3258,6 +3433,139 @@ mod tests {
+         );
+     }
+ 
++    /// Both packed ten-bit formats are colour render targets on every rung that
++    /// asks `render_target_bpp` — buffer-backed textures, type-11 surfaces and
++    /// the rest — and a Store of either reaches the byte-copy rail.
++    ///
++    /// macOS 26 and 27 refused about two hundred `RGB10A2Unorm` buffer-texture
++    /// targets a boot (`rt_buffer_texture_format fmt=0x5a`) and their
++    /// `BGR10A2Unorm` WindowServer surfaces (`rt_type11_format fmt=0x5e`).
++    #[test]
++    fn both_ten_bit_orders_are_render_targets_with_an_exact_store() {
++        for (fmt, layout, class) in [
++            (
++                MTL_FORMAT_RGB10A2_UNORM,
++                TexelLayout::Rgb10a2Unorm,
++                SampledClass::Rgb10a2Unorm,
++            ),
++            (
++                MTL_FORMAT_BGR10A2_UNORM,
++                TexelLayout::Bgr10a2Unorm,
++                SampledClass::Bgr10a2Unorm,
++            ),
++        ] {
++            assert_eq!(render_target_bpp(fmt), Some(RGBA8_BPP), "{fmt:#x}");
++            assert_eq!(store_texel_order(fmt), Some(layout), "{fmt:#x}");
++            assert_eq!(sampled_class(fmt), Some(class), "{fmt:#x}");
++            assert!(narrows_to_unorm8(fmt), "{fmt:#x} narrows on the CPU rails");
++        }
++        // The integer twin stays out: no unorm converter may read it.
++        assert_eq!(render_target_bpp(MTL_FORMAT_RGB10A2_UINT), None);
++        assert_eq!(store_texel_order(MTL_FORMAT_RGB10A2_UINT), None);
++    }
++
++    /// Each colour channel lands in the bits Metal's format names and the
++    /// matching Vulkan format reads: red low for `RGB10A2Unorm`
++    /// (`A2B10G10R10_UNORM_PACK32`), blue low for `BGR10A2Unorm`
++    /// (`A2R10G10B10_UNORM_PACK32`), green in the middle and alpha on top for
++    /// both. Stated as words, so a channel in the wrong bits fails here rather
++    /// than as a tinted frame.
++    #[test]
++    fn the_ten_bit_words_put_each_channel_where_metal_says() {
++        let store = |fmt: u16, rgba: [u8; 4]| {
++            let mut word = [0u8; 4];
++            assert!(rgba8_to_texel(fmt, rgba, &mut word), "{fmt:#x}");
++            u32::from_le_bytes(word)
++        };
++        let rgb = MTL_FORMAT_RGB10A2_UNORM;
++        let bgr = MTL_FORMAT_BGR10A2_UNORM;
++        assert_eq!(store(rgb, [0xff, 0, 0, 0]), 0x3ff);
++        assert_eq!(store(rgb, [0, 0xff, 0, 0]), 0x3ff << 10);
++        assert_eq!(store(rgb, [0, 0, 0xff, 0]), 0x3ff << 20);
++        assert_eq!(store(rgb, [0, 0, 0, 0xff]), 0xc000_0000);
++        assert_eq!(store(bgr, [0xff, 0, 0, 0]), 0x3ff << 20);
++        assert_eq!(store(bgr, [0, 0xff, 0, 0]), 0x3ff << 10);
++        assert_eq!(store(bgr, [0, 0, 0xff, 0]), 0x3ff);
++        assert_eq!(store(bgr, [0, 0, 0, 0xff]), 0xc000_0000);
++        // The word goes to guest memory little-endian, as Metal stores it.
++        let mut bytes = [0u8; 4];
++        assert!(rgba8_to_texel(rgb, [0xff, 0, 0, 0], &mut bytes));
++        assert_eq!(bytes, [0xff, 0x03, 0, 0]);
++    }
++
++    /// Known ten-bit words read back as the eight-bit colour a shader would see
++    /// at that precision, in both channel orders, through every CPU reader.
++    #[test]
++    fn a_ten_bit_word_reads_as_its_top_eight_bits_in_either_order() {
++        // Low field 0x3ff, green 0x200, high field 0x001, alpha 0b10.
++        let word: u32 = 0x3ff | (0x200 << 10) | (0x001 << 20) | (0b10 << 30);
++        let bytes = word.to_le_bytes();
++        assert_eq!(
++            texel_to_rgba8(MTL_FORMAT_RGB10A2_UNORM, &bytes),
++            Some([0xff, 0x80, 0x00, 0xaa]),
++            "RGB10A2Unorm: red is the low field"
++        );
++        assert_eq!(
++            texel_to_rgba8(MTL_FORMAT_BGR10A2_UNORM, &bytes),
++            Some([0x00, 0x80, 0xff, 0xaa]),
++            "BGR10A2Unorm: blue is the low field"
++        );
++        // The row converter, which the scanout capture calls, and the layout
++        // narrow, which the readback rails call, agree with the texel reader.
++        for (fmt, layout) in [
++            (MTL_FORMAT_RGB10A2_UNORM, TexelLayout::Rgb10a2Unorm),
++            (MTL_FORMAT_BGR10A2_UNORM, TexelLayout::Bgr10a2Unorm),
++        ] {
++            let row: Vec<u8> = [word, 0, u32::MAX].iter().flat_map(|w| w.to_le_bytes()).collect();
++            let mut by_row = vec![0u8; row.len()];
++            assert!(convert_row_to_rgba8(fmt, &row, 3, &mut by_row));
++            let mut by_layout = vec![0u8; row.len()];
++            assert!(narrow_texel_to_rgba8(layout, &row, 3, &mut by_layout));
++            assert_eq!(by_row, by_layout, "{fmt:#x}");
++            assert_eq!(&by_row[..4], &texel_to_rgba8(fmt, &bytes).unwrap()[..]);
++            assert_eq!(&by_row[4..8], &[0, 0, 0, 0]);
++            assert_eq!(&by_row[8..], &[0xff; 4]);
++        }
++    }
++
++    /// The seed, the readback and the Store write and read one word: every
++    /// eight-bit value survives widening to ten bits and back, and the CPU Store
++    /// converter writes exactly what the seed expansion does, so the guest's
++    /// pages hold its own format whichever rail landed them.
++    #[test]
++    fn a_ten_bit_texel_survives_the_seed_readback_and_store_rails() {
++        let rgba: Vec<u8> = (0..=255u8)
++            .flat_map(|v| [v, v.wrapping_mul(7), 255 - v, v & 0xc0 | 0x3f])
++            .collect();
++        let pixels = (rgba.len() / 4) as u32;
++        for (fmt, layout) in [
++            (MTL_FORMAT_RGB10A2_UNORM, TexelLayout::Rgb10a2Unorm),
++            (MTL_FORMAT_BGR10A2_UNORM, TexelLayout::Bgr10a2Unorm),
++        ] {
++            let mut seeded = vec![0u8; rgba.len()];
++            assert!(expand_rgba8_to_texel(layout, &rgba, pixels, &mut seeded));
++            let mut stored = vec![0u8; rgba.len()];
++            assert!(convert_rgba8_to_row(fmt, &rgba, pixels, &mut stored));
++            assert_eq!(stored, seeded, "{fmt:#x}: the Store and the seed disagree");
++            let mut back = vec![0u8; rgba.len()];
++            assert!(narrow_texel_to_rgba8(layout, &seeded, pixels, &mut back));
++            // Alpha keeps two bits, so compare it at that precision; the colour
++            // channels come back exactly.
++            let (got, _) = back.as_chunks::<4>();
++            let (want, _) = rgba.as_chunks::<4>();
++            for (i, (got, want)) in got.iter().zip(want).enumerate() {
++                assert_eq!(&got[..3], &want[..3], "{fmt:#x} texel {i}");
++                assert_eq!(got[3], (want[3] >> 6) * 0x55, "{fmt:#x} texel {i} alpha");
++            }
++        }
++        // The two orders hold the same colour with red and blue exchanged.
++        let mut rgb = [0u8; 4];
++        let mut bgr = [0u8; 4];
++        assert!(rgba8_to_texel(MTL_FORMAT_RGB10A2_UNORM, [10, 20, 30, 255], &mut rgb));
++        assert!(rgba8_to_texel(MTL_FORMAT_BGR10A2_UNORM, [30, 20, 10, 255], &mut bgr));
++        assert_eq!(rgb, bgr);
++    }
++
+     #[test]
+     fn unsupported_fail_closed() {
+         // Unknown formats fail closed. Depth/stencil families have bpp for blit
+diff --git a/crates/reims-vgpu/src/runtime/census/present_proxy.rs b/crates/reims-vgpu/src/runtime/census/present_proxy.rs
+index d2a24a1a..8ee01ceb 100644
+--- a/crates/reims-vgpu/src/runtime/census/present_proxy.rs
++++ b/crates/reims-vgpu/src/runtime/census/present_proxy.rs
+@@ -64,7 +64,8 @@ pub enum MrtDrop {
+     NonContiguousSlot,
+     /// A secondary attachment's geometry differs from the primary's.
+     GeometryMismatch,
+-    /// The secondary's pixel format has no known engine mapping.
++    /// The secondary's pixel format has no known engine mapping, or has one this
++    /// host published no colour-attachment support for.
+     UnknownFormat,
+     /// The secondary target has no resident identity to render into.
+     NoIdentity,
+diff --git a/crates/reims-vgpu/src/runtime/draw/mod.rs b/crates/reims-vgpu/src/runtime/draw/mod.rs
+index 61871fa2..9a80beaa 100644
+--- a/crates/reims-vgpu/src/runtime/draw/mod.rs
++++ b/crates/reims-vgpu/src/runtime/draw/mod.rs
+@@ -1789,9 +1789,16 @@ pub(crate) fn note_sampled_narrowing(
+     if !crate::observe::first_sight(site, key) {
+         return;
+     }
++    // A ten-bit unorm channel always fits; only its low two bits go.
++    let lost = match fmt {
++        pixel_format::MTL_FORMAT_RGB10A2_UNORM | pixel_format::MTL_FORMAT_BGR10A2_UNORM => {
++            "256_levels"
++        }
++        _ => "clamp_to_unit_and_256_levels",
++    };
+     crate::observe::fail(format!(
+         "sampled_texture_narrowed reason={site} ref={texture_ref} fmt={fmt:#x} {w}x{h} \
+-         to=rgba8 lost=clamp_to_unit_and_256_levels"
++         to=rgba8 lost={lost}"
+     ));
+ }
+ 
+@@ -1871,9 +1878,11 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
+     for y in 0..h as usize {
+         let src = &raw[y * bpr..y * bpr + tight];
+         let dst = &mut rgba[y * dst_row..(y + 1) * dst_row];
+-        if !pixel_format::convert_row_to_rgba8(fmt, src, w, dst)
+-            && !ten_bit_row_to_rgba8(fmt, src, dst)
+-        {
++        // The packed ten-bit icons 26 and 27 draw from buffer textures narrow
++        // here through the shared converter, the same arm the scanout capture
++        // and the readback rails use, so every eight-bit reading of one word
++        // agrees.
++        if !pixel_format::convert_row_to_rgba8(fmt, src, w, dst) {
+             crate::observe::fail(format!(
+                 "buftex convert_fail ref={texture_ref} buf={} fmt={fmt:#x} row={y} {w}x{h}",
+                 bt.buffer_ref
+@@ -1884,28 +1893,6 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
+     Some((w, h, rgba))
+ }
+ 
+-/// One row of RGB10A2 or BGR10A2 texels narrowed to RGBA8, for the buffer-texture
+-/// loader alone. 26 and 27 draw their Setup Assistant icons from buffer textures
+-/// in these formats; the shared converters decline them on purpose, because
+-/// everywhere else the ten bits are kept by sampling the format natively.
+-fn ten_bit_row_to_rgba8(format: u16, src: &[u8], dst: &mut [u8]) -> bool {
+-    use crate::contract::pixel_format::{MTL_FORMAT_BGR10A2_UNORM, MTL_FORMAT_RGB10A2_UNORM};
+-    if format != MTL_FORMAT_RGB10A2_UNORM && format != MTL_FORMAT_BGR10A2_UNORM {
+-        return false;
+-    }
+-    for (texel, out) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+-        let word = u32::from_le_bytes([texel[0], texel[1], texel[2], texel[3]]);
+-        let (low, high) = ((word >> 2) as u8, (word >> 22) as u8);
+-        let (r, b) = if format == MTL_FORMAT_RGB10A2_UNORM {
+-            (low, high)
+-        } else {
+-            (high, low)
+-        };
+-        out.copy_from_slice(&[r, (word >> 12) as u8, b, ((word >> 30) as u8) * 85]);
+-    }
+-    true
+-}
+-
+ fn index_elem_size(index_type: u32) -> Option<usize> {
+     match index_type {
+         0 => Some(2), // MTLIndexTypeUInt16
+diff --git a/crates/reims-vgpu/src/runtime/draw/render_target.rs b/crates/reims-vgpu/src/runtime/draw/render_target.rs
+index e514d4d4..bacc3b18 100644
+--- a/crates/reims-vgpu/src/runtime/draw/render_target.rs
++++ b/crates/reims-vgpu/src/runtime/draw/render_target.rs
+@@ -1621,6 +1621,56 @@ mod tests {
+         }
+     }
+ 
++    /// A type-11 surface declared in either packed ten-bit order is a render
++    /// target at that format, and its integer twin is still refused by name.
++    ///
++    /// macOS 26 and 27 render WindowServer surfaces in `BGR10A2Unorm`; each pass
++    /// was refused as `rt_type11_format fmt=0x5e`, and the pass that sampled the
++    /// surface afterwards found no bytes anywhere (`texture_resolve_missing`).
++    #[test]
++    fn a_type11_surface_in_either_ten_bit_order_is_a_render_target() {
++        use crate::contract::pixel_format::{
++            MTL_FORMAT_BGR10A2_UNORM, MTL_FORMAT_RGB10A2_UINT, MTL_FORMAT_RGB10A2_UNORM,
++        };
++        for (mid, tex_ref, format) in [
++            (91, 0x5d0u32, MTL_FORMAT_BGR10A2_UNORM),
++            (92, 0x5d1, MTL_FORMAT_RGB10A2_UNORM),
++            (93, 0x5d2, MTL_FORMAT_RGB10A2_UINT),
++        ] {
++            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
++            let host = FakeHost::new();
++            assert!(state.map_surface(mid));
++            {
++                let m = state.mappings.get_mut(&mid).unwrap();
++                m.has_geom = true;
++                m.width = 276;
++                m.height = 115;
++                m.format = format;
++            }
++            state.texture_to_mapping.insert((3, tex_ref), mid);
++
++            let cap = crate::observe::FailCapture::start();
++            let rt = lookup_render_target(&mut state, &host, 3, attach(tex_ref));
++            if format == MTL_FORMAT_RGB10A2_UINT {
++                assert!(rt.is_none(), "an integer word has no unorm converter");
++                let line = cap.one("rt_resolve");
++                assert!(line.starts_with("rt_resolve reason=rt_type11_format "), "{line}");
++                continue;
++            }
++            let rt = rt.unwrap_or_else(|| panic!("{format:#x}: {:?}", cap.lines()));
++            assert_eq!(
++                (rt.mapping_id, rt.width, rt.height, rt.format),
++                (mid, 276, 115, format),
++                "{format:#x}"
++            );
++            assert!(
++                !cap.lines().iter().any(|l| l.starts_with("rt_resolve")),
++                "{format:#x}: {:?}",
++                cap.lines()
++            );
++        }
++    }
++
+     /// A refusal is reported once per attachment per check, not once per draw.
+     ///
+     /// The guest re-issues the same pass every frame, so this path is entered
+diff --git a/crates/reims-vgpu/src/runtime/draw/tests.rs b/crates/reims-vgpu/src/runtime/draw/tests.rs
+index f66c15d9..877973e2 100644
+--- a/crates/reims-vgpu/src/runtime/draw/tests.rs
++++ b/crates/reims-vgpu/src/runtime/draw/tests.rs
+@@ -2039,6 +2039,42 @@ fn a_padded_half_float_row_copies_straight_through_at_eight_bytes_a_texel() {
+     );
+ }
+ 
++/// A packed ten-bit texture keeps its own word on the CPU-origin sampled rail
++/// when the caller carries the layout, and narrows to the top eight bits of
++/// each channel when it does not (the colour LOAD seed's answer). Both orders,
++/// so an R/B exchange on either path fails here.
++#[test]
++fn a_ten_bit_sampled_texture_keeps_its_word_or_narrows_by_the_callers_answer() {
++    // Low field full, green half, high field empty, alpha full.
++    let word: u32 = 0x3ff | (0x200 << 10) | (0b11 << 30);
++    for (format, layout, narrowed) in [
++        (
++            pixel_format::MTL_FORMAT_RGB10A2_UNORM,
++            TexelLayout::Rgb10a2Unorm,
++            [0xff, 0x80, 0x00, 0xff],
++        ),
++        (
++            pixel_format::MTL_FORMAT_BGR10A2_UNORM,
++            TexelLayout::Bgr10a2Unorm,
++            [0x00, 0x80, 0xff, 0xff],
++        ),
++    ] {
++        let load = |native: NativeUploads| {
++            load_tight_linear_rgba_with(1, 1, 1, format, native, "test_tight_load", |dst| {
++                dst.copy_from_slice(&word.to_le_bytes());
++                true
++            })
++            .expect("a ten-bit sample loads")
++        };
++        let (bytes, fmt) = load(NativeUploads::ALL);
++        assert_eq!(fmt.layout(), layout, "{format:#x}");
++        assert_eq!(bytes, word.to_le_bytes(), "{format:#x}: the guest's word, unconverted");
++        let (bytes, fmt) = load(NativeUploads::NONE);
++        assert_eq!(fmt.layout(), TexelLayout::Rgba8, "{format:#x}");
++        assert_eq!(bytes, narrowed, "{format:#x}");
++    }
++}
++
+ #[test]
+ fn tight_rgba_linear_load_preserves_native_bytes() {
+     let native = [1, 2, 3, 4, 5, 6, 7, 8];
+diff --git a/crates/reims-vgpu/src/runtime/draw/texture_view.rs b/crates/reims-vgpu/src/runtime/draw/texture_view.rs
+index 11067f6d..2644fd4d 100644
+--- a/crates/reims-vgpu/src/runtime/draw/texture_view.rs
++++ b/crates/reims-vgpu/src/runtime/draw/texture_view.rs
+@@ -667,6 +667,11 @@ pub(crate) struct NativeUploads {
+     /// `f16_to_unorm8_lut`, which clamps to `[0, 1]` and quantizes to 256
+     /// levels; see [`pixel_format::TexelLayout::cpu_loader_arm_is_lossy`].
+     pub float16: bool,
++    /// Upload guest packed ten-bit colour (`RGB10A2Unorm`, `BGR10A2Unorm`) as
++    /// the identical `A2B10G10R10` / `A2R10G10B10` `_UNORM_PACK32` word. The
++    /// only exact path, for `float16`'s reason: the CPU arm keeps eight of each
++    /// channel's ten bits.
++    pub ten_bit: bool,
+ }
+ 
+ impl NativeUploads {
+@@ -675,6 +680,7 @@ impl NativeUploads {
+     pub const NONE: Self = Self {
+         bgra8: false,
+         float16: false,
++        ten_bit: false,
+     };
+ 
+     /// Native BGRA8 only — the answer this parameter carried when it was a
+@@ -689,6 +695,7 @@ impl NativeUploads {
+     pub const BGRA8: Self = Self {
+         bgra8: true,
+         float16: false,
++        ten_bit: false,
+     };
+ 
+     /// Every native layout the loaders can produce.
+@@ -701,6 +708,7 @@ impl NativeUploads {
+     pub const ALL: Self = Self {
+         bgra8: true,
+         float16: true,
++        ten_bit: true,
+     };
+ }
+ 
+@@ -730,6 +738,8 @@ pub(crate) fn linear_native_upload_format(
+         SampledClass::Bgra8Unorm if native.bgra8 => TexelLayout::Bgra8,
+         SampledClass::Rgba16Float if native.float16 => TexelLayout::Rgba16Float,
+         SampledClass::Rg16Float if native.float16 => TexelLayout::Rg16Float,
++        SampledClass::Rgb10a2Unorm if native.ten_bit => TexelLayout::Rgb10a2Unorm,
++        SampledClass::Bgr10a2Unorm if native.ten_bit => TexelLayout::Bgr10a2Unorm,
+         _ => return None,
+     })
+ }
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index 5a8e553e..9dba85da 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -2598,11 +2598,10 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
+     // fires, not before.
+     //
+     // The packed 32-bit colour formats take the native rail for the same
+-    // reason and a sharper one: their channel boundaries are not byte
+-    // boundaries, so `TexelLayout::Rgba8` would not merely quantize them, it
+-    // would read the word as four unrelated bytes. Four bytes wide is exactly
+-    // what the default arm below tests for and exactly what makes that wrong,
+-    // which is why they are named here rather than left to it.
++    // reason: the default arm below would cut each ten- or eleven-bit channel
++    // down to eight (or, for `RG11B10Float`, find no converter at all). Four
++    // bytes wide is exactly what the default arm tests for, which is why they
++    // are named here rather than left to it.
+     // The layout is the view's own; the transfer function travels with it,
+     // because the default arm below converts to RGBA8 order and decodes nothing.
+     let byte_format = SampledByteFormat::from_source(
+@@ -5022,11 +5021,11 @@ fn native_scratch_to_upload(
+ /// **Keyed on the format so the common one never asks an irrelevant question.**
+ /// The host capability is a lock-free device-lifetime snapshot, but this sits
+ /// on the rung carrying essentially all of the pathway's sampled traffic and
+-/// only two guest formats can make use of the answer.
++/// only four guest formats can make use of the answer.
+ /// [`pixel_format::narrows_to_unorm8`] is exactly the set of formats whose CPU
+-/// arm is lossy, which is exactly the set the half-float flag can change the
+-/// answer for — so keying on it is the same rule stated once, not a fast path
+-/// that could disagree with the slow one.
++/// arm is lossy, which is exactly the set the half-float and ten-bit flags can
++/// change the answer for — so keying on it is the same rule stated once, not a
++/// fast path that could disagree with the slow one.
+ fn native_uploads_for(sample_format: u16) -> NativeUploads {
+     if !pixel_format::narrows_to_unorm8(sample_format) {
+         return NativeUploads::BGRA8;
+@@ -5050,6 +5049,11 @@ fn native_uploads_asking_host() -> NativeUploads {
+         // would be two fields nobody could point at a host that needed them.
+         float16: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba16Float)
+             && engine::supports_sampled_layout_linear_filter(TexelLayout::Rg16Float),
++        // The same conjunction for the two ten-bit orders. Vulkan requires the
++        // filter for `A2B10G10R10_UNORM_PACK32` and not for its sibling, so the
++        // answer is asked rather than assumed.
++        ten_bit: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgb10a2Unorm)
++            && engine::supports_sampled_layout_linear_filter(TexelLayout::Bgr10a2Unorm),
+         ..NativeUploads::BGRA8
+     }
+ }
+@@ -6303,7 +6307,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
+         // Unknown wire format stays unknown — never guess a secondary layout —
+         // and a known format whose sRGB qualifier this attachment cannot carry
+         // says so instead of folding silently.
+-        let format = match translate::pixel::color_attachment(c.format) {
++        let format = match host_color_attachment(c.format) {
+             Ok((format, decline)) => {
+                 if decline.is_some() {
+                     srgb_census::note_downgrade(
+@@ -8988,7 +8992,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+         resources.vertex_count = vertex_count;
+         if let Some(c0) = req.colors.first() {
+             resources.color_attachment_format = Some(
+-                translate::pixel::color_attachment(c0.format)
++                host_color_attachment(c0.format)
+                     .map_err(|reason| {
+                         DrawError::Unsupported(
+                             crate::backend::vulkan::engine::reason::DrawReason::ColorAttachmentFormat(reason),
+@@ -10161,6 +10165,29 @@ pub(crate) fn gva_chain_identity(
+     })
+ }
+ 
++/// The colour attachment a pass declaring `format` renders through, or the
++/// reason this host cannot create one.
++///
++/// [`translate::pixel::color_attachment`] answers the contract half — may a
++/// colour attachment be this format at all. The attachment image is created at
++/// that answer, so the host half is asked here, before anything is created:
++/// Vulkan leaves colour-attachment support optional for some renderable
++/// formats, and `A2R10G10B10_UNORM_PACK32` (`BGR10A2Unorm`) is one. A host that
++/// published no such support refuses the pass by name instead of being handed
++/// an image it cannot render to.
++fn host_color_attachment(
++    format: u16,
++) -> Result<(ash::vk::Format, Option<translate::TranslateReason>), translate::TranslateReason> {
++    let resolved = translate::pixel::color_attachment(format)?;
++    let allocation = translate::pixel::ResidentFormat::of(resolved.0).allocation();
++    if translate::pixel::texel_layout_of(allocation)
++        .is_some_and(crate::backend::vulkan::engine::render_target_layout_declined)
++    {
++        return Err(translate::TranslateReason::NoColorAttachmentFormat(format));
++    }
++    Ok(resolved)
++}
++
+ /// The format the resident behind a GVA render target must hold: the one the
+ /// guest declared for that attachment.
+ ///
+-- 
+2.43.0
+
