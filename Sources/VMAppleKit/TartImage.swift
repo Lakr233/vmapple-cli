@@ -142,7 +142,8 @@ public enum ImagePull {
                 diskBytes: image.diskBytes,
                 handoffAddresses: try system.handoffAddresses(),
                 installed: system.version.map { "\($0) (\(system.build ?? "?"))" },
-                image: "\(reference.registry)/\(reference.repository)@\(digest)"
+                image: "\(reference.registry)/\(reference.repository)@\(digest)",
+                inlineEncryption: false
             )
             try VirtualMachine(directory: staging, configuration: configuration).save(configuration)
             try FileManager.default.moveItem(at: staging, to: directory)

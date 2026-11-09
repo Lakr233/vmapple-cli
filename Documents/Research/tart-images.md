@@ -73,3 +73,66 @@ files, which Preboot is. Checked against seven VMs restored by vmapple-cli
 (13.6, 14.6.1, 15.6.1 twice, 26.6.2 twice, 27.2): the Preboot iBoot gave the
 same handoff addresses and version that `restore` recorded from each IPSW
 (`PrebootTests`, with `VMAPPLE_TEST_VM` set to the VM's directory).
+
+## Booting
+
+A pulled 27.2 first panicked mounting its Data volume: `"unencrypted data
+volume is not allowed" @apfs_vfsops.c:2399`. The Data volume of a Tart image is
+unencrypted (`fs_flags` 0x1); a VM restored by vmapple-cli has an encrypted one
+(0x100). Its file-system tree is plaintext with valid checksums, so no key is
+missing. The difference is what each guest was told about its disk.
+
+What the 27.2 kernel does (kernelcache.release.vma2, 26B123):
+
+- `apfs_mount_crypto_check` panics for an unencrypted Data volume when the
+  device's encryption type is non-zero. It passes if `/filesystems` has
+  `DoNotUseSEP`, if `csr_check(CSR_ALLOW_APPLE_INTERNAL)` passes, or if the
+  device has `DK_FEATURE_PRIORITY`. The encryption type is `DKIOCGETENCRYPTIONTYPE`,
+  which AppleVirtIOStorage answers from its `Encryption Type`.
+- `AppleVirtIOStorageDevice::start` sets that to AES-XTS unless the disk carries
+  a vendor configuration: a virtio-pci capability with `cfg_type` 9
+  (`VIRTIO_PCI_CAP_VENDOR_CFG`) and vendor ID 0x106b, the data inline in PCI
+  configuration space after the six-byte header. With legacy feature bit 0 set,
+  the disk does not encrypt. The data starts with legacy features (u64), version
+  (u32), compatible size (u32), features (u64) and extended request size (u32).
+  The driver writes the negotiated fields back in place and checks the byte
+  count, not the contents.
+- Virtualization.framework builds this for its macOS disks in
+  `AvpVirtioBlockDevice` (`com.apple.Virtualization.VirtualMachine`, macOS 27):
+  legacy features 3, version 1, compatible size 0x1c, features 0, extended
+  request size 0x60.
+
+`Patches/qemu` 0017 adds `vendor-legacy-features` to `vmapple-virtio-blk-pci`;
+`boot` sets it to 3 on the root disk of a VM whose `vm.json` has
+`inlineEncryption: false`, which `pull` writes. The extended request size is 0,
+not the framework's 0x60. Offered 0x60, the guest started the disk, reached
+`DRIVER_OK` and sent it no request, so the boot waited for its root and went to
+Recovery. QEMU does not parse extended requests.
+
+Ruled out on the way, with the framework and the 27.2 kernel:
+
+- A Secure Enclave. `vma2` has none: the framework ships `AVPSEPBooter` only
+  for `vresearch1`, and OpenSEP stands in for that one. The guest's keystore is
+  AppleVPKeyStore, without a SEP.
+- Machine-bound keys. The framework's `AppleAesEngine` fills key selects 1 to 3
+  with `{1}`, `{2}` and `{3}` followed by zeros: `uid1_key` is a constant in the
+  binary, and 2 and 3 are set in the constructor. QEMU's `hw/vmapple/aes.c` has
+  the same values. `AppleVirtualPlatformHostKeyData` is the host's identity key
+  for the guest's strong identity, not storage.
+- `nvram.bin`. Its 16 KiB header carries no key; the rest is the same layout as
+  a restored VM's AUX.
+
+Run on the DGX on 2026-11-09, QEMU `hmacos-arm` + `Patches/qemu` 0001–0017,
+OpenAVB `c35e417`, `macos-golden-gate-vanilla:27.2` pulled fresh:
+
+1. Without 0017: the Data volume panic above, every boot.
+2. 0017 with extended request size 0x60: no request reached the root disk;
+   Recovery panic (`Reboot into Recovery`).
+3. Extended request size 0: Data mounted, `loginwindow` started.
+4. A cold boot to the desktop (logged in automatically, "Your Mac has been
+   updated to macOS 27.2"), `stop`, then a second cold boot to the desktop. No
+   panic in either.
+
+A boot that `boot --seconds` ends in userspace can leave the disk unbootable:
+after one such run, two later boots stopped in iBootStage1. The pulled disk was
+deleted and pulled again before step 4. Use `stop`.

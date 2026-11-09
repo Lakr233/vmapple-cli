@@ -113,15 +113,17 @@ installed version and kernel handoff from the disk's Preboot volume, so a pulled
 VM needs no `restore` or `account`. The format and that read are covered in
 [Research/tart-images.md](Research/tart-images.md).
 
-**A pulled image does not boot on this stack yet.** These images are restored on
-a Mac by Virtualization.framework, which has a Secure Enclave; the Data volume's
-media key is sealed in the SEP's xART. QEMU's `vmapple` has no SEP, so the guest
-cannot load the xART or derive the volume key and the kernel panics mounting the
-Data volume (`unencrypted data volume is not allowed`, then, past that gate,
-`M key derive-from-D failed` in xART). This is cryptographic, not a policy gate,
-so no host-side patch opens it. A VM that vmapple-cli restored itself boots
-because its whole restore ran on the same SEP-less machine. `pull` is therefore
-format compatibility for now, not a boot path.
+A pulled VM boots with `Patches/qemu` 0017. Virtualization.framework tells a
+macOS guest that its disk does not encrypt inline, so a disk it restored has an
+unencrypted Data volume. QEMU's virtio disk said nothing, so the guest assumed
+AES-XTS and panicked mounting that volume (`unencrypted data volume is not
+allowed`). `pull` records `inlineEncryption: false` in `vm.json`, and `boot` then
+gives the root disk the same vendor configuration as the framework. A VM that
+`restore` made keeps the old disk, whose Data volume is encrypted. Measured on
+2026-11-09 with `macos-golden-gate-vanilla:27.2`: two cold boots to the desktop,
+logged in automatically, and no panic. The Dock icons are grey placeholders, as
+on a restored 27.2. The causes and the checks are in
+[Research/tart-images.md](Research/tart-images.md).
 
 ## Build
 
