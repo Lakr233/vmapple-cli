@@ -3,7 +3,8 @@
 // forwarded to user space, PSCI 1.1, and pointer authentication.
 //
 // The guest payload and page tables follow probes/kvm/probe.c from
-// Hackintosh-on-DGXSpark/hmacos-arm (MIT).
+// Hackintosh-on-DGXSpark/hmacos-arm, Copyright (c) 2026 Icegrave0391, used under
+// the MIT License, whose text is in LICENSE.
 #define _GNU_SOURCE
 #include "ckvmprobe.h"
 
@@ -20,6 +21,19 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+// Linux 6.4's SMCCC filter, for building against older kernel headers.
+#ifndef KVM_ARM_VM_SMCCC_CTRL
+#define KVM_ARM_VM_SMCCC_CTRL 0
+#define KVM_ARM_VM_SMCCC_FILTER 0
+#define KVM_SMCCC_FILTER_FWD_TO_USER 2
+struct kvm_smccc_filter {
+    __u32 base;
+    __u32 nr_functions;
+    __u8 action;
+    __u8 pad[15];
+};
+#endif
 
 #define RAM_BYTES (2UL * 1024 * 1024)
 #define GUEST_BASE UINT64_C(0x40000000)
