@@ -121,8 +121,10 @@ allowed`). `pull` records `inlineEncryption: false` in `vm.json`, and `boot` the
 gives the root disk the same vendor configuration as the framework. A VM that
 `restore` made keeps the old disk, whose Data volume is encrypted. Measured on
 2026-11-09 with `macos-golden-gate-vanilla:27.2`: two cold boots to the desktop,
-logged in automatically, and no panic. The Dock icons are grey placeholders, as
-on a restored 27.2. The causes and the checks are in
+logged in automatically, and no panic. Later that day a fresh pull and that disk
+were booted again after runs that `boot --seconds` ended at 15 to 150 s and after
+a QEMU killed in userspace, and every boot reached `loginwindow`. The Dock icons
+are grey placeholders, as on a restored 27.2. The causes and the checks are in
 [Research/tart-images.md](Research/tart-images.md).
 
 ## Build

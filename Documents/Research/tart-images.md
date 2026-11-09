@@ -133,6 +133,20 @@ OpenAVB `c35e417`, `macos-golden-gate-vanilla:27.2` pulled fresh:
    updated to macOS 27.2"), `stop`, then a second cold boot to the desktop. No
    panic in either.
 
-A boot that `boot --seconds` ends in userspace can leave the disk unbootable:
-after one such run, two later boots stopped in iBootStage1. The pulled disk was
-deleted and pulled again before step 4. Use `stop`.
+During those runs, after a boot that `boot --seconds` ended in userspace, two
+later boots of that disk stopped in iBootStage1, and the disk was pulled again
+before step 4. That disk had also been through step 2's Recovery panic.
+
+Rerun on the DGX on 2026-11-09 with the same pieces, on an image pulled fresh
+and on the step 4 disk, every run followed by a boot of 100 to 120 s:
+
+- `boot --seconds` 15, 40 and 150 on the step 4 disk, and 90 on the fresh
+  disk's first boot (the one that finishes the update): each answered the power
+  button, reached `ApplePSCI - system off`, and the next boot went through
+  iBootStage1 and iBootStage2 to `loginwindow`.
+- QEMU killed with SIGKILL 75 s into a boot, after `loginwindow` started: the
+  next boot also went through to `loginwindow` and shut down cleanly.
+
+The iBootStage1 stop did not happen again, so `--seconds` is not what caused
+it. `boot --seconds` used to sleep the whole time even after QEMU had ended; it
+now returns when QEMU does.
