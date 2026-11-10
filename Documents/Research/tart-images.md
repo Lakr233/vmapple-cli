@@ -149,4 +149,6 @@ and on the step 4 disk, every run followed by a boot of 100 to 120 s:
 
 The iBootStage1 stop did not happen again, so `--seconds` is not what caused
 it. `boot --seconds` used to sleep the whole time even after QEMU had ended; it
-now returns when QEMU does.
+now returns when QEMU does. Killing the `boot` runner instead also left its
+QEMU open on the disk while the next boot started; see
+[two-qemus-one-disk-2026-11-10.md](two-qemus-one-disk-2026-11-10.md).

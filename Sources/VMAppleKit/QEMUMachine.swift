@@ -29,9 +29,11 @@ public enum QEMUError: Error, CustomStringConvertible {
     case exited(Int32)
     case timeout(String)
     case refused(String)
+    case alreadyRunning(String)
 
     public var description: String {
         switch self {
+        case .alreadyRunning(let path): "\(path) is already running; stop it first"
         case .exited(let status): "QEMU exited with \(status)"
         case .timeout(let what): "timed out waiting for \(what)"
         case .refused(let message): "QEMU refused: \(message)"
@@ -44,6 +46,7 @@ public final class QEMUMachine: @unchecked Sendable {
     public let machine: VirtualMachine
     private let options: QEMUOptions
     private let process = Process()
+    private var signalSources: [DispatchSourceSignal] = []
 
     public init(machine: VirtualMachine, options: QEMUOptions) {
         self.machine = machine
@@ -107,6 +110,13 @@ public final class QEMUMachine: @unchecked Sendable {
     }
 
     public func start() throws {
+        // The disks are opened without locks, so a second QEMU on them would
+        // write the same blocks. One left behind by a killed `boot` still
+        // listens on its monitor socket.
+        if let monitor = try? UnixSocket.connect(path: machine.qmpSocket.path) {
+            monitor.close()
+            throw QEMUError.alreadyRunning(machine.directory.path)
+        }
         for url in [machine.serialLog, machine.serialSocket, machine.qemuLog, machine.qmpSocket, machine.usbSocket, machine.guestMemory] {
             try? FileManager.default.removeItem(at: url)
         }
@@ -146,6 +156,33 @@ public final class QEMUMachine: @unchecked Sendable {
         process.environment = environment
         process.currentDirectoryURL = machine.directory
         try process.run()
+        endWithThisProcess()
+    }
+
+    /// QEMU does not notice its parent going, so a `boot` ended by a signal
+    /// takes it along.
+    private func endWithThisProcess() {
+        for number in [SIGTERM, SIGINT, SIGHUP] {
+            signal(number, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: number, queue: .global())
+            source.setEventHandler { [process] in
+                Self.terminate(process)
+                exit(128 + number)
+            }
+            source.resume()
+            signalSources.append(source)
+        }
+    }
+
+    /// Sends SIGTERM and, if QEMU still runs after `timeout`, SIGKILL. QEMU
+    /// can take a minute to act on SIGTERM under a busy guest.
+    static func terminate(_ process: Process, timeout: TimeInterval = 90) {
+        guard process.isRunning else { return }
+        process.terminate()
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        while process.isRunning, Date() < deadline { usleep(50_000) }
+        if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+        process.waitUntilExit()
     }
 
     public var isRunning: Bool {
@@ -199,9 +236,7 @@ public final class QEMUMachine: @unchecked Sendable {
     }
 
     public func stop() {
-        guard process.isRunning else { return }
-        process.terminate()
-        process.waitUntilExit()
+        Self.terminate(process)
     }
 
     /// Shuts macOS down if it answers the power button, and switches off otherwise.
