@@ -28,9 +28,9 @@ not booted with it. Causes, fixes and what is still wrong:
 [stability-2026-11-09.md](Research/stability-2026-11-09.md).
 
 Reims 0041–0045 are for 27.2's Dock icons and were run on 2026-11-10: a pulled
-27.2 twice to its desktop, and 13.6, 14.6.1, 15.6.1, 26.6.2 and a restored 27.2
-once each to the login window or the first setup panel, without logging in and
-with no panic. What they fix and what is left:
+27.2, a restored 13.6 and a restored 26.6.2 to their desktops, and 14.6.1,
+15.6.1 and a restored 27.2 once each to the login window or the first setup
+panel, with no panic. What they fix and what is left:
 [dock-icons-2026-11-10.md](Research/dock-icons-2026-11-10.md).
 
 steelbrain's rewritten Reims and its QEMU were tried apart from this stack. In
@@ -97,6 +97,12 @@ the kernel's layout first and turns both off on any kernel but 27.2's and
 Stop a logged-in guest with `stop`, or from the login window's Shut Down button.
 Switching QEMU off instead counts as a failed boot, and after a few LLB boots
 recovery.
+
+A VM runs in one QEMU at a time. QEMU opens the disks without locks, and two on
+one disk corrupt its APFS container within a boot. `boot`, `account` and
+`restore` refuse a VM whose monitor socket still answers, and a `boot` ended by
+SIGTERM, SIGINT or SIGHUP ends its QEMU. One ended by SIGKILL leaves QEMU
+running; `stop` still reaches it.
 
 `restore` extracts the IPSW next to it once, requests the tickets from Apple, and
 drives DFU, iBSS, iBEC and the restore OS itself. idevicerestore talks to

@@ -26,8 +26,11 @@ Small Metal probes were built on a Mac and copied in over that shell as base64,
 and RenderBox and the guest's Metal driver were disassembled on the same Mac,
 which runs 27.0.1. Neither is part of running a guest.
 
-For four minutes or more after a boot the guest's load average is above 300,
-with the patches and without them, and the shell answers slowly or not at all.
+For four minutes or more after a boot the guest's load average was above 300,
+with the patches and without them, and the shell answered slowly or not at all.
+QEMUs left behind by earlier runs were loading the host at the time
+([two-qemus-one-disk-2026-11-10.md](two-qemus-one-disk-2026-11-10.md)), and it
+was not measured again without them.
 
 ## Causes
 
@@ -113,7 +116,9 @@ All on the DGX on 2026-11-10 with `Patches/reims` 0001–0045.
   13 of the 19 application icons drew, one of them a black square, and six were
   placeholders. The three `?` items are applications the image does not have.
 - One boot each, 200 s, no panic, not logged in: 26.6.2 and 14.6.1 and 13.6 and
-  a restored 27.2 to the login window, 15.6.1 to the Language panel.
+  a restored 27.2 to the login window, 15.6.1 to the Language panel. Restored
+  13.6 and 26.6.2 were later logged in through their user setup panels to the
+  desktop and shut down cleanly (`ApplePSCI - system off`), with no panic.
 - 26.6.2 and 13.6 were booted again on 0001–0040 for comparison. Their login
   windows were the same on both: a second, dark password field below the first
   on 26.6.2, and white specks and a white strip along the bottom on 13.6.
@@ -124,12 +129,17 @@ All on the DGX on 2026-11-10 with `Patches/reims` 0001–0045.
   `heap_sample_unrendered` about 20 times and drops about 10 draws: a heap
   texture is sampled, or loaded as a pass's target, before any draw has rendered
   into it. A pass that only clears a heap texture is one way to get there.
-- In some boots the menu bar is a black band with a soft lower edge, or has a
-  black patch behind the status items. It was not seen before 0041, when
-  RenderBox could not make a heap.
+- On an image's first boot, the one that finishes the update, the menu bar has
+  a black patch behind the status items and the Dock's background is black. On
+  the second boot of the same disk both were right: no patch, and a grey glass
+  Dock. Earlier boots also showed a black band across the whole menu bar; those
+  ran with other QEMUs on the same disk.
+- A draft patch that lets a draw sample a heap texture a compute pass wrote
+  drew the same icons as 0045 on a fresh image, and is not in `Patches/reims`.
 - An `RGBA16Unorm` texture cannot be rendered into or converted
   (`rt_heap_format`, `buftex convert_fail fmt=0x6e`); RenderBox keeps a 384×384
   one over a buffer.
 - With 0045 a window's backing is copied to the guest once, on its first frame.
   The cost was not measured.
-- No version but the pulled 27.2 was taken to its desktop on 0041–0045.
+- 14.6.1, 15.6.1 and a restored 27.2 were not taken past the login window or
+  the Language panel on 0041–0045.

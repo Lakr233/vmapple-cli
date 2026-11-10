@@ -413,7 +413,9 @@ desktop with its Dock and menus.
 - `stop` works at Setup Assistant too: 26's hello screen powered off in seconds.
   Killing QEMU instead is what to avoid: after four or five killed boots, 26's LLB
   set `boot-command` to `recover` with `iboot-failure-reason` `0x64`, and the disk
-  had to be restored again.
+  had to be restored again. Killing `boot` without ending its QEMU also left a
+  second boot writing the same disk; see
+  [two-qemus-one-disk-2026-11-10.md](two-qemus-one-disk-2026-11-10.md).
 
 ## Open questions, riskiest first
 
