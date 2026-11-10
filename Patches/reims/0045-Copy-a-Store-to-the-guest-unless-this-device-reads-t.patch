@@ -1,0 +1,174 @@
+From cdf63598869d1741754b243802cfef7d9bf700eb Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Tue, 10 Nov 2026 16:44:01 +0800
+Subject: [PATCH 45/45] Copy a Store to the guest unless this device reads the
+ surface
+
+With the changes before this one iconservicesagent on macOS 27.2 drew
+its icons and still logged "Flattened representation is seemingly a
+fully transparent image" for all 19. It draws each icon into a 104x104
+IOSurface and reads the surface back with the CPU. The draw log showed
+the pass store (resident_surface_store) and, when the guest unmapped the
+surface 40 s later, writes=1: the pass's opening clear was the only
+thing this device ever wrote to its pages.
+
+The lazy rail keeps a Store in the host image until the guest names the
+resource in CmdSynchronizeResources. For an IOSurface the guest sends
+none: on Apple's host the attachment is the surface's own memory, so
+there is nothing to ask for. The debt was paid only when the ledger
+evicted it.
+
+A Store now stays in the host image only for a surface this device has
+itself read since the guest mapped it: one a draw sampled, a window
+backing the compositor reads, or one the display presented. Any other is
+copied to the guest's pages at once, as with REIMS_VGPU_LAZY_WRITEBACK=off.
+A window backing pays one copy for its first frame.
+
+After it, with the guest's icon caches cleared at boot, 13 of the 19
+application icons in the Dock of a pulled 27.2 drew, one of them as a
+black square; with the rail left as it was
+none did, and with it switched off by hand the one icon redrawn in that
+run did.
+
+Tests: a Store into a surface this device has not read is not deferred,
+and is once a draw has sampled the surface.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/reims-vgpu/src/model/state.rs         | 38 ++++++++++++++++++++
+ crates/reims-vgpu/src/runtime/drain/mod.rs   |  5 +++
+ crates/reims-vgpu/src/runtime/draw/vulkan.rs | 25 ++++++++++++-
+ 3 files changed, 67 insertions(+), 1 deletion(-)
+
+diff --git a/crates/reims-vgpu/src/model/state.rs b/crates/reims-vgpu/src/model/state.rs
+index 68a448e2..456dec97 100644
+--- a/crates/reims-vgpu/src/model/state.rs
++++ b/crates/reims-vgpu/src/model/state.rs
+@@ -2816,6 +2816,12 @@ pub struct DeviceState {
+     /// so the drain must not write them a second time. See
+     /// [`crate::runtime::reply_fence`].
+     pub heap_queries_answered: std::collections::HashSet<(u32, u32)>,
++    /// Surface mappings this device has itself read, sampled in a draw or
++    /// presented, as mapping id to the map generation it was read at. A render
++    /// Store into one of these may stay in the host image; into any other it
++    /// is copied to the guest's pages at once. See
++    /// [`Self::surface_read_by_host`].
++    pub surfaces_read_by_host: HashMap<u32, u32>,
+     /// Total stale views the reuse verify caught (fail-logged as
+     /// `gva_view_stale`; the view self-heals via retire + rebuild).
+     pub view_stale_reads: u64,
+@@ -2915,6 +2921,7 @@ impl DeviceState {
+             completion_stamp_seq: 0,
+             stamp_ledger: Default::default(),
+             heap_queries_answered: Default::default(),
++            surfaces_read_by_host: Default::default(),
+             gva_resident_backing: std::collections::BTreeMap::new(),
+             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
+             #[cfg(feature = "backend-vulkan")]
+@@ -4028,6 +4035,37 @@ impl DeviceState {
+     /// Also advances [`MappingEntry::surface_content_epoch`], so every one of
+     /// this crate's guest-page writers keeps that epoch closed for free — the
+     /// completeness property the type-11 `LoadFromTarget` gate rests on.
++    /// Record that this device read `mapping_id` itself: a draw sampled it or
++    /// the display presented it.
++    pub fn note_surface_read_by_host(&mut self, mapping_id: u32) {
++        let Some(generation) = self.mappings.get(&mapping_id).map(|m| m.map_generation) else {
++            return;
++        };
++        if self.surfaces_read_by_host.insert(mapping_id, generation) != Some(generation)
++            && self.surfaces_read_by_host.len() > 4096
++        {
++            let mappings = &self.mappings;
++            self.surfaces_read_by_host
++                .retain(|id, at| mappings.get(id).is_some_and(|m| m.map_generation == *at));
++        }
++    }
++
++    /// Whether this device has read `mapping_id` since the guest mapped it.
++    ///
++    /// The guest reads an IOSurface it rendered into with no command at all:
++    /// on Apple's host the attachment is the surface's own memory. So a Store
++    /// may only stay in the host image for a surface whose reader is this
++    /// device, a window backing the compositor samples or a framebuffer the
++    /// display presents. macOS 27.2's iconservicesagent draws each icon into
++    /// a surface and reads it back; left in the host image, every icon read as
++    /// transparent and the Dock showed placeholders.
++    pub fn surface_read_by_host(&self, mapping_id: u32) -> bool {
++        self.surfaces_read_by_host
++            .get(&mapping_id)
++            .zip(self.mappings.get(&mapping_id))
++            .is_some_and(|(at, m)| *at == m.map_generation)
++    }
++
+     pub fn mark_mapping_written(&mut self, mapping_id: u32) -> u32 {
+         let seq = self.next_validity_seq();
+         let Some(m) = self.mappings.get_mut(&mapping_id) else {
+diff --git a/crates/reims-vgpu/src/runtime/drain/mod.rs b/crates/reims-vgpu/src/runtime/drain/mod.rs
+index ffe67f72..2d843cef 100644
+--- a/crates/reims-vgpu/src/runtime/drain/mod.rs
++++ b/crates/reims-vgpu/src/runtime/drain/mod.rs
+@@ -5186,6 +5186,11 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
+                     state.pending.child_mask |= bit;
+                     break;
+                 }
++                if is_display_present(packet.opcode) {
++                    if let Some(mapping) = present_surface_id(packet.opcode, &packet.payload) {
++                        state.note_surface_read_by_host(mapping);
++                    }
++                }
+                 let watched_present = is_display_present(packet.opcode)
+                     && crate::runtime::mapper::wire_watch::enabled();
+                 let present_started_us = if watched_present {
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index beffeb09..c1d675ab 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -1306,6 +1306,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
+     }
+ 
+     if let Some(mid) = surface {
++        state.note_surface_read_by_host(mid);
+         // A condemned incarnation is bound from its resident or not at all:
+         // every rung below reads its pages, seeds from them or merges into them.
+         if mapper::wire_watch::guest_pages_condemned(state, mid) {
+@@ -10444,7 +10445,8 @@ fn store_surface_resident<M: HostMemory + HostOps>(
+     // and makes correctness depend on the texture identity outliving the
+     // command that synchronized it. Publish the existing alias eagerly and let
+     // the completion stamp carry its queue ordering.
+-    let lazy = crate::runtime::writeback_debt::lazy_writeback_enabled();
++    let lazy = crate::runtime::writeback_debt::lazy_writeback_enabled()
++        && state.surface_read_by_host(mapping_id);
+     let plan = surface_store_plan(lazy, guest_store.guest_backed);
+     if plan == SurfaceStorePlan::DeferCopy
+         && arm_surface_writeback_debt(state, host, mapping_id, identity, width, height)
+@@ -11589,6 +11591,27 @@ mod vulkan_split_tests {
+              test cannot see the defect"
+         );
+ 
++        // A surface nobody but the guest reads is not deferred: the guest
++        // reads an IOSurface with no command to ask for it. There is no engine
++        // here to copy from, so the Store reports the frame unwritten.
++        assert!(
++            !store_surface_resident(
++                &mut state,
++                &mut host,
++                &drawn,
++                mid,
++                w,
++                h,
++                GuestStoreStatus::default(),
++            ),
++            "a surface this device has not read is copied, not deferred"
++        );
++        assert!(state.pending_writebacks.get(mid).is_none());
++
++        // The compositor samples it, at the generation it now has.
++        state.note_surface_read_by_host(mid);
++        assert!(state.surface_read_by_host(mid));
++
+         assert!(
+             store_surface_resident(
+                 &mut state,
+-- 
+2.43.0
+

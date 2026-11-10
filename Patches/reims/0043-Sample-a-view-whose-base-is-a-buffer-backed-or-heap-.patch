@@ -1,0 +1,244 @@
+From 27aed56343af635fb3747ad0a63f79c794f827fe Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Tue, 10 Nov 2026 16:44:01 +0800
+Subject: [PATCH 43/45] Sample a view whose base is a buffer-backed or heap
+ texture
+
+A buffer-backed texture (opcode 9) and a heap texture (opcode 0x15)
+carry the same object tag as a texture view. The view chain walked into
+either as if it were one more view, failed to decode it
+(sample_view_resolve reason=res_texture_view_opcode), and the draw that
+sampled the view was dropped (draw_prepare_texture_resolve_missing,
+draw_vk_nothing_stored). A boot of 27.2 on the patches before these
+refused 172 views that way. Once RenderBox could make its heaps and
+linear textures it drew with little else.
+
+- The chain ends at a buffer-backed or heap texture as its base.
+- A view over a buffer-backed texture samples the buffer. RenderBox
+  views its R8 masks as A8; a view format with the same texel size reads
+  the same bytes under the view's format. Any other override, and any
+  level but 0, is refused (buftex_view_refused).
+- A view over a heap texture samples the heap texture's resident, when
+  its level is 0 and its format is the heap texture's
+  (heaptex_view_refused otherwise).
+
+After it a boot refused no view over a buffer-backed texture. What it
+still reports under that slug, 8 in a boot, is a heap texture sampled
+before any pass has rendered into it.
+
+Tests: a view chain ends at a buffer-backed texture, from the guest's
+own opcode-9 bytes.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/reims-vgpu/src/runtime/draw/tests.rs   | 65 +++++++++++++++++++
+ .../src/runtime/draw/texture_view.rs          | 34 +++++++++-
+ crates/reims-vgpu/src/runtime/draw/vulkan.rs  | 60 +++++++++++++++++
+ 3 files changed, 157 insertions(+), 2 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/draw/tests.rs b/crates/reims-vgpu/src/runtime/draw/tests.rs
+index 877973e2..f3a38281 100644
+--- a/crates/reims-vgpu/src/runtime/draw/tests.rs
++++ b/crates/reims-vgpu/src/runtime/draw/tests.rs
+@@ -7213,3 +7213,68 @@ fn the_buffer_backed_texture_rail_pays_for_its_texture_reference() {
+         "the sampled bind never asked the ledger what its texture reference owed"
+     );
+ }
++
++/// A view over a buffer-backed texture ends its chain at that texture.
++///
++/// The opcode-9 record shares the type-8 tag with a view, and the chain walk
++/// read it as one more hop and refused it (`res_texture_view_opcode`). macOS 27
++/// samples such views when it draws icons, and every one of those draws was
++/// dropped. The base below is the record a 27.2 guest sent, refs and all.
++#[test]
++fn a_view_chain_ends_at_a_buffer_backed_texture() {
++    use crate::contract::endian::{st16, st32, st64};
++    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
++    use crate::runtime::decode::resource::{
++        list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE_VIEW,
++        TEXTURE_VIEW_DESC_BASE_REF, TEXTURE_VIEW_DESC_LEN, TEXTURE_VIEW_DESC_LEVEL_BASE,
++        TEXTURE_VIEW_DESC_LEVEL_COUNT, TEXTURE_VIEW_DESC_OPCODE, TEXTURE_VIEW_DESC_PIXEL_FORMAT,
++        TEXTURE_VIEW_DESC_SLICE_BASE, TEXTURE_VIEW_DESC_SLICE_COUNT, TEXTURE_VIEW_DESC_TEXTURE_REF,
++        TEXTURE_VIEW_DESC_TEXTURE_TYPE, TEXTURE_VIEW_MIN_RANGED, TEXTURE_VIEW_MTL_TYPE_2D,
++        TEXTURE_VIEW_OPCODE_RANGED,
++    };
++
++    fn write_type8(host: &mut FakeHost, state: &DeviceState, object_ref: u32, gva: u64, desc: &[u8]) {
++        write_task_gva_arm64e(&mut *host, &state.tasks[1], gva, desc);
++        let off = list_object_entry_offset(object_ref, 256).unwrap();
++        let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
++        st32(&mut entry[0..], (OBJECT_TYPE_TEXTURE_VIEW as u32) | ((desc.len() as u32) << 8));
++        entry[4..12].copy_from_slice(&gva.to_le_bytes());
++        write_task_gva_arm64e(&mut *host, &state.tasks[1], off, &entry);
++    }
++
++    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
++    let mut host = FakeHost::new();
++    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
++    assert!(state.set_object_list(1, 0, 256));
++
++    // `newTextureWithBuffer:` record 0x76 over buffer 0x75, 104x104, as sent.
++    let buffer_texture: Vec<u8> = (0..64)
++        .map(|i| {
++            u8::from_str_radix(
++                &"090000004000000076000000750000000000000000000000000100000000000042170a0068000000680000000100000001000100010010000000000000000000"[i * 2..i * 2 + 2],
++                16,
++            )
++            .unwrap()
++        })
++        .collect();
++    write_type8(&mut host, &state, 0x76, 0x280, &buffer_texture);
++
++    let len = TEXTURE_VIEW_MIN_RANGED;
++    let mut view = vec![0u8; len];
++    st32(&mut view[TEXTURE_VIEW_DESC_OPCODE..], TEXTURE_VIEW_OPCODE_RANGED);
++    st32(&mut view[TEXTURE_VIEW_DESC_LEN..], len as u32);
++    st32(&mut view[TEXTURE_VIEW_DESC_TEXTURE_REF..], 211);
++    st32(&mut view[TEXTURE_VIEW_DESC_BASE_REF..], 0x76);
++    st16(&mut view[TEXTURE_VIEW_DESC_PIXEL_FORMAT..], MTL_FORMAT_BGRA8_UNORM);
++    st16(&mut view[TEXTURE_VIEW_DESC_TEXTURE_TYPE..], TEXTURE_VIEW_MTL_TYPE_2D);
++    st64(&mut view[TEXTURE_VIEW_DESC_LEVEL_BASE..], 0);
++    st64(&mut view[TEXTURE_VIEW_DESC_LEVEL_COUNT..], 1);
++    st64(&mut view[TEXTURE_VIEW_DESC_SLICE_BASE..], 0);
++    st64(&mut view[TEXTURE_VIEW_DESC_SLICE_COUNT..], 1);
++    write_type8(&mut host, &state, 211, 0x300, &view);
++
++    let resolved = resolve_texture_view_reasoned(&state, &host, 1, 211)
++        .expect("a view over a buffer-backed texture must resolve");
++    assert_eq!(resolved.base_texture_ref, 0x76);
++    assert_eq!(resolved.level, 0);
++}
+diff --git a/crates/reims-vgpu/src/runtime/draw/texture_view.rs b/crates/reims-vgpu/src/runtime/draw/texture_view.rs
+index 2644fd4d..f3f6abea 100644
+--- a/crates/reims-vgpu/src/runtime/draw/texture_view.rs
++++ b/crates/reims-vgpu/src/runtime/draw/texture_view.rs
+@@ -332,6 +332,32 @@ fn decode_texture_view_hop_reasoned<M: HostMemory + HostOps>(
+     Ok((view.base_texture_ref, level, swizzle, pixel_format))
+ }
+ 
++/// Whether a type-8 object is a texture of its own, buffer-backed (opcode 9 or
++/// its wide form) or placed in a heap, rather than a view. Those share the
++/// tag, and end a view chain as its base.
++fn is_own_texture<M: HostMemory + HostOps>(
++    state: &DeviceState,
++    host: &M,
++    task_id: u32,
++    texture_ref: u32,
++) -> bool {
++    use crate::runtime::decode::resource::{
++        texture_type8_opcode, HEAP_TEXTURE_OPCODE, HEAP_TEXTURE_WIDE_OPCODE,
++        TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
++    };
++    objects::resolve_resource(state, host, task_id, texture_ref)
++        .ok()
++        .is_some_and(|resource| {
++            matches!(
++                texture_type8_opcode(&resource.descriptor),
++                Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE)
++                    | Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE)
++                    | Some(HEAP_TEXTURE_OPCODE)
++                    | Some(HEAP_TEXTURE_WIDE_OPCODE)
++            )
++        })
++}
++
+ /// Resolve type-8 view to non-view base + mip + format override + swizzle.
+ ///
+ /// The `Result` carries a specific failure slug (`reason=view_resolve` sub-case)
+@@ -359,7 +385,9 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
+             // visibly (same as a one-hop miss on an unmapped base).
+             break;
+         };
+-        if entry.object_type != OBJECT_TYPE_TEXTURE_VIEW {
++        if entry.object_type != OBJECT_TYPE_TEXTURE_VIEW
++            || is_own_texture(state, host, task_id, base)
++        {
+             break;
+         }
+         depth += 1;
+@@ -372,7 +400,9 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
+ 
+     // Final base must not still be a type-8 view past the chain cap.
+     if let Some(entry) = objects::lookup_list_entry(state, host, task_id, base) {
+-        if entry.object_type == OBJECT_TYPE_TEXTURE_VIEW {
++        if entry.object_type == OBJECT_TYPE_TEXTURE_VIEW
++            && !is_own_texture(state, host, task_id, base)
++        {
+             return Err(TextureViewDecline::ChainOverflow { base, depth });
+         }
+     }
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index 2a3c4ae1..beffeb09 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -1190,6 +1190,66 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
+         ));
+     }
+ 
++    // A view over a buffer-backed or heap texture samples what that texture
++    // does. Either has one level. A view that renames a buffer's texels, A8
++    // over R8 as RenderBox does for its masks, reads the same bytes under the
++    // view's format; any other override would need a conversion nothing here
++    // makes. The view's swizzle is the bind's to apply, as for every view.
++    let is_view = resource
++        .as_deref()
++        .map(|resource| resource.entry.object_type)
++        .or_else(|| {
++            objects::lookup_list_entry(state, host, task_id, texture_ref)
++                .map(|entry| entry.object_type)
++        })
++        == Some(OBJECT_TYPE_TEXTURE_VIEW);
++    if is_view {
++        if let Some(view) = resolve_texture_view(state, host, task_id, texture_ref) {
++            let base = view.base_texture_ref;
++            if let Some(mut bt) = buffer_texture_descriptor(state, host, task_id, base, None) {
++                let own = bt.desc.pixel_format;
++                let format = view.pixel_format.unwrap_or(own);
++                let (width, _) = (bt.desc.width, bt.desc.height);
++                let same_texels = format == own
++                    || pixel_format::tight_row_bytes(width, format)
++                        .is_some_and(|row| Some(row) == pixel_format::tight_row_bytes(width, own));
++                if view.level != 0 || !same_texels {
++                    crate::runtime::drain::note_store_route("buftex_view_refused");
++                    return None;
++                }
++                crate::runtime::drain::note_store_route("buftex_view");
++                bt.desc.pixel_format = format;
++                let (w, h, rgba) = load_buffer_texture_rgba(state, host, task_id, base, &bt)?;
++                return Some((
++                    w,
++                    h,
++                    0,
++                    SampledSourceRequest::Bytes(
++                        std::sync::Arc::new(rgba),
++                        None,
++                        SampledByteFormat::from_source(TexelLayout::Rgba8, format),
++                        crate::backend::vulkan::engine::SampledByteOrigin::BufferBackedTexture,
++                    ),
++                ));
++            }
++            let heap = objects::resolve_resource(state, host, task_id, base)
++                .ok()
++                .and_then(|resource| heap_texture_of(&resource.descriptor));
++            if let Some(heap) = heap {
++                if view.level != 0 || view.pixel_format.is_some_and(|f| f != heap.format) {
++                    crate::runtime::drain::note_store_route("heaptex_view_refused");
++                    crate::observe::fail(format!(
++                        "heaptex_view_refused ref={texture_ref} base={base} level={} view_fmt={:?} base_fmt={:#x}",
++                        view.level, view.pixel_format, heap.format
++                    ));
++                    return None;
++                }
++                crate::runtime::drain::note_store_route("heaptex_view");
++                return resolve_sampled_source(state, host, task_id, base, None, may_bind_resident);
++            }
++        }
++    }
++
+     // The object list names exactly ONE surface for a sampled ref. Which one is
+     // decided by the entry's `object_type`, and the cases below are distinct
+     // values of that single u8 field, so they cannot both apply:
+-- 
+2.43.0
+

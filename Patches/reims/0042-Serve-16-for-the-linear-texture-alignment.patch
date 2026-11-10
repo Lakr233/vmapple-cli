@@ -1,0 +1,63 @@
+From f5ebde9298955b3c8a21989495bb01c5170bf2e9 Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Tue, 10 Nov 2026 16:44:01 +0800
+Subject: [PATCH 42/45] Serve 16 for the linear texture alignment
+
+With heaps working, iconservicesagent on macOS 27.2 next logged Metal's
+_mtlValidateStrideTextureParameters and a RenderBox precondition
+failure, 13 of each a boot. A probe in the guest got the text:
+"Linear texture: bytesPerRow (112) must be aligned to 256 bytes".
+
+27.2 answers minimumLinearTextureAlignmentForPixelFormat: from its own
+deviceLinearTextureAlignmentBytes, 16, the alignment of the Apple GPUs
+it is built for, and validates the row pitch a caller then asks for
+against linearTextureAlignmentBytes, which is device info key 13. This
+device served 256 there, so the guest was told 16 and held to 256, and
+every buffer-backed texture RenderBox made was refused.
+
+Key 13 is now 16, the value the guest uses when the key is absent. Every
+buffer texture command carries its own row pitch, and nothing else in
+this device reads the key. Key 40 (minimumTextureBufferAlignment) stays
+256.
+
+After it the probe created linear textures over a buffer in 21 formats,
+shared and private, six usages each, and the validation error was gone
+from the guest's log.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/reims-vgpu/src/model/regs.rs | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/crates/reims-vgpu/src/model/regs.rs b/crates/reims-vgpu/src/model/regs.rs
+index 92266c98..de4638ae 100644
+--- a/crates/reims-vgpu/src/model/regs.rs
++++ b/crates/reims-vgpu/src/model/regs.rs
+@@ -1197,6 +1197,15 @@ pub const DEVICE_INFO_KEY_RGB10A2_GAMMA: u32 = 8;
+ /// out on, so it is a promise about what this device can address rather than a
+ /// capability it can decline later.
+ ///
++/// **16, the number the guest already uses elsewhere.** macOS 27.2 answers
++/// `minimumLinearTextureAlignmentForPixelFormat:` from a 16 of its own, the
++/// alignment of the Apple GPUs it is built for, and checks the rows a caller
++/// then asks for against this key. Served 256, the two disagreed: RenderBox
++/// laid a 100 pixel RGBA8 row out on 400 bytes as it was told it could, Metal
++/// refused it (`bytesPerRow (112) must be aligned to 256 bytes`), and
++/// iconservicesagent drew no icon. Every buffer texture command carries its
++/// own row pitch, so nothing in this device depends on the larger number.
++///
+ /// Distinct from [`crate::contract::iosurface_pages::ROW_BYTES_ALIGN`], which is
+ /// an IOSurface row estimate for counting pages and is deliberately not a pitch.
+ /// Do not relate the two: one is Metal's linear-texture rule and the other is
+@@ -1473,7 +1482,7 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
+         crate::contract::draw::EXECUTABLE_PRIMITIVE_TYPES,
+     ),
+     (DEVICE_INFO_KEY_DUAL_PLANE_TEXTURES, 1),
+-    (DEVICE_INFO_KEY_LINEAR_TEXTURE_ALIGN, 256),
++    (DEVICE_INFO_KEY_LINEAR_TEXTURE_ALIGN, 16),
+     (DEVICE_INFO_KEY_HEAPS, 1),
+     (DEVICE_INFO_KEY_HEAP_BUFFER_GRANULARITY, 32),
+     (DEVICE_INFO_KEY_HEAP_TEXTURES, 1),
+-- 
+2.43.0
+
