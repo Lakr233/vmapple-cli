@@ -1,0 +1,629 @@
+From 38e38113ea14cb5f160fea493990bfb44d51373a Mon Sep 17 00:00:00 2001
+From: Lakr <git@qaq.wiki>
+Date: Tue, 10 Nov 2026 16:44:00 +0800
+Subject: [PATCH 41/45] Answer a heap size query before its doorbell returns
+
+A pulled macOS 27.2 (26B123) showed grey placeholders for every Dock
+icon. In the guest, iconservicesagent and com.apple.dock.extra logged
+RenderBox's "unable to create heap: 0" hundreds of times a boot, and
+then "Failed to generate flatten representation for icon stack".
+
+RenderBox sizes a texture heap from
+heapTextureSizeAndAlignWithDescriptor:. A probe run in the guest made
+that call 40 times: 27 returned {0, 0}, each in 10 to 60 us, and the 13
+that returned a size took 1 to 27 ms. The host log had answered all 40
+correctly. The guest sends CmdHeapTextureSizeAndAlign, rings the child
+doorbell and reads the sixteen reply bytes as soon as the write returns;
+it waits for no stamp and no interrupt (each query carries a fresh
+completion stamp that nothing waits on). Apple's host answers inside the
+doorbell write. This device hands the doorbell to the drain worker, so
+the guest read its own zeros unless the vCPU happened to lose the race.
+
+- The vCPU that rings a child doorbell looks through that channel's
+  ring, with no device lock, for heap size queries
+  (runtime::reply_fence). Nearly every doorbell finds none and returns
+  after three register reads.
+- When it finds one it takes the device lock, waiting for the drain's
+  tranche to end at most 250 ms, and writes the reply itself. The query
+  changes nothing in the device, so it need not wait its turn: a channel
+  held behind a shader translation kept the first version of this, which
+  waited for the drain to reach the packet, at its timeout 147 times in
+  one boot.
+- The drain leaves an answered packet's reply alone when it reaches it;
+  the guest may have reused those bytes by then.
+- A query that cannot be answered here, its reply address not mapped
+  yet, waits for the drain to pass it, as before bounded.
+
+After it the probe read a size from all 40 calls, and neither process
+logged the heap error again in a boot.
+
+Tests (lib, --test-threads=1, at the end of this series): 2317 passed,
+0 failed. New: the ring walk finds a
+query behind another packet with its payload, finds none in a ring
+without one, reads one that wraps the ring, stops at an unpublished
+packet, and reports the ring drained only once the head passes the
+query.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ crates/reims-vgpu/src/device/mod.rs          |  83 ++++++
+ crates/reims-vgpu/src/model/state.rs         |  16 +
+ crates/reims-vgpu/src/runtime/drain/mod.rs   |  29 +-
+ crates/reims-vgpu/src/runtime/mmio.rs        |   8 +-
+ crates/reims-vgpu/src/runtime/mod.rs         |   2 +
+ crates/reims-vgpu/src/runtime/reply_fence.rs | 294 +++++++++++++++++++
+ 6 files changed, 430 insertions(+), 2 deletions(-)
+ create mode 100644 crates/reims-vgpu/src/runtime/reply_fence.rs
+
+diff --git a/crates/reims-vgpu/src/device/mod.rs b/crates/reims-vgpu/src/device/mod.rs
+index f1a2b871..3b04d058 100644
+--- a/crates/reims-vgpu/src/device/mod.rs
++++ b/crates/reims-vgpu/src/device/mod.rs
+@@ -110,6 +110,11 @@ struct BoundDevice {
+     /// Lock-free clone of the negotiated protocol version (0x1034); see
+     /// [`crate::model::GfxRegs::version_live`].
+     version_live: Arc<AtomicU32>,
++    /// Lock-free clone of the root page (0x101c), the guest page size, and the
++    /// child rings the doorbell path has read; see [`wait_for_replies`].
++    root_page_live: Arc<AtomicU32>,
++    page_shift: u32,
++    reply_rings: Mutex<HashMap<u32, crate::runtime::reply_fence::RingPages>>,
+     /// The IOSurface mapper registers, read by a vCPU with no lock; published
+     /// by whoever changes them under the device lock.
+     iosfc_live: Arc<crate::model::IosfcLive>,
+@@ -183,6 +188,79 @@ fn publish_present_boundary(slot: &BoundDevice, frame_flush_seen: bool) {
+     }
+ }
+ 
++/// How long a doorbell waits to answer a reply command. The vCPU holds the BQL
++/// here, so the wait is bounded: past it the guest reads zeros, as it did for
++/// every such command before.
++const REPLY_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
++
++/// Answer the reply commands a child ring holds before its doorbell returns;
++/// see [`crate::runtime::reply_fence`]. A ring without one, nearly every
++/// doorbell, costs three register reads and returns.
++///
++/// This is the one place a vCPU waits for the device lock. It waits for the
++/// drain's tranche to end, not for the channel: the answer is written from
++/// here, so a channel held behind a shader translation does not hold it up.
++/// Only a command this cannot answer, its reply address not mapped yet, waits
++/// for the drain to reach it.
++fn wait_for_replies(slot: &BoundDevice, channel: u32) {
++    let Some(ops) = slot.ops else {
++        return;
++    };
++    let root_page = slot.root_page_live.load(Ordering::Acquire);
++    let mut scratch = VecDeque::new();
++    let peek = QemuHost::new(&ops, &mut scratch, &slot.prompt_actions);
++    let pending = {
++        let mut rings = slot.reply_rings.lock();
++        crate::runtime::reply_fence::find(
++            &peek,
++            root_page,
++            slot.page_shift,
++            channel,
++            rings.entry(channel).or_default(),
++        )
++    };
++    let Some(pending) = pending else {
++        return;
++    };
++    let started = std::time::Instant::now();
++    let pause = || {
++        if started.elapsed() < std::time::Duration::from_micros(200) {
++            std::hint::spin_loop();
++        } else {
++            std::thread::sleep(std::time::Duration::from_micros(50));
++        }
++    };
++    let mut answered = None;
++    while answered.is_none() && started.elapsed() < REPLY_WAIT {
++        match try_hold(&slot.inner, Holder::VcpuGfxWrite) {
++            Some(mut inner) => {
++                let DeviceInner { device, actions } = &mut *inner;
++                let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
++                answered = Some(crate::runtime::drain::answer_heap_queries(
++                    &mut device.state,
++                    &mut host,
++                    channel,
++                    &pending.queries,
++                ));
++            }
++            None => pause(),
++        }
++    }
++    if answered == Some(true) {
++        return;
++    }
++    while !pending.drained(&peek) {
++        if started.elapsed() >= REPLY_WAIT {
++            crate::observe::fail(format!(
++                "reply_wait_timeout ch={channel} queries={} answered_here={answered:?}",
++                pending.queries.len()
++            ));
++            return;
++        }
++        pause();
++    }
++}
++
+ fn apply_gfx_write(inner: &mut DeviceInner, slot: &BoundDevice, write: QueuedGfxWrite) {
+     match write.queued_at {
+         Some(at) => crate::runtime::drain::note_doorbell_queued(
+@@ -255,6 +333,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
+     let intr_fault = Arc::clone(&dev.state.gfx.interrupt_fault);
+     let fifo_read_live = Arc::clone(&dev.state.gfx.fifo_read);
+     let version_live = Arc::clone(&dev.state.gfx.version_live);
++    let root_page_live = Arc::clone(&dev.state.gfx.root_page_live);
+     let iosfc_live = Arc::clone(&dev.state.iosfc.live);
+     DEVICES.lock().insert(
+         id,
+@@ -273,6 +352,9 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
+             intr_fault,
+             fifo_read_live,
+             version_live,
++            root_page_live,
++            page_shift,
++            reply_rings: Mutex::new(HashMap::new()),
+             iosfc_live,
+             present_action_pending: AtomicBool::new(false),
+             present_boundary_seen: AtomicBool::new(false),
+@@ -482,6 +564,7 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
+                     .fetch_or(1u32 << channel, Ordering::AcqRel);
+                 crate::runtime::drain::note_doorbell_lock_free();
+                 schedule_device(&slot);
++                wait_for_replies(&slot, channel);
+             }
+             return true;
+         }
+diff --git a/crates/reims-vgpu/src/model/state.rs b/crates/reims-vgpu/src/model/state.rs
+index bdb48214..68a448e2 100644
+--- a/crates/reims-vgpu/src/model/state.rs
++++ b/crates/reims-vgpu/src/model/state.rs
+@@ -408,6 +408,11 @@ pub struct GfxRegs {
+     /// The `Arc` is shared with the device registry slot and survives reset,
+     /// like the four above.
+     pub version_live: Arc<AtomicU32>,
++    /// Lock-free clone of [`Self::root_page`], for the vCPU that rings a child
++    /// doorbell and must find that channel's ring with no device lock; see
++    /// [`crate::runtime::reply_fence`]. Shared with the registry slot, kept
++    /// across reset and cleared by it, like the five above.
++    pub root_page_live: Arc<AtomicU32>,
+     pub efi_display: u32,
+     pub efi_mode_select: u32,
+     pub efi_fb_start: u64,
+@@ -435,6 +440,7 @@ impl Default for GfxRegs {
+             interrupt_fault: Arc::new(AtomicU32::new(0)),
+             child_doorbell_rung: Arc::new(AtomicU32::new(0)),
+             version_live: Arc::new(AtomicU32::new(0)),
++            root_page_live: Arc::new(AtomicU32::new(0)),
+             efi_display: 0,
+             efi_mode_select: 0,
+             efi_fb_start: 0,
+@@ -2804,6 +2810,12 @@ pub struct DeviceState {
+     /// unmet waits are honest. Feeds no verdict — see
+     /// [`crate::runtime::drain::StampLedger`].
+     pub stamp_ledger: crate::runtime::drain::StampLedger,
++    /// The `CmdHeapTextureSizeAndAlign` packets a vCPU answered from its
++    /// doorbell, as (channel, packet head), until the drain reaches each and
++    /// leaves it alone. The guest may have reused the reply's bytes by then,
++    /// so the drain must not write them a second time. See
++    /// [`crate::runtime::reply_fence`].
++    pub heap_queries_answered: std::collections::HashSet<(u32, u32)>,
+     /// Total stale views the reuse verify caught (fail-logged as
+     /// `gva_view_stale`; the view self-heals via retire + rebuild).
+     pub view_stale_reads: u64,
+@@ -2902,6 +2914,7 @@ impl DeviceState {
+             pending_writebacks: crate::runtime::writeback_debt::PendingWritebacks::default(),
+             completion_stamp_seq: 0,
+             stamp_ledger: Default::default(),
++            heap_queries_answered: Default::default(),
+             gva_resident_backing: std::collections::BTreeMap::new(),
+             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
+             #[cfg(feature = "backend-vulkan")]
+@@ -3231,12 +3244,14 @@ impl DeviceState {
+         let fifo_read = Arc::clone(&self.gfx.fifo_read);
+         let child_rung = Arc::clone(&self.gfx.child_doorbell_rung);
+         let version_live = Arc::clone(&self.gfx.version_live);
++        let root_page_live = Arc::clone(&self.gfx.root_page_live);
+         intr_disp.store(0, Ordering::Release);
+         intr_gpu.store(0, Ordering::Release);
+         intr_fault.store(0, Ordering::Release);
+         fifo_read.store(0, Ordering::Release);
+         // A reset forgets the negotiation; the guest negotiates again.
+         version_live.store(0, Ordering::Release);
++        root_page_live.store(0, Ordering::Release);
+         // Cleared as well as kept: a reset drops every channel, so a bit rung
+         // before it names a channel that no longer exists.
+         child_rung.store(0, Ordering::Release);
+@@ -3259,6 +3274,7 @@ impl DeviceState {
+         self.gfx.fifo_read = fifo_read;
+         self.gfx.child_doorbell_rung = child_rung;
+         self.gfx.version_live = version_live;
++        self.gfx.root_page_live = root_page_live;
+     }
+ 
+     /// Queue the engine-unpin for a dying linear cache entry that still owns a
+diff --git a/crates/reims-vgpu/src/runtime/drain/mod.rs b/crates/reims-vgpu/src/runtime/drain/mod.rs
+index 59e5fda8..ffe67f72 100644
+--- a/crates/reims-vgpu/src/runtime/drain/mod.rs
++++ b/crates/reims-vgpu/src/runtime/drain/mod.rs
+@@ -2472,6 +2472,30 @@ fn reply_compute_info<H: HostMemory + HostOps>(
+     true
+ }
+ 
++/// Answer the heap queries a vCPU found in `channel`'s ring when it rang the
++/// doorbell, ahead of the drain. Returns whether every one now has its reply;
++/// one that could not be answered here is left for the drain.
++pub(crate) fn answer_heap_queries<H: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut H,
++    channel: u32,
++    queries: &[crate::runtime::reply_fence::Query],
++) -> bool {
++    let mut all = true;
++    for query in queries {
++        let key = (channel, query.head);
++        if state.heap_queries_answered.contains(&key) {
++            continue;
++        }
++        if reply_heap_texture_size_and_align(state, host, &query.payload) {
++            state.heap_queries_answered.insert(key);
++        } else {
++            all = false;
++        }
++    }
++    all
++}
++
+ fn reply_heap_texture_size_and_align<H: HostMemory + HostOps>(
+     state: &mut DeviceState,
+     host: &mut H,
+@@ -4736,7 +4760,10 @@ fn process_child_packet<H: HostMemory + HostOps>(
+             }
+         }
+         CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN => {
+-            let _ = reply_heap_texture_size_and_align(state, host, &packet.payload);
++            let head = packet.next_head.wrapping_sub(packet.total_size);
++            if !state.heap_queries_answered.remove(&(channel_id, head)) {
++                let _ = reply_heap_texture_size_and_align(state, host, &packet.payload);
++            }
+         }
+         // The one packet that says a cached page list has gone stale, and the
+         // only arm that consumes it. A second handler used to sit inside the
+diff --git a/crates/reims-vgpu/src/runtime/mmio.rs b/crates/reims-vgpu/src/runtime/mmio.rs
+index 387cdba9..3a4f93f7 100644
+--- a/crates/reims-vgpu/src/runtime/mmio.rs
++++ b/crates/reims-vgpu/src/runtime/mmio.rs
+@@ -140,7 +140,13 @@ pub fn gfx_write<H: HostMemory + HostOps>(
+                 .interrupt_status_gpu
+                 .fetch_and(!val, std::sync::atomic::Ordering::AcqRel);
+         }
+-        GFX_REG_ROOT_PAGE => state.gfx.root_page = val,
++        GFX_REG_ROOT_PAGE => {
++            state.gfx.root_page = val;
++            state
++                .gfx
++                .root_page_live
++                .store(val, std::sync::atomic::Ordering::Release);
++        }
+         GFX_REG_CHILD_DOORBELL | GFX_REG_CHILD_REPLAY_DOORBELL => {
+             if crate::model::accept_child_channel(val, "mmio_child_doorbell") {
+                 state.active_child_mask |= 1u32 << val;
+diff --git a/crates/reims-vgpu/src/runtime/mod.rs b/crates/reims-vgpu/src/runtime/mod.rs
+index c13676ba..93a1fec7 100644
+--- a/crates/reims-vgpu/src/runtime/mod.rs
++++ b/crates/reims-vgpu/src/runtime/mod.rs
+@@ -108,6 +108,8 @@ pub mod present_identity;
+ /// edit of them requires — the direction that is ordered is the map.
+ pub mod range_coverage;
+ pub mod released_pages;
++/// The reply commands a child FIFO holds when its doorbell rings.
++pub mod reply_fence;
+ /// Type-11 mappings that claim one guest page, held out of writing until the
+ /// guest says which one it released.
+ pub mod surface_quarantine;
+diff --git a/crates/reims-vgpu/src/runtime/reply_fence.rs b/crates/reims-vgpu/src/runtime/reply_fence.rs
+new file mode 100644
+index 00000000..b28090e8
+--- /dev/null
++++ b/crates/reims-vgpu/src/runtime/reply_fence.rs
+@@ -0,0 +1,294 @@
++//! The reply commands a child FIFO holds when its doorbell rings.
++//!
++//! The guest sends `CmdHeapTextureSizeAndAlign` and reads the reply as soon as
++//! its doorbell write returns: it waits for no stamp and no interrupt. Apple's
++//! host answers inside that write. This device drains on a worker, so a
++//! doorbell that returned at once left the guest reading the sixteen zero bytes
++//! it had put there, and `heapTextureSizeAndAlignWithDescriptor:` returned
++//! `{0, 0}` for most calls. On macOS 27.2 RenderBox sizes its texture heaps from
++//! that answer, logged `unable to create heap: 0`, and iconservicesagent drew
++//! no icon: the Dock showed placeholders.
++//!
++//! So the vCPU that rings a doorbell looks, with no device lock, for such
++//! commands among the packets the ring holds. The query changes nothing in the
++//! device, so the vCPU answers it there and then, ahead of whatever the ring
++//! holds before it; a channel held behind a shader translation would otherwise
++//! keep the guest waiting for as long as the translation takes. Everything
++//! here is read from guest memory the way the drain reads it.
++
++use crate::contract::endian::{ld16, ld32};
++use crate::model::{
++    child_reg_block_offset, pfn_to_gpa, published_byte_count, CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN,
++    CHILD_REG_BASE_PFN, CHILD_REG_HEAD, CHILD_REG_TAIL, CHILD_RING_PFN_ENTRY_LEN,
++    PACKET_HEADER_LEN, PACKET_OPCODE, PACKET_STAMP_COUNT, PACKET_STAMP_LEN, PACKET_TOTAL_SIZE,
++};
++use crate::runtime::host::{read_u32, HostMemory};
++
++/// A reply command is a few dozen bytes. One that claims more is not read.
++const MAX_QUERY_LEN: u32 = 1024;
++
++/// A child ring as its page list describes it, kept by the caller between
++/// doorbells so the list is read once per ring.
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct RingPages {
++    pub root_page: u32,
++    pub base_pfn: u32,
++    pub page_gpas: Vec<u64>,
++}
++
++/// One queued reply command: where its packet starts, which names it to the
++/// drain, and its payload.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Query {
++    pub head: u32,
++    pub payload: Vec<u8>,
++}
++
++/// The reply commands between a channel's head and tail.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Pending {
++    pub queries: Vec<Query>,
++    head_gpa: u64,
++    after: u32,
++}
++
++impl Pending {
++    /// Whether the drain has run every command in [`Self::queries`]. An
++    /// unreadable head counts as drained: there is nothing left to wait on.
++    pub fn drained<M: HostMemory>(&self, mem: &M) -> bool {
++        match read_u32(mem, self.head_gpa) {
++            Ok(head) => head.wrapping_sub(self.after) as i32 >= 0,
++            Err(_) => true,
++        }
++    }
++}
++
++/// Find the reply commands between `channel`'s head and tail.
++///
++/// `None` when the ring holds none, which is nearly every doorbell, or when the
++/// ring cannot be read; the drain reports a ring it cannot read.
++pub fn find<M: HostMemory>(
++    mem: &M,
++    root_page: u32,
++    page_shift: u32,
++    channel: u32,
++    cache: &mut RingPages,
++) -> Option<Pending> {
++    if root_page == 0 {
++        return None;
++    }
++    let regs_gpa = pfn_to_gpa(root_page, page_shift) + child_reg_block_offset(channel)?;
++    let head = read_u32(mem, regs_gpa + CHILD_REG_HEAD).ok()?;
++    let tail = read_u32(mem, regs_gpa + CHILD_REG_TAIL).ok()?;
++    if head == tail {
++        return None;
++    }
++    let base_pfn = read_u32(mem, regs_gpa + CHILD_REG_BASE_PFN).ok()?;
++    if base_pfn == 0 {
++        return None;
++    }
++    let page_size = 1u64 << page_shift;
++    if cache.root_page != root_page || cache.base_pfn != base_pfn || cache.page_gpas.is_empty() {
++        let mut list = vec![0u8; page_size as usize];
++        mem.read_gpa(pfn_to_gpa(base_pfn, page_shift), &mut list)
++            .ok()?;
++        *cache = RingPages {
++            root_page,
++            base_pfn,
++            page_gpas: list
++                .chunks_exact(CHILD_RING_PFN_ENTRY_LEN as usize)
++                .map(ld32)
++                .take_while(|&pfn| pfn != 0)
++                .map(|pfn| pfn_to_gpa(pfn, page_shift))
++                .collect(),
++        };
++    }
++    let length = u32::try_from(cache.page_gpas.len() as u64 * page_size).ok()?;
++    let mut remaining = published_byte_count(head, tail, length)?;
++    let mut at = head;
++    let mut queries = Vec::new();
++    let mut after = head;
++    while remaining >= PACKET_HEADER_LEN {
++        let header = read_ring(
++            mem,
++            &cache.page_gpas,
++            length,
++            at,
++            PACKET_HEADER_LEN,
++            page_shift,
++        )?;
++        let total = ld32(&header[PACKET_TOTAL_SIZE..]);
++        if total < PACKET_HEADER_LEN || total > remaining {
++            break;
++        }
++        let payload_at =
++            PACKET_HEADER_LEN + u32::from(ld16(&header[PACKET_STAMP_COUNT..])) * PACKET_STAMP_LEN;
++        if ld16(&header[PACKET_OPCODE..]) == CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN
++            && payload_at <= total
++            && total <= MAX_QUERY_LEN
++        {
++            let packet = read_ring(mem, &cache.page_gpas, length, at, total, page_shift)?;
++            queries.push(Query {
++                head: at,
++                payload: packet[payload_at as usize..].to_vec(),
++            });
++            after = at.wrapping_add(total);
++        }
++        at = at.wrapping_add(total);
++        remaining -= total;
++    }
++    (!queries.is_empty()).then_some(Pending {
++        queries,
++        head_gpa: regs_gpa + CHILD_REG_HEAD,
++        after,
++    })
++}
++
++fn read_ring<M: HostMemory>(
++    mem: &M,
++    page_gpas: &[u64],
++    length: u32,
++    at: u32,
++    len: u32,
++    page_shift: u32,
++) -> Option<Vec<u8>> {
++    let page_size = 1u64 << page_shift;
++    let mut out = vec![0u8; len as usize];
++    for (i, byte) in out.iter_mut().enumerate() {
++        let off = u64::from(at.wrapping_add(i as u32) % length);
++        let page = *page_gpas.get((off >> page_shift) as usize)?;
++        mem.read_gpa(page + (off & (page_size - 1)), std::slice::from_mut(byte))
++            .ok()?;
++    }
++    Some(out)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::model::{PACKET_COMPLETION_STAMP, PAGE_SHIFT_ARM64E};
++    use crate::runtime::host::FakeHost;
++
++    const ROOT_PFN: u32 = 0x10;
++    const LIST_PFN: u32 = 0x11;
++    const RING_PFN: u32 = 0x12;
++    const CHANNEL: u32 = 2;
++    const PAGE: u32 = 1 << PAGE_SHIFT_ARM64E;
++    const DRAW: u16 = 0x22;
++
++    fn gpa(pfn: u32) -> u64 {
++        pfn_to_gpa(pfn, PAGE_SHIFT_ARM64E)
++    }
++
++    fn regs() -> u64 {
++        gpa(ROOT_PFN) + child_reg_block_offset(CHANNEL).unwrap()
++    }
++
++    fn packet(opcode: u16, payload: &[u8]) -> Vec<u8> {
++        let mut out = vec![0u8; PACKET_HEADER_LEN as usize];
++        out[PACKET_OPCODE..PACKET_OPCODE + 2].copy_from_slice(&opcode.to_le_bytes());
++        let total = PACKET_HEADER_LEN + payload.len() as u32;
++        out[PACKET_TOTAL_SIZE..PACKET_TOTAL_SIZE + 4].copy_from_slice(&total.to_le_bytes());
++        out[PACKET_COMPLETION_STAMP..PACKET_COMPLETION_STAMP + 4]
++            .copy_from_slice(&7u32.to_le_bytes());
++        out.extend_from_slice(payload);
++        out
++    }
++
++    /// A one-page ring on `CHANNEL` holding `packets` from `head` on.
++    fn ring(head: u32, packets: &[Vec<u8>]) -> FakeHost {
++        let mut host = FakeHost::new();
++        for pfn in [ROOT_PFN, LIST_PFN, RING_PFN] {
++            host.map_range(gpa(pfn), PAGE as usize, 0);
++        }
++        host.put_u32(gpa(LIST_PFN), RING_PFN);
++        let mut at = head;
++        for packet in packets {
++            for byte in packet {
++                host.write_gpa(gpa(RING_PFN) + u64::from(at % PAGE), &[*byte])
++                    .unwrap();
++                at = at.wrapping_add(1);
++            }
++        }
++        host.put_u32(regs() + CHILD_REG_HEAD, head);
++        host.put_u32(regs() + CHILD_REG_TAIL, at);
++        host.put_u32(regs() + CHILD_REG_BASE_PFN, LIST_PFN);
++        host
++    }
++
++    fn find_in(host: &FakeHost) -> Option<Pending> {
++        find(
++            host,
++            ROOT_PFN,
++            PAGE_SHIFT_ARM64E,
++            CHANNEL,
++            &mut RingPages::default(),
++        )
++    }
++
++    #[test]
++    fn a_ring_without_a_reply_command_holds_nothing_to_answer() {
++        assert_eq!(find_in(&ring(0x40, &[])), None);
++        assert_eq!(find_in(&ring(0x40, &[packet(DRAW, &[1; 20])])), None);
++    }
++
++    #[test]
++    fn a_reply_command_behind_another_packet_is_found_with_its_payload() {
++        let query = [0xabu8; 64];
++        let host = ring(
++            0x40,
++            &[
++                packet(DRAW, &[1; 20]),
++                packet(CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN, &query),
++                packet(DRAW, &[2; 8]),
++            ],
++        );
++        let pending = find_in(&host).expect("the query is in the ring");
++        assert_eq!(
++            pending.queries,
++            vec![Query {
++                head: 0x40 + 32,
++                payload: query.to_vec(),
++            }]
++        );
++    }
++
++    #[test]
++    fn the_ring_is_drained_once_the_head_passes_the_last_reply_command() {
++        let query = packet(CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN, &[3; 64]);
++        let after = 0x40 + query.len() as u32;
++        let mut host = ring(0x40, &[query, packet(DRAW, &[2; 8])]);
++        let pending = find_in(&host).expect("the query is in the ring");
++        assert!(!pending.drained(&host));
++        host.put_u32(regs() + CHILD_REG_HEAD, after - 1);
++        assert!(!pending.drained(&host));
++        host.put_u32(regs() + CHILD_REG_HEAD, after);
++        assert!(pending.drained(&host));
++    }
++
++    #[test]
++    fn a_reply_command_that_wraps_the_ring_is_read_whole() {
++        let query: Vec<u8> = (0..64).collect();
++        let head = PAGE - 20;
++        let host = ring(
++            head,
++            &[packet(CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN, &query)],
++        );
++        let pending = find_in(&host).expect("the query is in the ring");
++        assert_eq!(
++            pending.queries,
++            vec![Query {
++                head,
++                payload: query
++            }]
++        );
++    }
++
++    #[test]
++    fn a_packet_longer_than_the_ring_holds_ends_the_walk() {
++        let mut host = ring(0x40, &[packet(DRAW, &[1; 20])]);
++        // A total size past the tail: the producer has not published it.
++        host.put_u32(gpa(RING_PFN) + 0x40 + PACKET_TOTAL_SIZE as u64, 0x1000);
++        assert_eq!(find_in(&host), None);
++    }
++}
+-- 
+2.43.0
+

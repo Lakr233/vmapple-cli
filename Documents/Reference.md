@@ -16,7 +16,7 @@ disk boots through OpenAVB, iBoot and XNU to `launchd` without a host.
 | 14.6.1 (23G93) | works, 5 min | works with `account`: login, desktop, Terminal; a cold and two warm boots on 2026-11-09, no panic; a warm boot on reims 0001–0039 hung before the display started, which reims 0040 fixes | the menu bar, the Dock, Finder and Terminal's text draw; the desktop is yellow | qemu 0001–0016, reims 0001–0040, metal2vulkan 0001–0003 |
 | 15.6.1 (24G90) | works, 6 min; one of two attempts timed out waiting for the restore OS's USB | works: Setup Assistant, account, login, desktop, Dock, menus, Terminal; a cold and a warm boot on 2026-11-09, no panic | the login window's wallpaper, the menu bar, the Dock and Terminal's text draw in their colours; the desktop and the Setup Assistant panels after the language panel sit on macOS's yellow fallback wallpaper (see below) | qemu 0001–0016, reims 0001–0039, metal2vulkan 0001–0003 |
 | 26.6.2 (25G83) | works, 6 min, twice | works with `account`: login, desktop; of two cold boots on 2026-11-09 at this level one was clean and one panicked while shutting down (`Debugger synch pending on cpu 2`) | the menu bar, widgets and every Dock icon draw; the background is dark grey or near-white instead of the wallpaper, and Spotlight and the menu bar garble | qemu 0001–0016, reims 0001–0040, metal2vulkan 0001–0003 |
-| 27.2 (26B123) | works, 6 min | works with `account` (Setup Assistant alone restarts the guest after Data & Privacy): login, the user's own setup panels, desktop; seven boots on 2026-11-09, five cold and two warm, no panic | the desktop wallpaper, menu bar, widgets and Terminal's text draw; the Dock's icons are grey placeholders, glass controls carry small rainbow blocks, and in one boot the screen turned to stripes after Terminal was opened | qemu 0001–0016, reims 0001–0039 (two boots; five on 0001–0033), metal2vulkan 0001–0003 |
+| 27.2 (26B123) | works, 6 min | works with `account` (Setup Assistant alone restarts the guest after Data & Privacy): login, the user's own setup panels, desktop; seven boots on 2026-11-09, five cold and two warm, no panic | the desktop wallpaper, menu bar, widgets and Terminal's text draw; glass controls carry small rainbow blocks, and in one boot the screen turned to stripes after Terminal was opened. The Dock's icons were grey placeholders up to reims 0040; on a pulled image at 0045, 13 of the 19 draw, one as a black square, and in some boots the menu bar is a black band | qemu 0001–0016, reims 0001–0039 (two boots; five on 0001–0033), metal2vulkan 0001–0003; the Dock on a pulled image with qemu 0001–0017 and reims 0001–0045 |
 
 Every row was rerun on 2026-11-09 with Reims's wire watch and guard on, cold
 (Reims translates the shaders and builds the pipelines the boot meets) and warm
@@ -26,6 +26,12 @@ through the night, so the last column names the level each row last ran at;
 reims 0040 only fixes a register read-back race, and 13.6, 15.6.1 and 27.2 were
 not booted with it. Causes, fixes and what is still wrong:
 [stability-2026-11-09.md](Research/stability-2026-11-09.md).
+
+Reims 0041–0045 are for 27.2's Dock icons and were run on 2026-11-10: a pulled
+27.2 twice to its desktop, and 13.6, 14.6.1, 15.6.1, 26.6.2 and a restored 27.2
+once each to the login window or the first setup panel, without logging in and
+with no panic. What they fix and what is left:
+[dock-icons-2026-11-10.md](Research/dock-icons-2026-11-10.md).
 
 steelbrain's rewritten Reims and its QEMU were tried apart from this stack. In
 one cold boot each, 26.6.2 drew its wallpaper, Dock and Terminal and came
@@ -123,9 +129,10 @@ gives the root disk the same vendor configuration as the framework. A VM that
 2026-11-09 with `macos-golden-gate-vanilla:27.2`: two cold boots to the desktop,
 logged in automatically, and no panic. Later that day a fresh pull and that disk
 were booted again after runs that `boot --seconds` ended at 15 to 150 s and after
-a QEMU killed in userspace, and every boot reached `loginwindow`. The Dock icons
-are grey placeholders, as on a restored 27.2. The causes and the checks are in
-[Research/tart-images.md](Research/tart-images.md).
+a QEMU killed in userspace, and every boot reached `loginwindow`. The causes and
+the checks are in [Research/tart-images.md](Research/tart-images.md). Its Dock
+icons were grey placeholders until `Patches/reims` 0041–0045; see
+[Research/dock-icons-2026-11-10.md](Research/dock-icons-2026-11-10.md).
 
 ## Build
 

@@ -184,7 +184,8 @@ At 0040 the Reims library tests pass, 2311 of 2311, and QEMU's
   frame's EXEC had turned into a NOP of the same length. Builds later in a boot
   reach 8.6 to 9.0 s.
 - 27.2: stripes after opening Terminal (one boot of seven, also seen on
-  2026-11-08); the Dock's icons are grey placeholders; small rainbow blocks on
+  2026-11-08); the Dock's icons are grey placeholders (most draw from 0045, see
+  [dock-icons-2026-11-10.md](dock-icons-2026-11-10.md)); small rainbow blocks on
   glass controls.
 - 26.6.2: the background is dark grey or near-white; Spotlight and the menu bar
   garble.
