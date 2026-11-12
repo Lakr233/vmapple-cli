@@ -1,0 +1,184 @@
+From 3ce365bc433fe8760c71db7f8c583da3e028910f Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Thu, 12 Nov 2026 12:55:58 +0800
+Subject: [PATCH 67/68] vgpu: size task object lists from wire byte length and
+ gate type4 probes
+
+---
+ crates/reims-vgpu/src/runtime/drain/mod.rs   | 10 ++++-
+ crates/reims-vgpu/src/runtime/drain/tests.rs | 46 ++++++++++++++++++++
+ crates/reims-vgpu/src/runtime/exec/mod.rs    | 16 +++++--
+ crates/reims-vgpu/src/runtime/objects/mod.rs | 34 +++++++++++++++
+ 4 files changed, 101 insertions(+), 5 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/drain/mod.rs b/crates/reims-vgpu/src/runtime/drain/mod.rs
+index 2fdc48c7f..29072e837 100644
+--- a/crates/reims-vgpu/src/runtime/drain/mod.rs
++++ b/crates/reims-vgpu/src/runtime/drain/mod.rs
+@@ -511,7 +511,13 @@ fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Optio
+     }
+     let task_id = ld32(&payload[SET_OBJECT_LIST_TASK_ID..]);
+     let pfn = ld32(&payload[SET_OBJECT_LIST_PFN..]);
+-    let count = ld32(&payload[SET_OBJECT_LIST_COUNT..]);
++    // Wire `+0x08` carries the object-list allocation's byte length
++    // (`49_152` = 3 × 16 KiB = 4 096 × 12 B on arm64, growing to `98_304` =
++    // 8 192 × 12 B; `1_048_576` = 1 MiB = 87 381 × 12 B on x86), not an entry
++    // count. Converting to 12-byte slots bounds speculative probes to the
++    // mapped list allocation instead of walking 12× past its end.
++    let byte_len = ld32(&payload[SET_OBJECT_LIST_COUNT..]);
++    let count = byte_len / (crate::runtime::decode::resource::OBJECT_LIST_ENTRY_LEN as u32);
+     // A new object list changes the construction input for references this
+     // device has not constructed yet. Exact-window buffer resolutions are not
+     // object states and therefore retire here. Typed objects already
+@@ -529,7 +535,7 @@ fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Optio
+         (u64::from(task_id) << 48) ^ (u64::from(pfn) << 24) ^ u64::from(count),
+     ) {
+         crate::observe::off(format!(
+-            "set_object_list site={} task={task_id} pfn={pfn:#x} count={count} \
++            "set_object_list site={} task={task_id} pfn={pfn:#x} bytes={byte_len} count={count} \
+              applied={} plen={}",
+             packet_site(channel),
+             applied as u8,
+diff --git a/crates/reims-vgpu/src/runtime/drain/tests.rs b/crates/reims-vgpu/src/runtime/drain/tests.rs
+index d84340d64..61e8163b2 100644
+--- a/crates/reims-vgpu/src/runtime/drain/tests.rs
++++ b/crates/reims-vgpu/src/runtime/drain/tests.rs
+@@ -6788,3 +6788,49 @@ fn the_mapper_ring_backlog_names_an_overrun_and_a_consumer_ahead() {
+     assert_eq!(ring_backlog(10, 4, 4), RingBacklog::Overrun { lost: 2 });
+     assert_eq!(ring_backlog(3, 4, 4), RingBacklog::ConsumerAhead);
+ }
++
++#[test]
++fn set_object_list_converts_wire_byte_length_to_12_byte_slot_count() {
++    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
++    let mut host = FakeHost::new();
++    state.define_task(3, 0x1000, 1);
++
++    let mut root_payload = Vec::with_capacity(12);
++    root_payload.extend_from_slice(&3u32.to_le_bytes());
++    root_payload.extend_from_slice(&0x1u32.to_le_bytes());
++    root_payload.extend_from_slice(&49_152u32.to_le_bytes());
++    process_root_packet(
++        &mut state,
++        &mut host,
++        &Packet {
++            opcode: ROOT_OP_SET_OBJECT_LIST,
++            stamp_waits: Vec::new(),
++            total_size: PACKET_HEADER_LEN + 12,
++            completion_stamp: 0,
++            payload: root_payload,
++            next_head: 0,
++        },
++    );
++    assert_eq!(state.tasks[3].object_list_pfn, 0x1);
++    assert_eq!(state.tasks[3].object_list_count, 4096);
++
++    let mut child_payload = Vec::with_capacity(12);
++    child_payload.extend_from_slice(&3u32.to_le_bytes());
++    child_payload.extend_from_slice(&0x914u32.to_le_bytes());
++    child_payload.extend_from_slice(&98_304u32.to_le_bytes());
++    process_child_packet(
++        &mut state,
++        &mut host,
++        2,
++        &Packet {
++            opcode: CHILD_OP_SET_OBJECT_LIST,
++            stamp_waits: Vec::new(),
++            total_size: PACKET_HEADER_LEN + 12,
++            completion_stamp: 0,
++            payload: child_payload,
++            next_head: 0,
++        },
++    );
++    assert_eq!(state.tasks[3].object_list_pfn, 0x914);
++    assert_eq!(state.tasks[3].object_list_count, 8192);
++}
+diff --git a/crates/reims-vgpu/src/runtime/exec/mod.rs b/crates/reims-vgpu/src/runtime/exec/mod.rs
+index 7db2de0c1..6cc08749e 100644
+--- a/crates/reims-vgpu/src/runtime/exec/mod.rs
++++ b/crates/reims-vgpu/src/runtime/exec/mod.rs
+@@ -1969,7 +1969,9 @@ fn handle_render_record<M: HostMemory + HostOps>(
+                         if !out.type11_mappings.contains(&m) {
+                             out.type11_mappings.push(m);
+                         }
+-                    } else if objects::resolve_type4_surface(state, host, texture_ref) {
++                    } else if objects::ref_may_name_type4_surface(state, host, task_id, texture_ref)
++                        && objects::resolve_type4_surface(state, host, texture_ref)
++                    {
+                         // x86 type-4: object ref is surface_id / mapping_id.
+                         if !out.type11_mappings.contains(&texture_ref) {
+                             out.type11_mappings.push(texture_ref);
+@@ -2218,7 +2220,13 @@ fn handle_render_record<M: HostMemory + HostOps>(
+                         if !out.type11_mappings.contains(&m) {
+                             out.type11_mappings.push(m);
+                         }
+-                    } else if objects::resolve_type4_surface(state, host, published_ref) {
++                    } else if objects::ref_may_name_type4_surface(
++                        state,
++                        host,
++                        task_id,
++                        published_ref,
++                    ) && objects::resolve_type4_surface(state, host, published_ref)
++                    {
+                         // A type-4 attachment is its own mapping id — the arm
+                         // below pushes `att.texture_ref` where the type-11 arm
+                         // pushes the id it resolved to.
+@@ -4302,7 +4310,9 @@ fn dirty_color_targets<M: HostMemory + HostOps>(
+             // The guest pages are the only copy of a type-11 surface, so there
+             // is no mirror to drop — only bump gen for scanout skips.
+             let _ = state.mark_mapping_written(mid);
+-        } else if objects::resolve_type4_surface(state, host, tex_ref) {
++        } else if objects::ref_may_name_type4_surface(state, host, task_id, tex_ref)
++            && objects::resolve_type4_surface(state, host, tex_ref)
++        {
+             let _ = state.mark_mapping_written(tex_ref);
+         }
+     }
+diff --git a/crates/reims-vgpu/src/runtime/objects/mod.rs b/crates/reims-vgpu/src/runtime/objects/mod.rs
+index 73c80b5b0..8c3eb2b98 100644
+--- a/crates/reims-vgpu/src/runtime/objects/mod.rs
++++ b/crates/reims-vgpu/src/runtime/objects/mod.rs
+@@ -2296,6 +2296,40 @@ fn apply_type4_backing<M: HostMemory>(
+     true
+ }
+ 
++/// Whether `ref_` in `task_id` can directly name a type-4 surface id.
++///
++/// A slot in `task_id` that already holds a non-surface task-local resource
++/// (e.g. a type-2/3/12/16 GVA texture, buffer, or memoryless target) is never a
++/// global `surface_id` in another task's heap. Skipping the cross-task type-4
++/// search in that case avoids probing every live task's object list on ordinary
++/// GVA texture binds and attachments. When `task_id` has no entry at `ref_`,
++/// `true` keeps the search open for callers naming a bare `surface_id` owned by
++/// task 0.
++pub fn ref_may_name_type4_surface<M: HostMemory>(
++    state: &DeviceState,
++    host: &M,
++    task_id: u32,
++    ref_: u32,
++) -> bool {
++    if !crate::model::is_mapping_id(ref_) {
++        return false;
++    }
++    let obj_type = state
++        .task_resources
++        .get(task_id, ref_)
++        .map(|r| r.entry.object_type)
++        .or_else(|| probe_list_entry(state, host, task_id, ref_).map(|e| e.object_type));
++    match obj_type {
++        None => true,
++        Some(
++            OBJECT_TYPE_SURFACE
++            | OBJECT_TYPE_REF_TEXTURE
++            | crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VIEW,
++        ) => true,
++        Some(_) => false,
++    }
++}
++
+ /// Resolve present `surface_id` to type-4 backing pages + geometry.
+ ///
+ /// Scans active tasks: object-list slot `surface_id` must be type-4 (heap is
+-- 
+2.43.0
+

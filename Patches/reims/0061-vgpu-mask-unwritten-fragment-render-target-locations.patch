@@ -1,0 +1,275 @@
+From 4ff9a952331780d73cd3f981a8cac02eef49a94c Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Thu, 12 Nov 2026 00:31:14 +0800
+Subject: [PATCH 61/68] vgpu: mask unwritten fragment render-target locations
+ and match color0 by slot
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In Metal, omitting [[color(i)]] from a fragment shader's return type leaves attachment i untouched even when the render pipeline's color attachment descriptor carries the default MTLColorWriteMaskAll. Vulkan instead writes undefined values to any render-pass color attachment whose colorWriteMask is non-zero when the fragment output interface declares no Location = i (Vulkan 15.2).
+
+Across macOS 27.2 RenderBox and WindowServer MRT passes, coverage-only shaders (Location 1), sublayer shaders (Locations 1 and 2), and color0-only shaders (Location 0) share multi-attachment render passes. Masking unwritten locations only when render_targets was completely empty — and before secondary_targets was populated — wiped sibling attachments (icon base plates, UI button labels, and Liquid Glass SDF/refraction maps) to zero.
+
+Also resolve RenderPipelineDescriptor.color0 and the primary Vulkan attachment by slot == 0 rather than color_attachments.first(), preventing sparse secondary-only pipelines from aliasing slot 1's blend state onto slot 0.
+---
+ .../src/runtime/decode/resource/mod.rs        |   2 +-
+ .../src/runtime/decode/resource/tests.rs      |  39 +++++
+ crates/reims-vgpu/src/runtime/draw/vulkan.rs  | 159 ++++++++++++++++--
+ 3 files changed, 186 insertions(+), 14 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/decode/resource/mod.rs b/crates/reims-vgpu/src/runtime/decode/resource/mod.rs
+index 9a58860e1..23a6e8793 100644
+--- a/crates/reims-vgpu/src/runtime/decode/resource/mod.rs
++++ b/crates/reims-vgpu/src/runtime/decode/resource/mod.rs
+@@ -2956,7 +2956,7 @@ pub fn decode_render_pipeline_descriptor(
+         }
+         if color_abs < declared {
+             out.color_attachments = parse_color_attachments(bytes, declared, color_abs)?;
+-            if let Some(c0) = out.color_attachments.first().copied() {
++            if let Some(c0) = out.color_attachments.iter().find(|a| a.slot == 0).copied() {
+                 out.color0 = c0;
+             }
+         }
+diff --git a/crates/reims-vgpu/src/runtime/decode/resource/tests.rs b/crates/reims-vgpu/src/runtime/decode/resource/tests.rs
+index 1adb133fb..73652b26b 100644
+--- a/crates/reims-vgpu/src/runtime/decode/resource/tests.rs
++++ b/crates/reims-vgpu/src/runtime/decode/resource/tests.rs
+@@ -3201,3 +3201,42 @@ fn a_declared_input_primitive_topology_does_not_refuse_the_pipeline() {
+     assert!(RENDER_PIPELINE_TAGS_BENIGN.contains(&PIPELINE_TAG_INPUT_PRIMITIVE_TOPOLOGY));
+     assert!(!RENDER_PIPELINE_TAGS_BENIGN.contains(&0x6d));
+ }
++
++#[test]
++fn sparse_secondary_color_attachment_does_not_alias_color0() {
++    use crate::contract::endian::st32;
++
++    let mut b = vec![0u8; 64];
++    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
++    st32(&mut b[8..], 21);
++    b[16] = 1;
++    b[17] = PIPELINE_TAG_COLOR_ATTACH_OFFSET;
++    b[18] = 4;
++    let color_rel = 8u32;
++    st32(&mut b[19..], color_rel);
++    let section = 16 + color_rel as usize;
++    st32(&mut b[section..], 1);
++    st32(&mut b[section + 4..], 8);
++    let entry = section + 8;
++    b[entry] = 3;
++    b[entry + 1] = COLOR_ATTACHMENT_TAG_INDEX;
++    b[entry + 2] = 4;
++    st32(&mut b[entry + 3..], 1);
++    b[entry + 7] = COLOR_ATTACHMENT_TAG_PIXEL_FORMAT;
++    b[entry + 8] = 4;
++    st32(&mut b[entry + 9..], 0x69);
++    b[entry + 13] = COLOR_ATTACHMENT_TAG_BLEND_ENABLE;
++    b[entry + 14] = 4;
++    st32(&mut b[entry + 15..], 1);
++    let end = (entry + 19 + 3) & !3;
++    b.truncate(end);
++    let payload_len = (end - 16) as u32;
++    st32(&mut b[4..], end as u32);
++    st32(&mut b[12..], payload_len);
++
++    let pd = decode_render_pipeline_descriptor(&b).expect("sparse secondary pipeline decodes");
++    assert_eq!(pd.color_attachments.len(), 1);
++    assert_eq!(pd.color_attachments[0].slot, 1);
++    assert!(pd.color_attachments[0].blending_enabled);
++    assert_eq!(pd.color0, PipelineColorAttachment::default());
++}
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index d7721bb50..bd769667e 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -6629,6 +6629,35 @@ pub(super) fn secondary_target_identity<M: HostMemory + HostOps>(
+     }
+ }
+ 
++/// Zero color write masks and disable blending on attachments not declared by
++/// the fragment stage output interface.
++///
++/// In Metal, omitting `[[color(i)]]` from a fragment return type leaves
++/// attachment `i` untouched even when the pipeline color attachment carries the
++/// default `MTLColorWriteMaskAll`. Vulkan instead writes undefined values to
++/// every render-pass color attachment whose `colorWriteMask` is non-zero when
++/// the fragment shader declares no output at `Location = i` (Vulkan 15.2,
++/// Fragment Output Interface).
++fn mask_unwritten_render_targets(
++    render_targets: &[metal2vulkan::reflect::RenderTarget],
++    primary_mask: &mut crate::runtime::decode::resource::ColorWriteMask,
++    primary_blend: &mut Option<crate::backend::vulkan::engine::BlendStateResource>,
++    secondary_targets: &mut [crate::backend::vulkan::engine::SecondaryColorTarget],
++) {
++    let none = crate::runtime::decode::resource::ColorWriteMask::NONE;
++    if !render_targets.iter().any(|rt| rt.location == 0) {
++        *primary_mask = none;
++        *primary_blend = None;
++    }
++    for (idx, target) in secondary_targets.iter_mut().enumerate() {
++        let loc = (idx + 1) as u32;
++        if !render_targets.iter().any(|rt| rt.location == loc) {
++            target.color_write_mask = none;
++            target.blend = None;
++        }
++    }
++}
++
+ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
+     state: &mut DeviceState,
+     host: &mut M,
+@@ -8955,20 +8984,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+         // alone, so gating the mask on blending would drop it exactly where the
+         // guest is replacing rather than compositing.
+         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Assemble);
+-        resources.color_write_mask = pd.color0.write_mask;
+-        if f_shader.reflection.render_targets.is_empty() {
+-            // The fragment stage writes no colour (a scratch storage write, or a
+-            // pipeline with no fragment function), so no attachment may change.
+-            let none = crate::runtime::decode::resource::ColorWriteMask::new(0)
+-                .expect("an empty mask is in range");
+-            resources.color_write_mask = none;
+-            for target in &mut resources.secondary_targets {
+-                target.color_write_mask = none;
+-            }
+-        }
+-        if pd.color0.blending_enabled {
++        let primary_att = if pd.color_attachments.is_empty() {
++            Some(&pd.color0)
++        } else {
++            pd.color_attachments.iter().find(|a| a.slot == 0)
++        };
++        let empty_mask = crate::runtime::decode::resource::ColorWriteMask::new(0)
++            .expect("an empty mask is in range");
++        resources.color_write_mask = primary_att.map_or(empty_mask, |a| a.write_mask);
++        if let Some(att0) = primary_att.filter(|a| a.blending_enabled) {
+             let constants = req.blend_color.unwrap_or([0.0; 4]);
+-            match translate::blend::state(&pd.color0, constants) {
++            match translate::blend::state(att0, constants) {
+                 Ok(b) => {
+                     resources.blend = Some(b);
+                 }
+@@ -9528,6 +9554,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+                 )
+             })?;
+         }
++        mask_unwritten_render_targets(
++            &f_shader.reflection.render_targets,
++            &mut resources.color_write_mask,
++            &mut resources.blend,
++            &mut resources.secondary_targets,
++        );
+         // The engine's own typed `DrawError` (a `vk_*` VkCall slug, a
+         // `DrawReason` refusal, an interim `_untyped`) propagates unchanged so
+         // the boundary below names the engine's specific check as the primary
+@@ -13142,6 +13174,107 @@ mod vulkan_split_tests {
+         req.colors[0].buffer_backed = true;
+         assert!(!super::gva_store_defer_eligible(&req));
+     }
++
++    #[test]
++    fn mask_unwritten_render_targets_preserves_only_declared_locations() {
++        use crate::backend::vulkan::engine::{
++            BlendFactor, BlendOp, BlendStateResource, SecondaryColorTarget, TargetIdentity,
++        };
++        use crate::runtime::decode::resource::ColorWriteMask;
++        use metal2vulkan::reflect::RenderTarget;
++
++        let sample_blend = BlendStateResource {
++            src_color: BlendFactor::One,
++            dst_color: BlendFactor::OneMinusSrcAlpha,
++            color_op: BlendOp::Add,
++            src_alpha: BlendFactor::One,
++            dst_alpha: BlendFactor::OneMinusSrcAlpha,
++            alpha_op: BlendOp::Add,
++            constants: [0.0; 4],
++        };
++        let make_secs = || {
++            vec![
++                SecondaryColorTarget {
++                    identity: TargetIdentity::Texture {
++                        ref_: 11,
++                        width: 64,
++                        height: 64,
++                        generation: 1,
++                        stencil: false,
++                    },
++                    width: 64,
++                    height: 64,
++                    format: ash::vk::Format::R8G8B8A8_UNORM,
++                    clear: [0.0; 4],
++                    load: true,
++                    blend: Some(sample_blend),
++                    color_write_mask: ColorWriteMask::ALL,
++                },
++                SecondaryColorTarget {
++                    identity: TargetIdentity::Texture {
++                        ref_: 12,
++                        width: 64,
++                        height: 64,
++                        generation: 1,
++                        stencil: false,
++                    },
++                    width: 64,
++                    height: 64,
++                    format: ash::vk::Format::R8G8B8A8_UNORM,
++                    clear: [0.0; 4],
++                    load: true,
++                    blend: Some(sample_blend),
++                    color_write_mask: ColorWriteMask::ALL,
++                },
++            ]
++        };
++        let rt = |location| RenderTarget {
++            member_index: 0,
++            location,
++            type_name: None,
++        };
++
++        // Coverage-only shader (`[[color(1)]]`) in a 3-MRT RenderBox pass:
++        // slot 0 and slot 2 must be masked off; slot 1 keeps mask + blend.
++        let mut c0_mask = ColorWriteMask::ALL;
++        let mut c0_blend = Some(sample_blend);
++        let mut secs = make_secs();
++        super::mask_unwritten_render_targets(&[rt(1)], &mut c0_mask, &mut c0_blend, &mut secs);
++        assert_eq!(c0_mask, ColorWriteMask::NONE);
++        assert!(c0_blend.is_none());
++        assert_eq!(secs[0].color_write_mask, ColorWriteMask::ALL);
++        assert!(secs[0].blend.is_some());
++        assert_eq!(secs[1].color_write_mask, ColorWriteMask::NONE);
++        assert!(secs[1].blend.is_none());
++
++        // Color0-only shader (`[[color(0)]]`) in a 2-MRT Liquid Glass pass:
++        // slot 0 keeps mask + blend; slot 1 SDF/refraction map is untouched.
++        let mut c0_mask = ColorWriteMask::ALL;
++        let mut c0_blend = Some(sample_blend);
++        let mut secs = make_secs();
++        secs.truncate(1);
++        super::mask_unwritten_render_targets(&[rt(0)], &mut c0_mask, &mut c0_blend, &mut secs);
++        assert_eq!(c0_mask, ColorWriteMask::ALL);
++        assert!(c0_blend.is_some());
++        assert_eq!(secs[0].color_write_mask, ColorWriteMask::NONE);
++        assert!(secs[0].blend.is_none());
++
++        // Sublayer shader (`[[color(1)]], [[color(2)]]`) in a 3-MRT pass:
++        // slot 0 is masked off; slots 1 and 2 remain active.
++        let mut c0_mask = ColorWriteMask::ALL;
++        let mut c0_blend = Some(sample_blend);
++        let mut secs = make_secs();
++        super::mask_unwritten_render_targets(
++            &[rt(1), rt(2)],
++            &mut c0_mask,
++            &mut c0_blend,
++            &mut secs,
++        );
++        assert_eq!(c0_mask, ColorWriteMask::NONE);
++        assert!(c0_blend.is_none());
++        assert_eq!(secs[0].color_write_mask, ColorWriteMask::ALL);
++        assert_eq!(secs[1].color_write_mask, ColorWriteMask::ALL);
++    }
+ }
+ 
+ /// Whether the CLEAR-seed Store at the head of a draw chain runs, for this
+-- 
+2.43.0
+

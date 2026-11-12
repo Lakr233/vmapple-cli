@@ -1,0 +1,261 @@
+From eaf40ffe7750f483439b7ed0236c26bbc910b1a6 Mon Sep 17 00:00:00 2001
+From: Anees Iqbal <hello@aneesiqbal.ai>
+Date: Sat, 29 Aug 2026 03:17:07 +0300
+Subject: [PATCH 46/68] vgpu: a clear-only pass publishes through its resolve
+ texture, for both resolving store actions
+
+Component: crates/reims-vgpu, runtime::exec clear rail; x86 macOS / Linux Vulkan
+pathway, found on the macos-13 rail.
+
+`apply_clear` refused `MTLStoreActionStoreAndMultisampleResolve` by name and
+dropped the guest's clear, immediately above the code that already handled its
+sibling correctly by retargeting the write to the resolve texture.
+
+The contract says the two are the same here, and it is public API rather than
+anything recovered: `MTLLoadActionClear` with no draws leaves **every sample** of
+the attachment holding `clearColor`, so resolving those samples yields exactly
+`clearColor`. Both resolve-carrying store actions therefore publish the same
+single-sample result into `resolveTexture`. They differ only in whether the
+multisample texture is additionally retained, which is not the surface this path
+publishes and not one the guest scans out -- which is why the sibling had always
+ignored that half too.
+
+This matters more than it did last week. `apply_clear` is now the only thing that
+lands a pass clear in guest memory, because the commit before this one removed the
+eager pre-draw seed that used to cover the same attachments. That seed's gate was
+`store_action_publishes_single_sample`, which accepts
+`StoreAndMultisampleResolve`; this refusal does not. So the previous commit took
+away the cover for a case that was already being dropped, and the two together
+would have lost every such clear with nothing but this one line to say so.
+
+The decision is now a predicate, `clear_publish_target` -> `ClearPublish`, so the
+rule for which texture a clear lands in is stated once and can be tested without
+a device. `apply_clear` consumes its answer instead of re-deriving the retarget
+from `resolve_texture_ref`, which was the same rule spelled a second time. The
+`Direct` case keeps the attachment exactly as the guest declared it, level and
+all; only `Resolved` rewrites the target, and level zero there is a property of a
+resolve target rather than a general normalisation.
+
+`clear_multisample_resolve_target_missing` still refuses a resolve that names no
+resolve texture, now for both actions and carrying the store action, so admitting
+the pair above cannot silently admit that.
+
+Found by a human opening every app in the Dock on a driven macos-13 boot, which
+fired the refusal 27 times in a 16 s window on one attachment pair (`source=4
+resolve=3`). No automated probe in this tree had produced it: a
+sustained-animation boot of the same build refused zero draws and cleared
+zero passes this way.
+
+Verified: `cargo test -p reims-vgpu --no-default-features --features host-window
+-- --test-threads=1` -- 2209 lib green, other targets green;
+`wire_fixtures_reach_the_decoders` fails 2, byte-identical to master and
+pre-existing. clippy `-D warnings` exits 0 on all three arms.
+
+Gated by `a_clear_publishes_through_the_resolve_texture_for_both_resolving_store_actions`,
+verified by ablation: restoring the refusal fails it with `NotPublished` against
+the expected `Resolved(3)`.
+
+Not verified at commit time: no live boot yet with this fix in the device, so the
+27-refusal count has not been observed going to zero, and no frame has been
+compared. No `conformance/` case: the battery does not exist on this base.
+---
+ crates/reims-vgpu/src/runtime/exec/mod.rs   | 88 +++++++++++++++------
+ crates/reims-vgpu/src/runtime/exec/tests.rs | 75 ++++++++++++++++++
+ 2 files changed, 138 insertions(+), 25 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/exec/mod.rs b/crates/reims-vgpu/src/runtime/exec/mod.rs
+index bc48a463f..b1ba06626 100644
+--- a/crates/reims-vgpu/src/runtime/exec/mod.rs
++++ b/crates/reims-vgpu/src/runtime/exec/mod.rs
+@@ -4334,42 +4334,80 @@ fn land_chain_before_abandon<M: HostMemory + HostOps>(
+     dirty_color_targets(state, host, task_id, &acc.color_targets);
+ }
+ 
++/// Where a clear-only pass publishes its single-sample result.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum ClearPublish {
++    /// Publish into the attachment's own texture, exactly as declared.
++    Direct,
++    /// Publish into the resolve texture instead of the multisample one.
++    Resolved(u32),
++    /// This store action publishes no single-sample result, or there is no
++    /// attachment texture at all. Not a loss: the guest asked for nothing.
++    NotPublished,
++    /// A resolve-carrying store action naming no resolve texture. The guest
++    /// asked for a resolve and gave nowhere to put it.
++    ResolveTargetMissing,
++}
++
++/// Which texture a clear-only pass's colour attachment publishes into.
++///
++/// `MTLLoadActionClear` with no draws leaves **every sample** of the attachment
++/// holding `clearColor`, so resolving those samples yields exactly `clearColor`.
++/// Both resolve-carrying store actions therefore publish the same single-sample
++/// result, into `resolveTexture`, and they differ only in whether the
++/// multisample texture is *also* retained — which is not the surface this path
++/// publishes and not one the guest scans out.
++///
++/// That is why `MTLStoreActionStoreAndMultisampleResolve` is handled here rather
++/// than refused. It used to be refused by name while the code immediately below
++/// already did the right thing for its sibling: retarget the write to
++/// `resolveTexture`. On a driven macos-13 app sweep that refusal fired 27 times
++/// on one attachment pair, each one a clear the guest asked for and did not get.
++fn clear_publish_target(att: &ColorAttachment) -> ClearPublish {
++    if att.texture_ref == 0 || !store_action_publishes_single_sample(att.store_action) {
++        return ClearPublish::NotPublished;
++    }
++    let resolves = matches!(
++        att.store_action,
++        MTL_STORE_ACTION_MULTISAMPLE_RESOLVE | MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE
++    );
++    if resolves {
++        if att.resolve_texture_ref == 0 {
++            return ClearPublish::ResolveTargetMissing;
++        }
++        return ClearPublish::Resolved(att.resolve_texture_ref);
++    }
++    ClearPublish::Direct
++}
++
+ fn apply_clear<M: HostMemory + HostOps>(
+     state: &mut DeviceState,
+     host: &mut M,
+     task_id: u32,
+     att: &ColorAttachment,
+ ) -> bool {
+-    if att.texture_ref == 0 || !store_action_publishes_single_sample(att.store_action) {
+-        return false;
+-    }
+-    if att.store_action == MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE {
+-        crate::observe::fail(format!(
+-            "render_clear reason=clear_store_and_multisample_resolve_unsupported \
+-             source={} resolve={}",
+-            att.texture_ref, att.resolve_texture_ref
+-        ));
+-        return false;
+-    }
+-    if att.store_action == MTL_STORE_ACTION_MULTISAMPLE_RESOLVE
+-        && att.resolve_texture_ref == 0
+-    {
+-        crate::observe::fail(format!(
+-            "render_clear reason=clear_multisample_resolve_target_missing source={}",
+-            att.texture_ref
+-        ));
+-        return false;
+-    }
+-    let target = if att.resolve_texture_ref != 0 {
+-        ColorAttachment {
+-            texture_ref: att.resolve_texture_ref,
++    let target = match clear_publish_target(att) {
++        // Declared single-sample: published exactly as the guest stated it,
++        // level and all.
++        ClearPublish::Direct => *att,
++        // A resolve: the clear lands in the resolve texture as an ordinary
++        // single-sample store. Level zero because a resolve target has one.
++        ClearPublish::Resolved(texture_ref) => ColorAttachment {
++            texture_ref,
+             resolve_texture_ref: 0,
+             level: 0,
+             store_action: MTL_STORE_ACTION_STORE,
+             ..*att
++        },
++        ClearPublish::NotPublished => return false,
++        ClearPublish::ResolveTargetMissing => {
++            crate::observe::fail(format!(
++                "render_clear reason=clear_multisample_resolve_target_missing source={} \
++                 store={}",
++                att.texture_ref, att.store_action
++            ));
++            return false;
+         }
+-    } else {
+-        *att
+     };
+     // Prefer full draw-path resolve (type-11 or type-2/3 GVA wallpaper targets).
+     let Some(req) =
+diff --git a/crates/reims-vgpu/src/runtime/exec/tests.rs b/crates/reims-vgpu/src/runtime/exec/tests.rs
+index cc5320666..2413a34f1 100644
+--- a/crates/reims-vgpu/src/runtime/exec/tests.rs
++++ b/crates/reims-vgpu/src/runtime/exec/tests.rs
+@@ -5008,3 +5008,78 @@ fn a_clear_seeds_the_pass_for_any_store_action_and_publishes_only_for_store() {
+          guest pages would be inventing content the guest declined"
+     );
+ }
++
++/// A clear-only pass publishes through its resolve texture for **both**
++/// resolve-carrying store actions, not just one of them.
++///
++/// `MTLLoadActionClear` with no draws leaves every sample holding `clearColor`,
++/// so resolving those samples yields exactly `clearColor`. That makes
++/// `StoreAndMultisampleResolve` and `MultisampleResolve` identical in what they
++/// publish to the single-sample surface the guest scans out; they differ only in
++/// whether the multisample texture is additionally retained, which this path
++/// does not publish and the guest does not scan out.
++///
++/// `StoreAndMultisampleResolve` used to be refused by name immediately above the
++/// code that already retargeted its sibling correctly, so the clear was dropped.
++/// A driven macos-13 app sweep fired that refusal 27 times on one attachment
++/// pair (`source=4 resolve=3`) — each one a clear the guest asked for and did
++/// not get, on the only rail that still lands a pass clear in guest memory.
++#[test]
++fn a_clear_publishes_through_the_resolve_texture_for_both_resolving_store_actions() {
++    use crate::contract::pass_action::{
++        MTL_STORE_ACTION_DONT_CARE, MTL_STORE_ACTION_MULTISAMPLE_RESOLVE,
++        MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
++    };
++
++    let att = |store: u16, texture_ref: u32, resolve_texture_ref: u32| ColorAttachment {
++        texture_ref,
++        resolve_texture_ref,
++        store_action: store,
++        load_action: MTL_LOAD_ACTION_CLEAR,
++        ..Default::default()
++    };
++
++    // The pair the sweep actually sent.
++    assert_eq!(
++        clear_publish_target(&att(MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE, 4, 3)),
++        ClearPublish::Resolved(3),
++        "a store-and-resolve clear publishes into its resolve texture"
++    );
++    assert_eq!(
++        clear_publish_target(&att(MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, 4, 3)),
++        ClearPublish::Resolved(3),
++        "its sibling has always published there, and the two must agree"
++    );
++
++    // A plain single-sample store keeps the attachment the guest declared,
++    // level and all — it is not retargeted.
++    assert_eq!(
++        clear_publish_target(&att(MTL_STORE_ACTION_STORE, 4, 0)),
++        ClearPublish::Direct
++    );
++
++    // A resolve with nowhere to resolve into is still a named refusal, for both
++    // actions. This is the half that must NOT be lost by admitting the pair
++    // above.
++    for store in [
++        MTL_STORE_ACTION_MULTISAMPLE_RESOLVE,
++        MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
++    ] {
++        assert_eq!(
++            clear_publish_target(&att(store, 4, 0)),
++            ClearPublish::ResolveTargetMissing,
++            "a resolve naming no resolve texture has nowhere to publish"
++        );
++    }
++
++    // Nothing to publish: an action that keeps no single sample, and no
++    // attachment at all. Neither is a loss.
++    assert_eq!(
++        clear_publish_target(&att(MTL_STORE_ACTION_DONT_CARE, 4, 3)),
++        ClearPublish::NotPublished
++    );
++    assert_eq!(
++        clear_publish_target(&att(MTL_STORE_ACTION_STORE, 0, 0)),
++        ClearPublish::NotPublished
++    );
++}
+-- 
+2.43.0
+

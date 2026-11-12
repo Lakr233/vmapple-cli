@@ -1,0 +1,146 @@
+From dada2fc7e4c0823c9ac0655cd54a8cdce16df366 Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Wed, 11 Nov 2026 21:20:48 +0800
+Subject: [PATCH 58/68] vgpu: collect released private residents and isolate
+ memoryless MRT targets
+
+Only Surface and Gva residents have guest pages that owe a deferred writeback copy-out, so gate ResidentTargetSlot::released_and_collectable's gpu_only_content hold on those two namespaces so released Heap and memoryless Texture residents stop accumulating in VRAM.
+
+Also key memoryless colour attachments on TaskResource::lifetime_ref().id() and lease them on TaskResource across passes so distinct tasks or recreated memoryless MRT textures do not collide on generation zero.
+---
+ .../engine/pools/images_and_registry.rs       | 39 ++++++++++++++++++-
+ .../src/backend/vulkan/engine/pools/mod.rs    |  9 ++++-
+ crates/reims-vgpu/src/runtime/draw/vulkan.rs  | 22 ++++++++++-
+ 3 files changed, 64 insertions(+), 6 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/pools/images_and_registry.rs b/crates/reims-vgpu/src/backend/vulkan/engine/pools/images_and_registry.rs
+index c7519865f..a7fdbaeab 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/pools/images_and_registry.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/pools/images_and_registry.rs
+@@ -2016,7 +2016,7 @@ impl ResourcePools {
+         Some(
+             self.registry
+                 .get(identity)
+-                .is_some_and(ResidentTargetSlot::released_and_collectable),
++                .is_some_and(|slot| slot.released_and_collectable(identity)),
+         )
+     }
+ 
+@@ -2026,7 +2026,7 @@ impl ResourcePools {
+             .filter(|identity| {
+                 self.registry
+                     .get(*identity)
+-                    .is_some_and(ResidentTargetSlot::released_and_collectable)
++                    .is_some_and(|slot| slot.released_and_collectable(*identity))
+             })
+             .take(max)
+             .cloned()
+@@ -2951,6 +2951,41 @@ pub(super) mod pin_count_tests {
+         );
+     }
+ 
++    #[test]
++    fn released_private_residents_do_not_wait_for_a_guest_copy_out_that_cannot_happen() {
++        for id in [
++            TargetIdentity::Heap {
++                task_id: 3,
++                ref_: 9,
++                width: 64,
++                height: 64,
++                generation: 7,
++                format: translate::pixel::RESIDENT_RGBA_FORMAT,
++            },
++            TargetIdentity::Texture {
++                ref_: 11,
++                width: 64,
++                height: 64,
++                generation: 8,
++                stencil: false,
++            },
++        ] {
++            let mut pools = ResourcePools::new();
++            pools.registry.insert(id.clone(), dummy_slot(true));
++            pools.registry_order.push_back(id.clone());
++
++            assert_eq!(pools.retain_resident_target(&id), Some(false));
++            pools.registry_mark_ready(&id);
++            assert!(pools.registry[&id].gpu_only_content);
++            assert_eq!(
++                pools.release_resident_ownership(&id),
++                Some(true),
++                "private residents have no guest pages to copy out to: {id:?}"
++            );
++            assert_eq!(pools.released_resident_keys(1), vec![id]);
++        }
++    }
++
+     fn surf(id: u32) -> TargetIdentity {
+         TargetIdentity::Surface {
+             id,
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/pools/mod.rs b/crates/reims-vgpu/src/backend/vulkan/engine/pools/mod.rs
+index bf521755b..226622cf3 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/pools/mod.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/pools/mod.rs
+@@ -2094,8 +2094,13 @@ impl ResidentTargetSlot {
+     /// the guest's IOSurface pages, so releasing a texture object cannot lose a
+     /// frame. The window exists only because this device defers, and it closes
+     /// where the deferral is recorded.
+-    pub(crate) fn released_and_collectable(&self) -> bool {
+-        self.resource_released && self.pin_count == 0 && !self.gpu_only_content
++    pub(crate) fn released_and_collectable(&self, identity: &TargetIdentity) -> bool {
++        let owes_guest_copy_out = self.gpu_only_content
++            && matches!(
++                identity,
++                TargetIdentity::Surface { .. } | TargetIdentity::Gva { .. }
++            );
++        self.resource_released && self.pin_count == 0 && !owes_guest_copy_out
+     }
+ 
+     /// Whether this slot's image may be re-used for a request of this geometry,
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index 6ba91ba2d..49d6520ca 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -6612,11 +6612,16 @@ pub(super) fn secondary_target_identity<M: HostMemory + HostOps>(
+     {
+         Some(heap_target_identity(task_id, target, c.width, c.height))
+     } else if c.memoryless {
++        let generation = state
++            .task_resources
++            .get(task_id, c.texture_ref)
++            .map(|resource| resource.lifetime_ref().id())
++            .unwrap_or(0);
+         Some(TargetIdentity::Texture {
+             ref_: c.texture_ref,
+             width: c.width,
+             height: c.height,
+-            generation: 0,
++            generation,
+             stencil: false,
+         })
+     } else {
+@@ -9822,7 +9827,20 @@ pub(crate) fn retain_heap_target(
+ 
+ fn retain_pass_heap_targets(state: &DeviceState, req: &DrawEncodeRequest) {
+     for c in &req.colors {
+-        if c.mapping_id != 0 || c.target_gva != 0 || c.memoryless {
++        if c.mapping_id != 0 || c.target_gva != 0 {
++            continue;
++        }
++        if c.memoryless {
++            if let Some(resource) = state.task_resources.get(req.task_id, c.texture_ref) {
++                let identity = crate::backend::vulkan::engine::TargetIdentity::Texture {
++                    ref_: c.texture_ref,
++                    width: c.width,
++                    height: c.height,
++                    generation: resource.lifetime_ref().id(),
++                    stencil: false,
++                };
++                let _ = resource.resident_target_backing(&identity);
++            }
+             continue;
+         }
+         if let Some(&target) = state.heap_texture_targets.get(&(req.task_id, c.texture_ref)) {
+-- 
+2.43.0
+

@@ -1,0 +1,325 @@
+From 4f1d933c85613bb921b8a295885ec136a9b0814a Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Wed, 11 Nov 2026 23:28:44 +0800
+Subject: [PATCH 60/68] vgpu: zero-clear non-Clear secondary MRT slots and sync
+ buffer-texture Stores
+
+build_secondary_targets previously passed c.clear_color to the Vulkan pass even when loadAction was DontCare or an unrendered Load fallback, seeding RenderBox memoryless coverage/accumulator slots with QuartzCore's [1, 0, 0, 1] sentinel and tinting Liquid Glass backdrops and icon stacks red. Clear secondary slots to [0; 4] unless loadAction is Clear, matching primary color0, and keep buffer-backed GVA Stores synchronous so guest MTLBuffer and view readers observe rendered texels without texture-keyed synchronize commands.
+---
+ crates/reims-vgpu/src/runtime/draw/mod.rs     |   8 ++
+ .../src/runtime/draw/render_target.rs         |  10 ++
+ crates/reims-vgpu/src/runtime/draw/tests.rs   |   2 +
+ crates/reims-vgpu/src/runtime/draw/vulkan.rs  | 120 +++++++++++++++++-
+ crates/reims-vgpu/src/runtime/exec/mod.rs     |   1 +
+ crates/reims-vgpu/src/runtime/exec/tests.rs   |   1 +
+ 6 files changed, 136 insertions(+), 6 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/draw/mod.rs b/crates/reims-vgpu/src/runtime/draw/mod.rs
+index e894d1924..307457bc0 100644
+--- a/crates/reims-vgpu/src/runtime/draw/mod.rs
++++ b/crates/reims-vgpu/src/runtime/draw/mod.rs
+@@ -822,6 +822,9 @@ pub struct ColorRtRequest {
+     /// zero, and the attachment is a host image keyed by `texture_ref` that is
+     /// never seeded from or written back to the guest.
+     pub memoryless: bool,
++    /// A type-8 buffer-backed texture whose Store writes directly to its
++    /// shared `MTLBuffer` pages rather than arming a texture-keyed GVA debt.
++    pub buffer_backed: bool,
+ }
+ 
+ /// One `setVisibilityResultMode:offset:`, as the encoder state it is.
+@@ -4429,6 +4432,7 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
+         format: fmt,
+         sample_count: _,
+         memoryless: _,
++        buffer_backed: _,
+     }) = lookup_render_target(state, host, task_id, *att)
+     else {
+         return lost("render_target_unresolved");
+@@ -4555,6 +4559,7 @@ pub fn color_target_request<M: HostMemory + HostOps>(
+         target_seed_layout: None,
+         multisample_source_ref: 0,
+         memoryless: rt.memoryless,
++        buffer_backed: rt.buffer_backed,
+     };
+     Some(DrawEncodeRequest {
+         task_id,
+@@ -4692,6 +4697,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
+             format: mfmt,
+             sample_count: target_sample_count,
+             memoryless,
++            buffer_backed,
+         } = target;
+         #[cfg(feature = "backend-vulkan")]
+         let attachment_sample_count = pipeline_sample_count.unwrap_or(target_sample_count);
+@@ -4873,6 +4879,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
+                     target_seed_layout: seed_layout,
+                     multisample_source_ref,
+                     memoryless,
++                    buffer_backed,
+                 });
+                 continue;
+             }
+@@ -4894,6 +4901,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
+             target_seed_layout: None,
+             multisample_source_ref,
+             memoryless,
++            buffer_backed,
+         });
+     }
+     if colors.is_empty() {
+diff --git a/crates/reims-vgpu/src/runtime/draw/render_target.rs b/crates/reims-vgpu/src/runtime/draw/render_target.rs
+index dba0ccec8..f3cec2021 100644
+--- a/crates/reims-vgpu/src/runtime/draw/render_target.rs
++++ b/crates/reims-vgpu/src/runtime/draw/render_target.rs
+@@ -361,6 +361,10 @@ pub(super) struct ResolvedRenderTarget {
+     /// lives for the pass. Metal lets such an attachment neither load nor
+     /// store, so nothing is seeded into it and nothing is written back.
+     pub(super) memoryless: bool,
++    /// A type-8 buffer-backed texture over a shared MTLBuffer: guest CPU and
++    /// buffer readers access the underlying buffer without synchronizing
++    /// `texture_ref`, so a Store must land synchronously in guest memory.
++    pub(super) buffer_backed: bool,
+ }
+ 
+ /// Why a colour attachment's `texture_ref` could not be turned into somewhere
+@@ -937,6 +941,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
+             format: fmt,
+             sample_count: 1,
+             memoryless: false,
++            buffer_backed: false,
+         });
+     }
+     // x86 Ventura/Tahoe type-4 surface/backing (present IOSurface). Object-list
+@@ -1018,6 +1023,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
+             format: fmt,
+             sample_count: 1,
+             memoryless: false,
++            buffer_backed: false,
+         });
+     }
+     let entry = live.ok_or(C::NoListEntry.at(resolved_ref))?;
+@@ -1063,6 +1069,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
+             format: fmt,
+             sample_count: tex.sample_count,
+             memoryless: true,
++            buffer_backed: false,
+         });
+     }
+     // Type-8 heap texture: no guest storage at all, so it renders into an engine
+@@ -1125,6 +1132,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
+                 format: fmt,
+                 sample_count: heap.sample_count,
+                 memoryless: false,
++                buffer_backed: false,
+             });
+         }
+     }
+@@ -1188,6 +1196,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
+                 format: fmt,
+                 sample_count: 1,
+                 memoryless: false,
++                buffer_backed: true,
+             });
+         }
+     }
+@@ -1336,6 +1345,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
+         format: fmt,
+         sample_count: 1,
+         memoryless: false,
++        buffer_backed: false,
+     })
+ }
+ 
+diff --git a/crates/reims-vgpu/src/runtime/draw/tests.rs b/crates/reims-vgpu/src/runtime/draw/tests.rs
+index 024ec9298..96d25a0a4 100644
+--- a/crates/reims-vgpu/src/runtime/draw/tests.rs
++++ b/crates/reims-vgpu/src/runtime/draw/tests.rs
+@@ -6202,6 +6202,7 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
+         target_seed_layout: None,
+         multisample_source_ref: 0,
+         memoryless: false,
++        buffer_backed: false,
+     };
+ 
+     let armed = sync_store_allowed_pages(&state, &host, 1, Some(&c0), true)
+@@ -6411,6 +6412,7 @@ fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
+         target_seed_layout: None,
+         multisample_source_ref: 0,
+         memoryless: false,
++        buffer_backed: false,
+     };
+     // Full height, left half only: the partial store the Load seed forces, and
+     // it crosses the page boundary at row 64.
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index 92542b58a..d7721bb50 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -6794,12 +6794,16 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
+             // becomes a clear over live content.
+             super::note_load_action_dont_care(pipeline.object_id, c.width, c.height);
+         }
+-        let clear = [
+-            c.clear_color[0] as f32,
+-            c.clear_color[1] as f32,
+-            c.clear_color[2] as f32,
+-            c.clear_color[3] as f32,
+-        ];
++        let clear = if matches!(declared, crate::contract::pass_action::LoadAction::Clear) {
++            [
++                c.clear_color[0] as f32,
++                c.clear_color[1] as f32,
++                c.clear_color[2] as f32,
++                c.clear_color[3] as f32,
++            ]
++        } else {
++            [0.0; 4]
++        };
+         // This slot's own blend, resolved exactly as the Metal arm resolves it:
+         // find the pipeline's attachment entry for this Metal slot. No
+         // `or_else(first())` fallback here — the Metal path has one for its
+@@ -11061,6 +11065,7 @@ fn gva_store_defer_eligible(req: &DrawEncodeRequest) -> bool {
+         || c0.row_stride == 0
+         || c0.texture_ref == 0
+         || req.gva_alloc_gen == 0
++        || c0.buffer_backed
+     {
+         return false;
+     }
+@@ -13034,6 +13039,109 @@ mod vulkan_split_tests {
+             "an unrendered memoryless secondary cannot load undefined bytes"
+         );
+     }
++
++    #[test]
++    fn secondary_non_clear_attachment_ignores_sentinel_clear_color() {
++        use crate::backend::vulkan::engine::TargetIdentity;
++        use crate::contract::pass_action::{
++            MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_DONT_CARE, MTL_LOAD_ACTION_LOAD,
++        };
++        use crate::runtime::decode::resource::{
++            PipelineColorAttachment, RenderPipelineDescriptor,
++        };
++
++        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
++        let mut host = FakeHost::default();
++        let pipeline = RenderPipelineDescriptor {
++            object_id: 21,
++            color_attachments: vec![
++                PipelineColorAttachment {
++                    slot: 0,
++                    pixel_format: u32::from(crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT),
++                    ..PipelineColorAttachment::default()
++                },
++                PipelineColorAttachment {
++                    slot: 1,
++                    pixel_format: u32::from(crate::contract::pixel_format::MTL_FORMAT_RG32_FLOAT),
++                    ..PipelineColorAttachment::default()
++                },
++            ],
++            ..RenderPipelineDescriptor::default()
++        };
++        let primary = TargetIdentity::Surface {
++            id: 0x43,
++            width: 32,
++            height: 32,
++            generation: 1,
++            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
++        };
++        let make_colors = |load_action: u16| {
++            vec![
++                ColorRtRequest {
++                    slot: 0,
++                    width: 32,
++                    height: 32,
++                    format: crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT,
++                    ..ColorRtRequest::default()
++                },
++                ColorRtRequest {
++                    slot: 1,
++                    texture_ref: 78,
++                    width: 32,
++                    height: 32,
++                    format: crate::contract::pixel_format::MTL_FORMAT_RG32_FLOAT,
++                    load_action,
++                    clear_color: [1.0, 0.0, 0.0, 1.0],
++                    memoryless: true,
++                    ..ColorRtRequest::default()
++                },
++            ]
++        };
++
++        for action in [MTL_LOAD_ACTION_DONT_CARE, MTL_LOAD_ACTION_LOAD] {
++            let secs = super::build_secondary_targets(
++                &mut state,
++                &mut host,
++                1,
++                &make_colors(action),
++                &pipeline,
++                &primary,
++                32,
++                32,
++                [0.0; 4],
++            )
++            .expect("secondary builds");
++            assert_eq!(secs[0].clear, [0.0; 4]);
++        }
++
++        let secs_clear = super::build_secondary_targets(
++            &mut state,
++            &mut host,
++            1,
++            &make_colors(MTL_LOAD_ACTION_CLEAR),
++            &pipeline,
++            &primary,
++            32,
++            32,
++            [0.0; 4],
++        )
++        .expect("explicit clear secondary builds");
++        assert_eq!(secs_clear[0].clear, [1.0, 0.0, 0.0, 1.0]);
++    }
++
++    #[test]
++    fn buffer_backed_gva_store_is_not_defer_eligible() {
++        let mut req = one_page_gva_request();
++        req.gva_alloc_gen = 1;
++        req.colors[0].format = crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
++        req.colors[0].width = 8;
++        req.colors[0].height = 8;
++        req.colors[0].row_stride = 32;
++        assert!(super::gva_store_defer_eligible(&req));
++
++        req.colors[0].buffer_backed = true;
++        assert!(!super::gva_store_defer_eligible(&req));
++    }
+ }
+ 
+ /// Whether the CLEAR-seed Store at the head of a draw chain runs, for this
+diff --git a/crates/reims-vgpu/src/runtime/exec/mod.rs b/crates/reims-vgpu/src/runtime/exec/mod.rs
+index 7d22c1859..a1ab476d2 100644
+--- a/crates/reims-vgpu/src/runtime/exec/mod.rs
++++ b/crates/reims-vgpu/src/runtime/exec/mod.rs
+@@ -4044,6 +4044,7 @@ fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::Dra
+             target_seed_layout: None,
+             multisample_source_ref: c.multisample_source_ref,
+             memoryless: c.memoryless,
++            buffer_backed: c.buffer_backed,
+         })
+         .collect();
+     draw::DrawEncodeRequest {
+diff --git a/crates/reims-vgpu/src/runtime/exec/tests.rs b/crates/reims-vgpu/src/runtime/exec/tests.rs
+index 9b13b88ba..26f2deb52 100644
+--- a/crates/reims-vgpu/src/runtime/exec/tests.rs
++++ b/crates/reims-vgpu/src/runtime/exec/tests.rs
+@@ -2285,6 +2285,7 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
+             target_seed_layout: None,
+             multisample_source_ref: 0,
+             memoryless: false,
++            buffer_backed: false,
+         }],
+         ..Default::default()
+     };
+-- 
+2.43.0
+

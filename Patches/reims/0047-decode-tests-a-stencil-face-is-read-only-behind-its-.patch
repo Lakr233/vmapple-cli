@@ -1,0 +1,152 @@
+From d02bcc2c173724f02b8d9f13c181718656a61fee Mon Sep 17 00:00:00 2001
+From: Anees Iqbal <hello@aneesiqbal.ai>
+Date: Sat, 29 Aug 2026 06:27:02 +0300
+Subject: [PATCH 47/68] decode+tests: a stencil face is read only behind its
+ own enable bit
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two gaps the wire-fixture instrument was reporting, both in the decoders rather
+than in the fixtures.
+
+Component: crates/reims-vgpu decode, both pathways (the depth-stencil record is
+backend-independent).
+
+A depth-stencil descriptor's face blocks were both decoded unconditionally. The
+module's own note said Metal substitutes default faces before it serializes, so
+both blocks are always written; Apple's capture of a descriptor whose front face
+is absent shows that is not true of every record — the front block is left
+untouched, and on a real wire the bytes under it are the guest's stale ring.
+That made one record decode two ways depending on noise, which is exactly the
+property `no_decoder_reads_a_bit_apples_serializer_never_wrote` holds. Each face
+is now read behind its own enable bit and is the zeroed face otherwise.
+
+This changes no execution: every consumer already gates on the same bit
+(`runtime::draw::vulkan`'s stencil block, `backend::metal::render`). What it
+removes is the nondeterminism ahead of them, so a decoded record is a function
+of what the serializer wrote.
+
+`PGSerializerCommandEncoder` had no decoder mapping in the fixture test, so its
+four cases panicked the run rather than being checked. These are
+`MTLCommandEncoder`'s residency selectors — `useHeap:`, `useHeaps:count:`,
+`useResource:usage:`, `useResources:count:usage:` — which subclasses inherit, so
+the serializer emits them under the base class and a record can then arrive in a
+render stream or a compute one. Both decoders carry the same two opcodes for
+them (0x86 heaps, 0x87 resources), which makes a gap in either a gap for real
+guest residency and neither arm's coverage evidence about the other's. The class
+is therefore decoded only when *both* decoders read it; routing it to one would
+have passed while the other silently dropped every heap the guest made resident.
+
+Both opcodes were already implemented on both arms, so this adds coverage rather
+than behavior — the test was blind to four records, not the device.
+
+Tests. `wire_fixtures_reach_the_decoders` now passes both cases where it
+previously failed both; the corpus is 375 cases across six classes and no class
+is unmapped. Full suite green (2222 lib + 7 integration binaries); clippy
+-D warnings clean on all three arms.
+
+Not verified. The fixture corpus is gitignored and Apple-captured, so this arm
+only runs on a checkout that has it; nothing here was exercised on a live guest,
+and the depth-stencil change is unobservable on one by construction.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../src/runtime/decode/resource/mod.rs        | 33 ++++++++++++++++---
+ .../tests/wire_fixtures_reach_the_decoders.rs | 28 ++++++++++++++++
+ 2 files changed, 57 insertions(+), 4 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/decode/resource/mod.rs b/crates/reims-vgpu/src/runtime/decode/resource/mod.rs
+index f66839538..f1894b30f 100644
+--- a/crates/reims-vgpu/src/runtime/decode/resource/mod.rs
++++ b/crates/reims-vgpu/src/runtime/decode/resource/mod.rs
+@@ -2233,14 +2233,39 @@ pub fn decode_depth_stencil_descriptor(
+     // unidentified (Metal substitutes default faces before serialize). Keep the
+     // product field names; source the bit from the same byte the view exposes.
+     let state = body.depth_state;
++    let front_stencil_enabled = (state & DEPTH_STENCIL_FRONT_STENCIL_ENABLED as u8) != 0;
++    let back_stencil_enabled = (state & DEPTH_STENCIL_BACK_STENCIL_ENABLED as u8) != 0;
++    // A face block is only meaningful behind its own enable bit, and reading it
++    // otherwise reads the guest's stale ring.
++    //
++    // The paragraph above says Metal substitutes default faces before it
++    // serializes, so both blocks are always written. That is not true of every
++    // record: Apple's own capture of a descriptor whose front face is absent
++    // leaves the front block untouched, and the bytes under it on a real wire
++    // are whatever the ring last held. Decoding them made one record decode two
++    // ways depending on noise, which is the property
++    // `no_decoder_reads_a_bit_apples_serializer_never_wrote` exists to hold.
++    //
++    // Gating changes no execution — every consumer already reads a face only
++    // behind the same bit (`runtime::draw::vulkan`'s stencil block,
++    // `backend::metal::render`) — it removes the nondeterminism ahead of them,
++    // so the decoded record is a function of what the serializer wrote.
+     Ok(DepthStencilDescriptor {
+         depth_stencil_id: body.object_ref.get(),
+         depth_compare_function: body.depth_compare_function() as u32,
+         depth_write_enabled: body.depth_write_enabled(),
+-        front_stencil_enabled: (state & DEPTH_STENCIL_FRONT_STENCIL_ENABLED as u8) != 0,
+-        back_stencil_enabled: (state & DEPTH_STENCIL_BACK_STENCIL_ENABLED as u8) != 0,
+-        front_face: face_from_wire(&body.front),
+-        back_face: face_from_wire(&body.back),
++        front_stencil_enabled,
++        back_stencil_enabled,
++        front_face: if front_stencil_enabled {
++            face_from_wire(&body.front)
++        } else {
++            DepthStencilFace::default()
++        },
++        back_face: if back_stencil_enabled {
++            face_from_wire(&body.back)
++        } else {
++            DepthStencilFace::default()
++        },
+     })
+ }
+ 
+diff --git a/crates/reims-vgpu/tests/wire_fixtures_reach_the_decoders.rs b/crates/reims-vgpu/tests/wire_fixtures_reach_the_decoders.rs
+index b8b56fc3d..b1e101407 100644
+--- a/crates/reims-vgpu/tests/wire_fixtures_reach_the_decoders.rs
++++ b/crates/reims-vgpu/tests/wire_fixtures_reach_the_decoders.rs
+@@ -454,10 +454,38 @@ fn read_record(class: &str, bytes: &[u8], opcode: u32) -> Option<Reading> {
+         "PGSerializerComputeCommandEncoder" => Some(compute_verdict(bytes)),
+         "PGSerializerBlitCommandEncoder" => Some(blit_verdict(bytes)),
+         "PGSerializerInfoCommandEncoder" => Some(info_verdict(bytes, opcode)),
++        "PGSerializerCommandEncoder" => Some(inherited_encoder_verdict(bytes)),
+         _ => None,
+     }
+ }
+ 
++/// A record Apple's serializer defines on the **base** encoder class, read by
++/// every encoder decoder that can receive one.
++///
++/// `MTLCommandEncoder`'s residency selectors — `useHeap:`, `useHeaps:count:`,
++/// `useResource:usage:`, `useResources:count:usage:` — are inherited rather
++/// than reimplemented, so the serializer emits them under the base class and a
++/// record can then arrive in a render stream or a compute one. Both decoders
++/// carry the same two opcodes for them (`0x86` heaps, `0x87` resources), which
++/// makes a gap in *either* a gap for real guest residency, and neither arm's
++/// coverage is evidence about the other's.
++///
++/// So the base class is decoded only when both decoders read it: the first
++/// non-`Decoded` reading is what this returns, and a clean pair returns the
++/// render one. Routing the class to a single decoder would have passed while
++/// the other silently dropped every heap the guest made resident.
++fn inherited_encoder_verdict(bytes: &[u8]) -> Reading {
++    let render = render_verdict(bytes);
++    if !matches!(render.verdict, Verdict::Decoded) {
++        return render;
++    }
++    let compute = compute_verdict(bytes);
++    if !matches!(compute.verdict, Verdict::Decoded) {
++        return compute;
++    }
++    render
++}
++
+ /// Classes with no record decoder in this crate, and why.
+ ///
+ /// The info encoder's queries are reached only through `runtime::icb`, for the
+-- 
+2.43.0
+
