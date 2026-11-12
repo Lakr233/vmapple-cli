@@ -1,0 +1,1171 @@
+From 0832113f971a76ae4342fa3f74300b391acdf750 Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Thu, 12 Nov 2026 10:15:17 +0800
+Subject: [PATCH 66/68] vgpu: support XR10 and two-plane alpha on IOSurface
+ mappings
+
+Two-plane RGB10A8_2p_XR10 (0x226/0x227) IOSurfaces store extended-range
+10-bit RGB in Plane 0 and 8-bit alpha in Plane 1. Previously, IOSurface
+render writeback narrowed XR10 targets through BGRA8 and wrote Plane 0
+only, leaving Plane 1 alpha zeroed in guest RAM (causing CPU readers
+such as iconservicesagent on FaceTime's 256x256 0x226 icon surface to
+read zero alpha across the icon), while scanout/type-11 RGBA8 readback
+decoded Plane 0 without Plane 1 and treated transparent pixels as opaque
+black.
+
+Route XR10 IOSurface native writebacks through Rgba16Float encoding into
+both Plane 0 and Plane 1, populate Plane 1 on BGRA8/RGBA8 fallback
+writes, and decode XR10 IOSurfaces (including Plane 1 alpha on 550/551)
+across scanout, type-11 load seeds, type-11 memoized sampling, and
+type-5 views.
+---
+ crates/reims-vgpu/src/runtime/draw/mod.rs     | 159 ++++++
+ crates/reims-vgpu/src/runtime/draw/vulkan.rs  |  73 ++-
+ crates/reims-vgpu/src/runtime/exec/mod.rs     |   3 +-
+ .../src/runtime/mapping_write/mod.rs          | 481 +++++++++++++++++-
+ .../src/runtime/mapping_write/tests.rs        | 125 +++++
+ .../src/runtime/render_writeback.rs           |   3 +-
+ crates/reims-vgpu/src/runtime/scanout/mod.rs  |  69 ++-
+ 7 files changed, 886 insertions(+), 27 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/draw/mod.rs b/crates/reims-vgpu/src/runtime/draw/mod.rs
+index e1f7bdd55..c00c745bd 100644
+--- a/crates/reims-vgpu/src/runtime/draw/mod.rs
++++ b/crates/reims-vgpu/src/runtime/draw/mod.rs
+@@ -6157,6 +6157,24 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
+     // Type-11 path via resolve.
+     if let Some(mid) = objects::resolve_type11_ref(state, host, task_id, texture_ref) {
+         let source = mapping_declared_format(state, mid, None);
++        if native.float16 && pixel_format::is_xr10(source) {
++            let _ = mapper::ensure_resolved_for_scanout(state, host, mid);
++            let geom = state
++                .mappings
++                .get(&mid)
++                .filter(|m| m.has_geom && m.width > 0 && m.height > 0)
++                .map(|m| (m.width, m.height));
++            if let Some((w, h)) = geom {
++                if let Some(bytes) =
++                    crate::runtime::mapping_write::read_xr10_to_rgba16f(state, host, mid, w, h)
++                {
++                    return Some((
++                        bytes,
++                        SampledByteFormat::from_source(TexelLayout::Rgba16Float, source),
++                    ));
++                }
++            }
++        }
+         return load_type11_mapping_rgba(state, host, mid, None)
+             .map(|(_, _, r)| (r, SampledByteFormat::from_source(TexelLayout::Rgba8, source)));
+     }
+@@ -6252,6 +6270,147 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
+     };
+     let identity_key = (1u64 << 63) | (1u64 << 62) | mid as u64;
+     let key = (mid, w, h);
++    if native_uploads.float16 && pixel_format::is_xr10(declared_fmt) {
++        if crate::runtime::mapper::ensure_resolved_for_scanout(state, host, mid) {
++            let windows = state.mappings.get(&mid).and_then(|m| {
++                let p0 = crate::runtime::mapping_write::type11_sample_window(
++                    m,
++                    w,
++                    h,
++                    declared_fmt,
++                )?;
++                let p1 = if pixel_format::is_two_plane_xr10(declared_fmt) {
++                    let win = crate::runtime::mapping_write::two_plane_xr10_alpha_window(m, w, h);
++                    if m.device_desc_complete().is_some() && win.is_none() {
++                        return None;
++                    }
++                    win
++                } else {
++                    None
++                };
++                Some((p0, p1))
++            });
++            if let Some(((base_off, surface_bpr, span_end), alpha_window)) = windows {
++                let p0_bpp = pixel_format::bytes_per_pixel(declared_fmt)?;
++                let p0_tight = w.checked_mul(p0_bpp)?;
++                let p0_len = host_alloc_len((p0_tight as u64).checked_mul(h as u64)?)?;
++                let p1_len = if alpha_window.is_some() {
++                    host_alloc_len((w as u64).checked_mul(h as u64)?)?
++                } else {
++                    0
++                };
++                let total_native = p0_len.checked_add(p1_len)?;
++                if p0_len > 0 {
++                    let mut scratch = std::mem::take(&mut state.type11_memo_scratch);
++                    prepare_memo_scratch(&mut scratch, total_native, total_native);
++                    let mut read_ok = crate::runtime::mapping_write::read_rect_raw_at(
++                        state,
++                        host,
++                        mid,
++                        crate::runtime::mapping_write::SurfaceWindow {
++                            base_off,
++                            bpr: surface_bpr,
++                            span_end,
++                            bpp: p0_bpp,
++                        },
++                        crate::runtime::mapping_write::Rect {
++                            origin_x: 0,
++                            origin_y: 0,
++                            width: w,
++                            height: h,
++                        },
++                        &mut scratch[..p0_len],
++                        p0_tight,
++                    );
++                    if read_ok {
++                        if let Some((a_off, a_bpr, a_end)) = alpha_window {
++                            read_ok = crate::runtime::mapping_write::read_rect_raw_at(
++                                state,
++                                host,
++                                mid,
++                                crate::runtime::mapping_write::SurfaceWindow {
++                                    base_off: a_off,
++                                    bpr: a_bpr,
++                                    span_end: a_end,
++                                    bpp: 1,
++                                },
++                                crate::runtime::mapping_write::Rect {
++                                    origin_x: 0,
++                                    origin_y: 0,
++                                    width: w,
++                                    height: h,
++                                },
++                                &mut scratch[p0_len..total_native],
++                                w,
++                            );
++                        }
++                    }
++                    if read_ok {
++                        if let Some(m) = state.type11_memo.get_touch(&key) {
++                            if m.layout == crate::contract::pixel_format::TexelLayout::Rgba16Float
++                                && m.native == scratch
++                            {
++                                let rgba = m.rgba.clone();
++                                let generation = m.generation;
++                                state.type11_memo_scratch = scratch;
++                                return Some((
++                                    rgba,
++                                    LinearSampleIdentity {
++                                        key: identity_key,
++                                        generation,
++                                    },
++                                    crate::contract::pixel_format::TexelLayout::Rgba16Float,
++                                ));
++                            }
++                        }
++                        let out_row =
++                            (w as usize).checked_mul(pixel_format::RGBA16F_BPP as usize)?;
++                        let out_len = out_row.checked_mul(h as usize)?;
++                        let mut decoded = vec![0u8; out_len];
++                        let p0_row = p0_tight as usize;
++                        let decode_ok = (0..h as usize).all(|y| {
++                            let s0 = &scratch[y * p0_row..(y + 1) * p0_row];
++                            let s1 = alpha_window.map(|_| {
++                                &scratch[p0_len + y * (w as usize)..p0_len + (y + 1) * (w as usize)]
++                            });
++                            let dst = &mut decoded[y * out_row..(y + 1) * out_row];
++                            pixel_format::decode_xr10_row_to_rgba16f(
++                                declared_fmt,
++                                w,
++                                s0,
++                                s1,
++                                dst,
++                            )
++                        });
++                        if decode_ok {
++                            let payload = std::sync::Arc::new(decoded);
++                            let generation = state.next_sampled_content_generation();
++                            let entry_bytes = scratch.len() + payload.len();
++                            state.type11_memo.insert(
++                                key,
++                                crate::model::GuestLinearMemo {
++                                    native: scratch,
++                                    rgba: payload.clone(),
++                                    layout: crate::contract::pixel_format::TexelLayout::Rgba16Float,
++                                    generation,
++                                },
++                                entry_bytes,
++                            );
++                            return Some((
++                                payload,
++                                LinearSampleIdentity {
++                                    key: identity_key,
++                                    generation,
++                                },
++                                crate::contract::pixel_format::TexelLayout::Rgba16Float,
++                            ));
++                        }
++                    }
++                    state.type11_memo_scratch = scratch;
++                }
++            }
++        }
++    }
+     if let Some(native_layout) = linear_native_upload_format(declared_fmt, native_uploads)
+         .filter(|layout| !layout.is_four_byte_color())
+     {
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index 588eab2d1..01bb150e0 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -303,8 +303,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
+                             .first()
+                             .and_then(|c0| state.mappings.get(&c0.mapping_id))
+                             .map(mapping_write::mapping_store_format)
+-                            .and_then(pixel_format::store_texel_order)
+-                            .filter(|layout| !layout.is_four_byte_color())
++                            .and_then(mapping_write::mapping_native_resident_layout)
+                         {
+                             if let Ok(rb) =
+                                 crate::backend::vulkan::engine::read_target_native(&identity)
+@@ -864,8 +863,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
+                     .mappings
+                     .get(&c.mapping_id)
+                     .map(mapping_write::mapping_store_format)
+-                    .and_then(pixel_format::store_texel_order)
+-                    .filter(|layout| !layout.is_four_byte_color())
++                    .and_then(mapping_write::mapping_native_resident_layout)
+                     .and_then(|layout| {
+                         pixel_format::solid_native_texels(c.width, c.height, layout, &c.clear_color)
+                             .map(|texels| {
+@@ -2774,6 +2772,23 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
+                 if !mapper::ensure_resolved_for_scanout(state, host, mapping_id) {
+                     return None;
+                 }
++                let declared_fmt = state
++                    .mappings
++                    .get(&mapping_id)
++                    .map(mapping_write::mapping_store_format)?;
++                if target_layout == TexelLayout::Rgba16Float
++                    && pixel_format::is_xr10(declared_fmt)
++                {
++                    let native =
++                        mapping_write::read_xr10_to_rgba16f(state, host, mapping_id, w, h)?;
++                    return Some((
++                        Type11LoadSeed::Host(
++                            std::sync::Arc::new(native),
++                            SeedOrder::Native(TexelLayout::Rgba16Float),
++                        ),
++                        Type11SeedRung::GuestPages,
++                    ));
++                }
+                 let (base_off, surface_bpr, span_end) = {
+                     let m = state.mappings.get(&mapping_id)?;
+                     let fmt = mapping_write::mapping_store_format(m);
+@@ -2998,6 +3013,9 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
+             pixel_format::MTL_FORMAT_RGBA16_UNORM if native_uploads.unorm16 => {
+                 TexelLayout::Rgba16Unorm
+             }
++            _ if pixel_format::is_xr10(view.pixel_format) && native_uploads.float16 => {
++                TexelLayout::Rgba16Float
++            }
+             pixel_format::MTL_FORMAT_RGBA16_FLOAT if native_uploads.float16 => {
+                 TexelLayout::Rgba16Float
+             }
+@@ -3056,7 +3074,36 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
+     // RGBA8 formats expand per-pixel into a fresh RGBA8 buffer; native R8/RG8
+     // upload the plane bytes verbatim (the memo stores those bytes as both the
+     // memcmp key and the upload payload).
+-    let rgba: std::sync::Arc<Vec<u8>> = if byte_format.layout() == TexelLayout::Rgba8 {
++    let rgba: std::sync::Arc<Vec<u8>> = if pixel_format::is_xr10(view.pixel_format)
++        && byte_format.layout() == TexelLayout::Rgba16Float
++    {
++        let Some(f16_stride) = view.width.checked_mul(pixel_format::RGBA16F_BPP) else {
++            return fail(Type5ViewDecline::RgbaStride);
++        };
++        let Some(f16_len) = (f16_stride as u64)
++            .checked_mul(view.height as u64)
++            .and_then(host_alloc_len)
++        else {
++            return fail(Type5ViewDecline::RgbaLen { stride: f16_stride });
++        };
++        let mut decoded = vec![0u8; f16_len];
++        for y in 0..view.height as usize {
++            let src_off = y.saturating_mul(tight as usize);
++            let dst_off = y.saturating_mul(f16_stride as usize);
++            let src = &native[src_off..src_off + tight as usize];
++            let dst = &mut decoded[dst_off..dst_off + f16_stride as usize];
++            if !pixel_format::decode_xr10_row_to_rgba16f(
++                view.pixel_format,
++                view.width,
++                src,
++                None,
++                dst,
++            ) {
++                return fail(Type5ViewDecline::Convert { row: y, bpp });
++            }
++        }
++        std::sync::Arc::new(decoded)
++    } else if byte_format.layout() == TexelLayout::Rgba8 {
+         let Some(rgba_stride) = view.width.checked_mul(RGBA8_BPP) else {
+             return fail(Type5ViewDecline::RgbaStride);
+         };
+@@ -11342,17 +11389,25 @@ fn arm_surface_writeback_debt<M: HostMemory + HostOps>(
+     // observes, which is the one thing that switch's doc promises they never do.
+     // Nothing else drops an entry from that map and no guest-write witness feeds
+     // it, so a stale claim is held until the window is written some other way.
+-    if let Some(m) = state.mappings.get(&mapping_id) {
++    let residency_windows = state.mappings.get(&mapping_id).map(|m| {
+         let format = if m.format != 0 {
+             m.format
+         } else {
+             pixel_format::MTL_FORMAT_BGRA8_UNORM
+         };
+-        if let Some((base_off, _bpr, span_end)) =
+-            crate::runtime::mapping_write::type11_sample_window(m, width, height, format)
+-        {
++        let p0 = crate::runtime::mapping_write::type11_sample_window(m, width, height, format);
++        let p1 = pixel_format::is_two_plane_xr10(format)
++            .then(|| crate::runtime::mapping_write::two_plane_xr10_alpha_window(m, width, height))
++            .flatten();
++        (p0, p1)
++    });
++    if let Some((p0, p1)) = residency_windows {
++        if let Some((base_off, _bpr, span_end)) = p0 {
+             state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
+         }
++        if let Some((a_off, _a_bpr, a_end)) = p1 {
++            state.invalidate_storage_residency_window(mapping_id, a_off, a_end);
++        }
+     }
+     // The one call that says "these pixels changed and the guest's pages do not
+     // hold them yet". It advances the surface's content epoch, which is what the
+diff --git a/crates/reims-vgpu/src/runtime/exec/mod.rs b/crates/reims-vgpu/src/runtime/exec/mod.rs
+index 6fb13cb66..7db2de0c1 100644
+--- a/crates/reims-vgpu/src/runtime/exec/mod.rs
++++ b/crates/reims-vgpu/src/runtime/exec/mod.rs
+@@ -4507,8 +4507,7 @@ fn apply_clear<M: HostMemory + HostOps>(
+         .mappings
+         .get(&c0.mapping_id)
+         .map(mapping_write::mapping_store_format)
+-        .and_then(crate::contract::pixel_format::store_texel_order)
+-        .filter(|layout| !layout.is_four_byte_color())
++        .and_then(mapping_write::mapping_native_resident_layout)
+         .and_then(|layout| {
+             crate::contract::pixel_format::solid_native_texels(w, h, layout, &att.clear_color).map(
+                 |texels| {
+diff --git a/crates/reims-vgpu/src/runtime/mapping_write/mod.rs b/crates/reims-vgpu/src/runtime/mapping_write/mod.rs
+index 1a0185343..e3667f602 100644
+--- a/crates/reims-vgpu/src/runtime/mapping_write/mod.rs
++++ b/crates/reims-vgpu/src/runtime/mapping_write/mod.rs
+@@ -214,6 +214,9 @@ fn sample_window(
+     format: u16,
+ ) -> Option<(u64, u32, u64)> {
+     let Some(desc) = m.device_desc_complete() else {
++        if plane_index.is_some_and(|p| p != 0) {
++            return None;
++        }
+         let end = packed_span_estimate(format, width, height)?;
+         // The estimate is a whole number of aligned rows, so dividing it back
+         // out is the row it was built from rather than a second derivation.
+@@ -257,6 +260,87 @@ pub fn type5_sample_window(
+     sample_window(m, Some(plane_index), width, height, format)
+ }
+ 
++/// Resolve Plane 1 (`R8Unorm` alpha) on a two-plane XR10 IOSurface (`550`/`551`).
++pub fn two_plane_xr10_alpha_window(
++    m: &MappingEntry,
++    width: u32,
++    height: u32,
++) -> Option<(u64, u32, u64)> {
++    let desc = m.device_desc_complete()?;
++    sample_window_from_device_desc(
++        Some(desc),
++        Some(1),
++        pixel_format::MTL_FORMAT_R8_UNORM,
++        width,
++        height,
++    )
++}
++
++/// Expected GPU resident [`pixel_format::TexelLayout`] for non-narrowed
++/// writeback into a type-11 IOSurface `format`.
++pub fn mapping_native_resident_layout(format: u16) -> Option<pixel_format::TexelLayout> {
++    if pixel_format::is_xr10(format) {
++        Some(pixel_format::TexelLayout::Rgba16Float)
++    } else {
++        pixel_format::store_texel_order(format).filter(|layout| !layout.is_four_byte_color())
++    }
++}
++
++/// Write a tight `width x height` `R8Unorm` Plane 1 alpha image into
++/// `alpha_window`, respecting `skip` mapping-offset ranges and invalidating
++/// storage residency over Plane 1.
++#[allow(clippy::too_many_arguments)]
++fn write_two_plane_alpha_vouched<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    mapping_id: u32,
++    alpha_window: (u64, u32, u64),
++    width: u32,
++    height: u32,
++    alpha_tight: &[u8],
++    skip: SkipRanges<'_>,
++    vouched: &mapper::PagesVouched,
++) -> Result<(), (u64, usize)> {
++    let (a_off, a_bpr_u32, a_end) = alpha_window;
++    let a_tight = width as usize;
++    let a_bpr = a_bpr_u32 as usize;
++    let need_alpha = a_tight.saturating_mul(height as usize);
++    if alpha_tight.len() < need_alpha || a_bpr < a_tight {
++        return Err((a_off, need_alpha));
++    }
++    let frame_len = (height as usize)
++        .saturating_sub(1)
++        .saturating_mul(a_bpr)
++        .saturating_add(a_tight);
++    let mut frame = vec![0u8; frame_len];
++    let mut runs: Vec<(u64, u64)> = Vec::new();
++    for y in 0..height {
++        let src_off = (y as usize) * a_tight;
++        let dst_off = (y as usize) * a_bpr;
++        frame[dst_off..dst_off + a_tight].copy_from_slice(&alpha_tight[src_off..src_off + a_tight]);
++        let row_lo = a_off.saturating_add((y as u64).saturating_mul(a_bpr_u32 as u64));
++        for (lo, hi) in unskipped(row_lo, row_lo.saturating_add(a_tight as u64), skip) {
++            match runs.last_mut() {
++                Some(last) if last.1 == lo => last.1 = hi,
++                _ => runs.push((lo, hi)),
++            }
++        }
++    }
++    if !mapper::write_mapping_bytes_only(
++        state,
++        host,
++        mapping_id,
++        a_off,
++        &frame,
++        Some(&runs),
++        vouched,
++    ) {
++        return Err((a_off, frame.len()));
++    }
++    state.invalidate_storage_residency_window(mapping_id, a_off, a_end);
++    Ok(())
++}
++
+ /// Revalidate + packed contig host view covering at least `span_end` bytes.
+ ///
+ /// Returns `None` when the mapping is fragmented on Linux (use
+@@ -639,7 +723,7 @@ pub fn write_native_uncached<M: HostMemory + HostOps>(
+     if !scanout_extent_ok(width, height) {
+         return false;
+     }
+-    let (base_off, surface_bpr, span_end, bpp) = {
++    let (format, base_off, surface_bpr, span_end, alpha_window) = {
+         let Some(m) = state.mappings.get(&mapping_id) else {
+             return false;
+         };
+@@ -650,14 +734,96 @@ pub fn write_native_uncached<M: HostMemory + HostOps>(
+         if mw != width || mh != height {
+             return false;
+         }
+-        if pixel_format::store_texel_order(format) != Some(resident_layout) {
+-            return false;
++        if pixel_format::is_xr10(format) {
++            if resident_layout != pixel_format::TexelLayout::Rgba16Float {
++                return false;
++            }
++            let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
++                return false;
++            };
++            let alpha_window = if pixel_format::is_two_plane_xr10(format) {
++                let win = two_plane_xr10_alpha_window(m, mw, mh);
++                if m.device_desc_complete().is_some() && win.is_none() {
++                    return false;
++                }
++                win
++            } else {
++                None
++            };
++            (format, base_off, bpr, span_end, alpha_window)
++        } else {
++            if pixel_format::store_texel_order(format) != Some(resident_layout) {
++                return false;
++            }
++            let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
++                return false;
++            };
++            (format, base_off, bpr, span_end, None)
+         }
+-        let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
++    };
++    if pixel_format::is_xr10(format) {
++        let Some(p0_bpp) = pixel_format::bytes_per_pixel(format) else {
+             return false;
+         };
+-        (base_off, bpr, span_end, resident_layout.bytes_per_texel())
+-    };
++        let Some(p0_stride) = width.checked_mul(p0_bpp) else {
++            return false;
++        };
++        let src_row_bytes = (width as usize).saturating_mul(pixel_format::RGBA16F_BPP as usize);
++        let need_src = src_row_bytes.saturating_mul(height as usize);
++        if src.len() < need_src {
++            return false;
++        }
++        let p0_row_bytes = p0_stride as usize;
++        let mut p0_tight = vec![0u8; p0_row_bytes.saturating_mul(height as usize)];
++        let mut p1_tight = alpha_window
++            .map(|_| vec![0u8; (width as usize).saturating_mul(height as usize)]);
++        for y in 0..height as usize {
++            let s = &src[y * src_row_bytes..(y + 1) * src_row_bytes];
++            let d0 = &mut p0_tight[y * p0_row_bytes..(y + 1) * p0_row_bytes];
++            let d1 = p1_tight
++                .as_mut()
++                .map(|buf| &mut buf[y * (width as usize)..(y + 1) * (width as usize)]);
++            if !pixel_format::encode_xr10_row_from_rgba16f(format, width, s, d0, d1) {
++                return false;
++            }
++        }
++        if !write_full_rect_raw_at(
++            state,
++            host,
++            mapping_id,
++            base_off,
++            surface_bpr,
++            span_end,
++            width,
++            height,
++            p0_bpp,
++            &p0_tight,
++            p0_stride,
++        ) {
++            return false;
++        }
++        if let (Some((a_off, a_bpr, a_end)), Some(p1)) = (alpha_window, p1_tight.as_deref()) {
++            if !write_full_rect_raw_at(
++                state,
++                host,
++                mapping_id,
++                a_off,
++                a_bpr,
++                a_end,
++                width,
++                height,
++                1,
++                p1,
++                width,
++            ) {
++                return false;
++            }
++        }
++        crate::runtime::surface_cache::forget(state, mapping_id);
++        crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
++        return true;
++    }
++    let bpp = resident_layout.bytes_per_texel();
+     let Some(src_stride) = width.checked_mul(bpp) else {
+         return false;
+     };
+@@ -703,7 +869,7 @@ pub fn write_native_skipping<M: HostMemory + HostOps>(
+     if !scanout_extent_ok(width, height) {
+         return false;
+     }
+-    let (base_off, surface_bpr, span_end, bpp) = {
++    let (format, base_off, surface_bpr, span_end, alpha_window) = {
+         let Some(m) = state.mappings.get(&mapping_id) else {
+             return false;
+         };
+@@ -714,14 +880,119 @@ pub fn write_native_skipping<M: HostMemory + HostOps>(
+         if mw != width || mh != height {
+             return false;
+         }
+-        if pixel_format::store_texel_order(format) != Some(resident_layout) {
++        if pixel_format::is_xr10(format) {
++            if resident_layout != pixel_format::TexelLayout::Rgba16Float {
++                return false;
++            }
++            let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
++                return false;
++            };
++            let alpha_window = if pixel_format::is_two_plane_xr10(format) {
++                let win = two_plane_xr10_alpha_window(m, mw, mh);
++                if m.device_desc_complete().is_some() && win.is_none() {
++                    return false;
++                }
++                win
++            } else {
++                None
++            };
++            (format, base_off, bpr, span_end, alpha_window)
++        } else {
++            if pixel_format::store_texel_order(format) != Some(resident_layout) {
++                return false;
++            }
++            let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
++                return false;
++            };
++            (format, base_off, bpr, span_end, None)
++        }
++    };
++    if pixel_format::is_xr10(format) {
++        let Some(p0_bpp) = pixel_format::bytes_per_pixel(format) else {
++            return false;
++        };
++        let p0_tight = (width as usize).saturating_mul(p0_bpp as usize);
++        let src_row_bytes = (width as usize).saturating_mul(pixel_format::RGBA16F_BPP as usize);
++        let need_src = src_row_bytes.saturating_mul(height as usize);
++        if src.len() < need_src || (surface_bpr as usize) < p0_tight {
+             return false;
+         }
+-        let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
++        let mut p0_encoded = vec![0u8; p0_tight.saturating_mul(height as usize)];
++        let mut p1_encoded = alpha_window
++            .map(|_| vec![0u8; (width as usize).saturating_mul(height as usize)]);
++        for y in 0..height as usize {
++            let s = &src[y * src_row_bytes..(y + 1) * src_row_bytes];
++            let d0 = &mut p0_encoded[y * p0_tight..(y + 1) * p0_tight];
++            let d1 = p1_encoded
++                .as_mut()
++                .map(|buf| &mut buf[y * (width as usize)..(y + 1) * (width as usize)]);
++            if !pixel_format::encode_xr10_row_from_rgba16f(format, width, s, d0, d1) {
++                return false;
++            }
++        }
++        crate::runtime::writeback_debt::supersede_for_mapping(
++            state,
++            mapping_id,
++            crate::runtime::render_writeback::SettleSite::MappingBgra8Write,
++        );
++        let Some(vouched) = vouch_for_write(state, host, mapping_id, "native_skip") else {
+             return false;
+         };
+-        (base_off, bpr, span_end, resident_layout.bytes_per_texel())
+-    };
++        let bpr = surface_bpr as usize;
++        let frame_len = (height as usize)
++            .saturating_sub(1)
++            .saturating_mul(bpr)
++            .saturating_add(p0_tight);
++        let mut frame = vec![0u8; frame_len];
++        let mut runs: Vec<(u64, u64)> = Vec::new();
++        for y in 0..height {
++            let src_off = (y as usize) * p0_tight;
++            let dst_off = (y as usize) * bpr;
++            frame[dst_off..dst_off + p0_tight]
++                .copy_from_slice(&p0_encoded[src_off..src_off + p0_tight]);
++            let row_lo = base_off.saturating_add((y as u64).saturating_mul(surface_bpr as u64));
++            for (lo, hi) in unskipped(row_lo, row_lo.saturating_add(p0_tight as u64), skip) {
++                match runs.last_mut() {
++                    Some(last) if last.1 == lo => last.1 = hi,
++                    _ => runs.push((lo, hi)),
++                }
++            }
++        }
++        if !mapper::write_mapping_bytes_only(
++            state,
++            host,
++            mapping_id,
++            base_off,
++            &frame,
++            Some(&runs),
++            &vouched,
++        ) {
++            return false;
++        }
++        if let (Some(a_win), Some(p1)) = (alpha_window, p1_encoded.as_deref()) {
++            if write_two_plane_alpha_vouched(
++                state,
++                host,
++                mapping_id,
++                a_win,
++                width,
++                height,
++                p1,
++                skip,
++                &vouched,
++            )
++            .is_err()
++            {
++                return false;
++            }
++        }
++        state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
++        let _ = state.mark_mapping_written(mapping_id);
++        crate::runtime::surface_cache::forget(state, mapping_id);
++        crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
++        return true;
++    }
++    let bpp = resident_layout.bytes_per_texel();
+     let tight = (width as usize).saturating_mul(bpp as usize);
+     let need_src = tight.saturating_mul(height as usize);
+     if src.len() < need_src || (surface_bpr as usize) < tight {
+@@ -1466,6 +1737,22 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
+             },
+         );
+     };
++    let alpha_window = if pixel_format::is_two_plane_xr10(format) {
++        let win = two_plane_xr10_alpha_window(m, mw, mh);
++        if m.device_desc_complete().is_some() && win.is_none() {
++            return refuse(
++                mapping_id,
++                SurfaceWriteRefusal::WindowUnresolved {
++                    width: mw,
++                    height: mh,
++                    format,
++                },
++            );
++        }
++        win
++    } else {
++        None
++    };
+     // Deferred-writeback flush-on-access: land pending resident content in
+     // these pages before touching them.
+     //
+@@ -1744,6 +2031,31 @@ fn write_bgra8_inner<M: HostMemory + HostOps>(
+             land_started.elapsed().as_micros() as u64,
+         );
+     }
++    if let Some(a_win) = alpha_window {
++        let px_w = mw as usize;
++        let mut alpha_tight = vec![0u8; px_w.saturating_mul(mh as usize)];
++        for y in 0..mh as usize {
++            let src_off = y * (src_stride as usize);
++            let src_row = &src[src_off..src_off + px_w * (RGBA8_BPP as usize)];
++            let dst_row = &mut alpha_tight[y * px_w..(y + 1) * px_w];
++            for x in 0..px_w {
++                dst_row[x] = src_row[x * 4 + 3];
++            }
++        }
++        if let Err((lo, len)) = write_two_plane_alpha_vouched(
++            state,
++            host,
++            mapping_id,
++            a_win,
++            mw,
++            mh,
++            &alpha_tight,
++            skip,
++            &vouched,
++        ) {
++            return refuse(mapping_id, SurfaceWriteRefusal::MapperWrite { lo, len });
++        }
++    }
+     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
+     let _ = state.mark_mapping_written(mapping_id);
+     if !skip.is_empty() {
+@@ -1901,6 +2213,22 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
+             },
+         );
+     };
++    let alpha_window = if pixel_format::is_two_plane_xr10(format) {
++        let win = two_plane_xr10_alpha_window(m, mw, mh);
++        if m.device_desc_complete().is_some() && win.is_none() {
++            return refuse(
++                mapping_id,
++                SurfaceWriteRefusal::WindowUnresolved {
++                    width: mw,
++                    height: mh,
++                    format,
++                },
++            );
++        }
++        win
++    } else {
++        None
++    };
+     let bpr = bpr_u32 as u64;
+     let Some(tight) = pixel_format::tight_row_bytes(mw, format) else {
+         return refuse(mapping_id, SurfaceWriteRefusal::FormatRowLength { format });
+@@ -2035,6 +2363,31 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
+             );
+         }
+     }
++    if let Some(a_win) = alpha_window {
++        let px_w = mw as usize;
++        let mut alpha_tight = vec![0u8; px_w.saturating_mul(mh as usize)];
++        for y in 0..mh as usize {
++            let src_off = y * (rgba_stride as usize);
++            let src_row = &rgba[src_off..src_off + px_w * (RGBA8_BPP as usize)];
++            let dst_row = &mut alpha_tight[y * px_w..(y + 1) * px_w];
++            for x in 0..px_w {
++                dst_row[x] = src_row[x * 4 + 3];
++            }
++        }
++        if let Err((lo, len)) = write_two_plane_alpha_vouched(
++            state,
++            host,
++            mapping_id,
++            a_win,
++            mw,
++            mh,
++            &alpha_tight,
++            &[],
++            &vouched,
++        ) {
++            return refuse(mapping_id, SurfaceWriteRefusal::MapperWrite { lo, len });
++        }
++    }
+     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
+     let _ = state.mark_mapping_written(mapping_id);
+     // Host render-cache (Linux §8.5): full-frame BGRA from the Store rgba.
+@@ -2344,6 +2697,112 @@ pub fn read_rect_raw<M: HostMemory + HostOps>(
+     read_rect_raw_at(state, host, mapping_id, window, rect, dst, dst_stride)
+ }
+ 
++/// Read an XR10 IOSurface (`550`/`551` two-plane, `554`/`555` `BGR10_XR`, or
++/// `558`/`559` `BGRA10_XR`) from guest pages and decode into tight `Rgba16Float`
++/// (`width * height * 8` bytes), preserving extended-range channels and Plane 1
++/// alpha.
++pub fn read_xr10_to_rgba16f<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    mapping_id: u32,
++    width: u32,
++    height: u32,
++) -> Option<Vec<u8>> {
++    if !scanout_extent_ok(width, height) {
++        return None;
++    }
++    let _ = mapper::ensure_resolved_for_scanout(state, host, mapping_id);
++    let (format, base_off, surface_bpr, span_end, alpha_window) = {
++        let m = state.mappings.get(&mapping_id)?;
++        if !m.mapped || m.page_entries.is_empty() {
++            return None;
++        }
++        let (mw, mh, format) = mapping_write_geometry(m, width, height);
++        if mw != width || mh != height || !pixel_format::is_xr10(format) {
++            return None;
++        }
++        let (base_off, bpr, span_end) = type11_sample_window(m, mw, mh, format)?;
++        let alpha_window = if pixel_format::is_two_plane_xr10(format) {
++            let win = two_plane_xr10_alpha_window(m, mw, mh);
++            if m.device_desc_complete().is_some() && win.is_none() {
++                return None;
++            }
++            win
++        } else {
++            None
++        };
++        (format, base_off, bpr, span_end, alpha_window)
++    };
++    let p0_bpp = pixel_format::bytes_per_pixel(format)?;
++    let p0_tight = width.checked_mul(p0_bpp)?;
++    let p0_len = usize::try_from((p0_tight as u64).checked_mul(height as u64)?).ok()?;
++    let mut p0_bytes = vec![0u8; p0_len];
++    if !read_rect_raw_at(
++        state,
++        host,
++        mapping_id,
++        SurfaceWindow {
++            base_off,
++            bpr: surface_bpr,
++            span_end,
++            bpp: p0_bpp,
++        },
++        Rect {
++            origin_x: 0,
++            origin_y: 0,
++            width,
++            height,
++        },
++        &mut p0_bytes,
++        p0_tight,
++    ) {
++        return None;
++    }
++    let p1_bytes = if let Some((a_off, a_bpr, a_end)) = alpha_window {
++        let a_len = usize::try_from((width as u64).checked_mul(height as u64)?).ok()?;
++        let mut buf = vec![0u8; a_len];
++        if !read_rect_raw_at(
++            state,
++            host,
++            mapping_id,
++            SurfaceWindow {
++                base_off: a_off,
++                bpr: a_bpr,
++                span_end: a_end,
++                bpp: 1,
++            },
++            Rect {
++                origin_x: 0,
++                origin_y: 0,
++                width,
++                height,
++            },
++            &mut buf,
++            width,
++        ) {
++            return None;
++        }
++        Some(buf)
++    } else {
++        None
++    };
++    let out_row = (width as usize).checked_mul(pixel_format::RGBA16F_BPP as usize)?;
++    let out_len = out_row.checked_mul(height as usize)?;
++    let mut out = vec![0u8; out_len];
++    let p0_row = p0_tight as usize;
++    for y in 0..height as usize {
++        let s0 = &p0_bytes[y * p0_row..(y + 1) * p0_row];
++        let s1 = p1_bytes
++            .as_deref()
++            .map(|buf| &buf[y * (width as usize)..(y + 1) * (width as usize)]);
++        let dst = &mut out[y * out_row..(y + 1) * out_row];
++        if !pixel_format::decode_xr10_row_to_rgba16f(format, width, s0, s1, dst) {
++            return None;
++        }
++    }
++    Some(out)
++}
++
+ /// Read a rect using an explicit sample window (plane base + bpr + span).
+ /// Contig HostOps view when possible; else multi-import.
+ #[allow(
+diff --git a/crates/reims-vgpu/src/runtime/mapping_write/tests.rs b/crates/reims-vgpu/src/runtime/mapping_write/tests.rs
+index 41e07b663..2e57b473d 100644
+--- a/crates/reims-vgpu/src/runtime/mapping_write/tests.rs
++++ b/crates/reims-vgpu/src/runtime/mapping_write/tests.rs
+@@ -2318,3 +2318,128 @@ fn rect_raw_roundtrip_subregion() {
+         8
+     ));
+ }
++
++#[test]
++fn two_plane_xr10_iosurface_native_and_bgra8_roundtrip_both_planes() {
++    use crate::contract::endian::{st16, st32, st64};
++    use crate::contract::iosurface_pages::{
++        DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT,
++        DEVICE_PLANE_BPE, DEVICE_PLANE_BPR, DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS,
++        DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE,
++    };
++    use crate::contract::pixel_format::{
++        f16_to_f32, f32_to_f16, TexelLayout, MTL_FORMAT_RGB10A8_2P_XR10,
++    };
++
++    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
++    let mut host = FakeHost::new();
++    let pfn0 = 0x40u32;
++    let pfn1 = 0x41u32;
++    let gpa0 = (pfn0 as u64) << PAGE_SHIFT_ARM64E;
++    let gpa1 = (pfn1 as u64) << PAGE_SHIFT_ARM64E;
++    host.map_range(gpa0, 0x8000, 0);
++    state.map_surface(12);
++    {
++        let m = state.mappings.get_mut(&12).unwrap();
++        m.mapped = true;
++        m.mapping_internal = 1;
++        m.page_entries = vec![
++            (pfn0 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
++            (pfn1 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
++        ];
++    }
++    let pack = |w: u32, h: u32| ((w as u64 & 0xffffff) << 8) | ((h as u64 & 0xffffff) << 40);
++    let mut desc = vec![0u8; DEVICE_DESC_LEN];
++    st32(&mut desc[DEVICE_DESC_ALLOC_SIZE..], 0x8000);
++    desc[DEVICE_DESC_PLANE_COUNT] = 2;
++    // Plane 0: 2x2 BGR10_XR @ +0x0000 (stride 128).
++    st32(&mut desc[DEVICE_DESC_PLANES + DEVICE_PLANE_OFFSET..], 0);
++    st32(&mut desc[DEVICE_DESC_PLANES + DEVICE_PLANE_SIZE..], 0x4000);
++    st64(&mut desc[DEVICE_DESC_PLANES + DEVICE_PLANE_DIMS..], pack(2, 2));
++    st32(&mut desc[DEVICE_DESC_PLANES + DEVICE_PLANE_BPR..], 128);
++    st16(&mut desc[DEVICE_DESC_PLANES + DEVICE_PLANE_BPE..], 4);
++    // Plane 1: 2x2 R8Unorm alpha @ +0x4000 (stride 128).
++    let p1 = DEVICE_DESC_PLANES + DEVICE_PLANE_DESC_LEN;
++    st32(&mut desc[p1 + DEVICE_PLANE_OFFSET..], 0x4000);
++    st32(&mut desc[p1 + DEVICE_PLANE_SIZE..], 0x4000);
++    st64(&mut desc[p1 + DEVICE_PLANE_DIMS..], pack(2, 2));
++    st32(&mut desc[p1 + DEVICE_PLANE_BPR..], 128);
++    st16(&mut desc[p1 + DEVICE_PLANE_BPE..], 1);
++    assert!(state.set_mapping_device_desc(12, &desc));
++    assert!(state.set_mapping_geom(12, 2, 2, MTL_FORMAT_RGB10A8_2P_XR10));
++    assert_eq!(
++        mapping_native_resident_layout(MTL_FORMAT_RGB10A8_2P_XR10),
++        Some(TexelLayout::Rgba16Float)
++    );
++
++    // 4 pixels: extended-range neon green, transparent black, half-alpha blue, negative red.
++    let pixels: [[f32; 4]; 4] = [
++        [0.1, 1.20, 0.2, 1.0],
++        [0.0, 0.0, 0.0, 0.0],
++        [0.0, 0.25, 0.75, 128.0 / 255.0],
++        [-0.25, 0.5, 0.5, 1.0],
++    ];
++    let mut rgba16f = Vec::with_capacity(32);
++    for px in pixels {
++        for ch in px {
++            rgba16f.extend_from_slice(&f32_to_f16(ch).to_le_bytes());
++        }
++    }
++    assert!(write_native_uncached(
++        &mut state,
++        &mut host,
++        12,
++        &rgba16f,
++        2,
++        2,
++        TexelLayout::Rgba16Float,
++    ));
++
++    // Transparent black (pixel 1) must encode 0.0 as XR10 code 384 in Plane 0 and 0x00 in Plane 1.
++    let mut p0_px1 = [0u8; 4];
++    assert!(host.read_gpa(gpa0 + 4, &mut p0_px1).is_ok());
++    let word = u32::from_le_bytes(p0_px1);
++    assert_eq!(word & 0x3ff, 384);
++    assert_eq!((word >> 10) & 0x3ff, 384);
++    assert_eq!((word >> 20) & 0x3ff, 384);
++    let mut p1_row0 = [0u8; 2];
++    let mut p1_row1 = [0u8; 2];
++    assert!(host.read_gpa(gpa1, &mut p1_row0).is_ok());
++    assert!(host.read_gpa(gpa1 + 128, &mut p1_row1).is_ok());
++    assert_eq!(p1_row0, [255, 0]);
++    assert_eq!(p1_row1, [128, 255]);
++
++    // Native Rgba16Float readback preserves extended-range channels and Plane 1 alpha.
++    let decoded = read_xr10_to_rgba16f(&mut state, &mut host, 12, 2, 2).expect("xr10 readback");
++    let ch_at = |px: usize, c: usize| -> f32 {
++        let off = px * 8 + c * 2;
++        f16_to_f32(u16::from_le_bytes([decoded[off], decoded[off + 1]]))
++    };
++    assert!((ch_at(0, 1) - 1.20).abs() < 0.004, "extended green preserved");
++    assert_eq!(ch_at(1, 3), 0.0, "transparent alpha preserved");
++    assert!((ch_at(2, 3) - 128.0 / 255.0).abs() < 0.005);
++    assert!((ch_at(3, 0) - (-0.25)).abs() < 0.004, "negative red preserved");
++
++    // Scanout / RGBA8 readback reads Plane 1 alpha rather than inventing opaque 255.
++    let mut bgra = [0u8; 16];
++    assert!(crate::runtime::scanout::read_mapping_bgra8(
++        &mut state, &mut host, 12, &mut bgra, 8, 2, 2
++    ));
++    assert_eq!(bgra[3], 255);
++    assert_eq!(bgra[7], 0, "transparent pixel must not become opaque black");
++    assert_eq!(bgra[11], 128);
++    assert_eq!(bgra[15], 255);
++
++    // BGRA8 fallback write also updates Plane 1 alpha.
++    let fallback_bgra: [u8; 16] = [
++        0, 255, 0, 200, // (0,0) a=200
++        0, 0, 0, 0, // (1,0) a=0
++        255, 0, 0, 64, // (0,1) a=64
++        0, 0, 255, 255, // (1,1) a=255
++    ];
++    assert!(write_bgra8(&mut state, &mut host, 12, &fallback_bgra, 8, 2, 2));
++    assert!(host.read_gpa(gpa1, &mut p1_row0).is_ok());
++    assert!(host.read_gpa(gpa1 + 128, &mut p1_row1).is_ok());
++    assert_eq!(p1_row0, [200, 0]);
++    assert_eq!(p1_row1, [64, 255]);
++}
+diff --git a/crates/reims-vgpu/src/runtime/render_writeback.rs b/crates/reims-vgpu/src/runtime/render_writeback.rs
+index 00543e90c..7ae277429 100644
+--- a/crates/reims-vgpu/src/runtime/render_writeback.rs
++++ b/crates/reims-vgpu/src/runtime/render_writeback.rs
+@@ -949,8 +949,7 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
+                 .mappings
+                 .get(&mapping_id)
+                 .map(crate::runtime::mapping_write::mapping_store_format)
+-                .and_then(crate::contract::pixel_format::store_texel_order)
+-                .filter(|layout| !layout.is_four_byte_color());
++                .and_then(crate::runtime::mapping_write::mapping_native_resident_layout);
+             if let Some(expected_layout) = native_layout {
+                 if let Ok(rb) = crate::backend::vulkan::engine::read_target_native(identity) {
+                     if rb.layout == expected_layout {
+diff --git a/crates/reims-vgpu/src/runtime/scanout/mod.rs b/crates/reims-vgpu/src/runtime/scanout/mod.rs
+index 98957e85c..a25213689 100644
+--- a/crates/reims-vgpu/src/runtime/scanout/mod.rs
++++ b/crates/reims-vgpu/src/runtime/scanout/mod.rs
+@@ -1023,6 +1023,16 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
+     let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mw, mh, format) else {
+         return fail(CaptureDecline::NoSampleWindow);
+     };
++    let alpha_window = if pixel_format::is_two_plane_xr10(format) {
++        let win = crate::runtime::mapping_write::two_plane_xr10_alpha_window(m, mw, mh);
++        if m.device_desc_complete().is_some() && win.is_none() {
++            return fail(CaptureDecline::NoSampleWindow);
++        }
++        win
++    } else {
++        None
++    };
++    let max_span_end = alpha_window.map_or(span_end, |(_, _, a_end)| span_end.max(a_end));
+     let bpr = bpr_u32 as usize;
+     if (bpr as u64) < tight as u64 {
+         return fail(CaptureDecline::BprBelowTight {
+@@ -1040,10 +1050,10 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
+         if ptr == 0 {
+             return fail(CaptureDecline::ContigViewNull);
+         }
+-        if (contig_len as u64) < span_end {
++        if (contig_len as u64) < max_span_end {
+             return fail(CaptureDecline::ContigViewShort {
+                 contig_len: contig_len as u64,
+-                span_end,
++                span_end: max_span_end,
+             });
+         }
+         if base_off >= span_end {
+@@ -1078,8 +1088,32 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
+     } else {
+         None
+     };
++    let alpha_multi = if let Some((a_off, _, a_end)) = alpha_window {
++        if a_off >= a_end {
++            return fail(CaptureDecline::BaseBeyondSpan {
++                base_off: a_off,
++                span_end: a_end,
++                contig: contig.is_some(),
++            });
++        }
++        if contig.is_none() {
++            let len = a_end.saturating_sub(a_off) as usize;
++            let mut bytes = vec![0u8; len];
++            if !crate::runtime::mapper::read_mapping_bytes(
++                state, host, mapping_id, a_off, &mut bytes,
++            ) {
++                return fail(CaptureDecline::MultiReadFailed { len });
++            }
++            Some(bytes)
++        } else {
++            None
++        }
++    } else {
++        None
++    };
+ 
+     let mut src_row = vec![0u8; tight as usize];
++    let mut alpha_row = alpha_window.map(|_| vec![0u8; mw as usize]);
+     let mut rgba_row = if format == MTL_FORMAT_BGRA8_UNORM
+         || format == pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB
+     {
+@@ -1113,7 +1147,36 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
+                 return fail(CaptureDecline::ConvertRowMissing { row: y });
+             }
+             let dst_row = &mut dst[dst_off..dst_off + dst_row_len];
+-            if !convert_row_to_rgba8(format, &src_row[..tight as usize], mw, rgba) {
++            let converted = if let (Some((a_off, a_bpr, _)), Some(a_row)) =
++                (alpha_window, alpha_row.as_mut())
++            {
++                let a_src_off = (y as usize).saturating_mul(a_bpr as usize);
++                let px_w = mw as usize;
++                if let Some((ptr, _)) = contig {
++                    let src_a = unsafe { (ptr as *const u8).add(a_off as usize + a_src_off) };
++                    unsafe {
++                        std::ptr::copy_nonoverlapping(src_a, a_row.as_mut_ptr(), px_w);
++                    }
++                } else if let Some(a_bytes) = alpha_multi.as_ref() {
++                    let end = a_src_off.saturating_add(px_w);
++                    let Some(row) = a_bytes.get(a_src_off..end) else {
++                        return fail(CaptureDecline::ConvertRowOob { row: y });
++                    };
++                    a_row.copy_from_slice(row);
++                } else {
++                    return fail(CaptureDecline::ConvertRowMissing { row: y });
++                }
++                pixel_format::decode_xr10_row_to_rgba8(
++                    format,
++                    mw,
++                    &src_row[..tight as usize],
++                    Some(a_row.as_slice()),
++                    rgba,
++                )
++            } else {
++                convert_row_to_rgba8(format, &src_row[..tight as usize], mw, rgba)
++            };
++            if !converted {
+                 return fail(CaptureDecline::ConvertToRgba { format });
+             }
+             if !convert_rgba8_to_row(MTL_FORMAT_BGRA8_UNORM, rgba, mw, dst_row) {
+-- 
+2.43.0
+

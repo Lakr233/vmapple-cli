@@ -1,0 +1,426 @@
+From fe7e2da058fbd4bd60b7b9e6297cddb20c1dd916 Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Wed, 11 Nov 2026 21:20:48 +0800
+Subject: [PATCH 57/68] vgpu: synchronize ColorInput feedback passes, compute
+ debt and native merges
+
+Add VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT to registry_target_usage so secondary MRT attachments and recycled colour residents disable incompatible framebuffer compression on attachment feedback loop hosts, set COLOR_ATTACHMENT_FEEDBACK_LOOP_EXT on graphics pipelines with color_inputs, include FRAGMENT_SHADER/INPUT_ATTACHMENT_READ in pre-pass barriers, keep MRT render passes open across layout-matching continuations, and emit an intra-subpass BY_REGION barrier for color_inputs programmable blending.
+
+Also settle deferred render writebacks before serving compute linear-texture cache hits, convert RGBA32Float CPU texels, and support skipping native merges on wide surfaces.
+---
+ .../src/backend/vulkan/engine/caches.rs       |  6 +-
+ .../src/backend/vulkan/engine/exec.rs         | 39 +++++++-
+ .../src/backend/vulkan/engine/mod.rs          | 15 ++-
+ .../engine/pools/images_and_registry.rs       | 17 ++--
+ .../reims-vgpu/src/contract/pixel_format.rs   | 19 ++++
+ .../src/runtime/compute_exec/mod.rs           |  5 +-
+ crates/reims-vgpu/src/runtime/draw/vulkan.rs  | 19 +++-
+ .../src/runtime/mapping_write/mod.rs          | 91 +++++++++++++++++++
+ crates/reims-vgpu/tests/vk_engine_parity.rs   |  2 +-
+ 9 files changed, 194 insertions(+), 19 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs b/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
+index d2ee97982..b0aca1f93 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
+@@ -2177,6 +2177,7 @@ impl ObjectCaches {
+                 attribute_formats,
+                 pipeline_layout: ask.pipeline_layout,
+                 render_pass: ask.render_pass,
++                attachment_feedback_loop_layout: ctx.features.attachment_feedback_loop_layout,
+             },
+             vert: std::sync::Arc::clone(ask.vert),
+             frag: std::sync::Arc::clone(ask.frag),
+@@ -2738,6 +2739,7 @@ pub(crate) struct GraphicsRecipe {
+     pub attribute_formats: Vec<vk::Format>,
+     pub pipeline_layout: vk::PipelineLayout,
+     pub render_pass: vk::RenderPass,
++    pub attachment_feedback_loop_layout: bool,
+ }
+ 
+ /// Build one graphics pipeline from `recipe`.
+@@ -2943,7 +2945,9 @@ pub(crate) unsafe fn create_graphics_pipeline(
+         .layout(recipe.pipeline_layout)
+         .render_pass(recipe.render_pass)
+         .subpass(0);
+-    if key.feedback_colors != 0 {
++    if key.feedback_colors != 0
++        || (key.pass.pass_key().color_inputs != 0 && recipe.attachment_feedback_loop_layout)
++    {
+         gpci = gpci.flags(vk::PipelineCreateFlags::COLOR_ATTACHMENT_FEEDBACK_LOOP_EXT);
+     }
+     if key.pass.has_depth() {
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs b/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
+index 6e95220d4..ca6f725e2 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
+@@ -4320,10 +4320,13 @@ pub(crate) unsafe fn execute_draw_inner(
+         area: (req.width, req.height),
+     };
+     let target_feedback = pass_key.color_feedback(0);
++    let target_fetched = pass_key.color_fetched(0);
+     let target_pass_layout = pass_key.color_layout(0);
+     let target_dst_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+         | if target_feedback {
+             vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER
++        } else if target_fetched {
++            vk::PipelineStageFlags::FRAGMENT_SHADER
+         } else {
+             vk::PipelineStageFlags::empty()
+         };
+@@ -4333,6 +4336,11 @@ pub(crate) unsafe fn execute_draw_inner(
+             vk::AccessFlags::SHADER_READ
+         } else {
+             vk::AccessFlags::empty()
++        }
++        | if target_fetched {
++            vk::AccessFlags::INPUT_ATTACHMENT_READ
++        } else {
++            vk::AccessFlags::empty()
+         };
+     let target_dependency = if target_feedback {
+         vk::DependencyFlags::FEEDBACK_LOOP_EXT
+@@ -4965,12 +4973,19 @@ pub(crate) unsafe fn execute_draw_inner(
+         }
+         let attachment_index = secondary_index + 1;
+         let feedback = pass_key.color_feedback(attachment_index);
+-        if feedback && req.continues_render_pass && pools.open_pass_echoes(&echo) {
++        let fetched = pass_key.color_fetched(attachment_index);
++        let desired_layout = pass_key.color_layout(attachment_index);
++        if (feedback || access.layout() == desired_layout)
++            && req.continues_render_pass
++            && pools.open_pass_echoes(&echo)
++        {
+             continue;
+         }
+         let dst_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+             | if feedback {
+                 vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER
++            } else if fetched {
++                vk::PipelineStageFlags::FRAGMENT_SHADER
+             } else {
+                 vk::PipelineStageFlags::empty()
+             };
+@@ -4980,6 +4995,11 @@ pub(crate) unsafe fn execute_draw_inner(
+                 vk::AccessFlags::SHADER_READ
+             } else {
+                 vk::AccessFlags::empty()
++            }
++            | if fetched {
++                vk::AccessFlags::INPUT_ATTACHMENT_READ
++            } else {
++                vk::AccessFlags::empty()
+             };
+         unsafe { outside_pass.before_record(PassObstacle::MrtLayout, pools, &ctx.device, cb) };
+         let (src_stage, src_access) = access.source_scope();
+@@ -5240,6 +5260,23 @@ pub(crate) unsafe fn execute_draw_inner(
+             &[],
+         );
+     }
++    if pass_key.color_inputs != 0 {
++        // Order programmable-blending (`SubpassData` `OpImageRead`) reads after
++        // preceding colour-attachment writes in the same subpass, matching
++        // `fetch_dep` in `caches::get_or_create_render_pass`.
++        let barrier = [vk::MemoryBarrier::default()
++            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
++            .dst_access_mask(vk::AccessFlags::INPUT_ATTACHMENT_READ)];
++        ctx.device.cmd_pipeline_barrier(
++            cb,
++            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
++            vk::PipelineStageFlags::FRAGMENT_SHADER,
++            vk::DependencyFlags::BY_REGION,
++            &barrier,
++            &[],
++            &[],
++        );
++    }
+     phase.enter(super::draw_phase::Phase::RecordState);
+     // Only if this command buffer is not already carrying it — the three
+     // `dynstate_*` skips below hang off this one call, because a pipeline change
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs b/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
+index af554a1c8..d0a7a2ebb 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
+@@ -172,7 +172,10 @@ pub(crate) fn registry_subresource_range(
+ /// geometry matches. Deriving usage here makes "same bucket implies same usage"
+ /// true by construction, so a fourth creation site cannot get it wrong and
+ /// nothing has to scan for one that did.
+-pub(crate) fn registry_target_usage(format: ash::vk::Format) -> ash::vk::ImageUsageFlags {
++pub(crate) fn registry_target_usage(
++    format: ash::vk::Format,
++    attachment_feedback_loop_layout: bool,
++) -> ash::vk::ImageUsageFlags {
+     if format_is_depth(format) {
+         // A depth resident is only ever attachment N of an ad-hoc framebuffer.
+         // No SAMPLED and no TRANSFER: nothing in this device reads a depth
+@@ -181,11 +184,15 @@ pub(crate) fn registry_target_usage(format: ash::vk::Format) -> ash::vk::ImageUs
+         // support the attachment alone.
+         ash::vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+     } else {
+-        ash::vk::ImageUsageFlags::COLOR_ATTACHMENT
++        let mut usage = ash::vk::ImageUsageFlags::COLOR_ATTACHMENT
+             | ash::vk::ImageUsageFlags::INPUT_ATTACHMENT
+             | ash::vk::ImageUsageFlags::TRANSFER_SRC
+             | ash::vk::ImageUsageFlags::TRANSFER_DST
+-            | ash::vk::ImageUsageFlags::SAMPLED
++            | ash::vk::ImageUsageFlags::SAMPLED;
++        if attachment_feedback_loop_layout {
++            usage |= ash::vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT;
++        }
++        usage
+     }
+ }
+ 
+@@ -3682,7 +3689,7 @@ pub fn probe_guest_backed_target(
+             width,
+             height,
+             format,
+-            registry_target_usage(format),
++            registry_target_usage(format, ctx.features.attachment_feedback_loop_layout),
+         )
+     };
+ }
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/pools/images_and_registry.rs b/crates/reims-vgpu/src/backend/vulkan/engine/pools/images_and_registry.rs
+index b6093a2d6..c7519865f 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/pools/images_and_registry.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/pools/images_and_registry.rs
+@@ -1054,14 +1054,10 @@ impl ResourcePools {
+         // reclaims and retries on out-of-memory rather than trimming ahead of
+         // one. See `recoverable_residents`.
+         self.note_registry_reach();
+-        let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
+-            | vk::ImageUsageFlags::INPUT_ATTACHMENT
+-            | vk::ImageUsageFlags::TRANSFER_SRC
+-            | vk::ImageUsageFlags::TRANSFER_DST
+-            | vk::ImageUsageFlags::SAMPLED;
+-        if ctx.features.attachment_feedback_loop_layout {
+-            usage |= vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT;
+-        }
++        let usage = super::super::registry_target_usage(
++            format.allocation(),
++            ctx.features.attachment_feedback_loop_layout,
++        );
+         // Reuse a recycled image+memory+view of identical (geometry, format)
+         // before allocating a fresh one — the usage set is identical across all
+         // registry targets, so a recycled image of the same geometry/format is
+@@ -1394,7 +1390,10 @@ impl ResourcePools {
+         }
+         // Census only, as in the primary `registry_ensure`.
+         self.note_registry_reach();
+-        let usage = super::super::registry_target_usage(format.allocation());
++        let usage = super::super::registry_target_usage(
++            format.allocation(),
++            ctx.features.attachment_feedback_loop_layout,
++        );
+         // Reuse a recycled image+memory+view of identical (geometry, format)
+         // before allocating — same recycle discipline as the primary
+         // `registry_ensure`. Usage is a function of the format
+diff --git a/crates/reims-vgpu/src/contract/pixel_format.rs b/crates/reims-vgpu/src/contract/pixel_format.rs
+index 812b2f406..355d646cb 100644
+--- a/crates/reims-vgpu/src/contract/pixel_format.rs
++++ b/crates/reims-vgpu/src/contract/pixel_format.rs
+@@ -2100,6 +2100,18 @@ pub fn texel_to_rgba8(format: u16, src: &[u8]) -> Option<[u8; 4]> {
+             rgba[COMPONENT_B] = ((u32::from(ld16(&src[4..6])) * 255 + 32768) >> 16) as u8;
+             rgba[COMPONENT_A] = ((u32::from(ld16(&src[6..8])) * 255 + 32768) >> 16) as u8;
+         }
++        MTL_FORMAT_RGBA32_FLOAT => {
++            for c in 0..4 {
++                let f = f32::from_le_bytes([
++                    src[c * 4],
++                    src[c * 4 + 1],
++                    src[c * 4 + 2],
++                    src[c * 4 + 3],
++                ]);
++                let clamped = if f.is_nan() { 0.0 } else { f.clamp(0.0, 1.0) };
++                rgba[c] = (clamped * 255.0 + 0.5) as u8;
++            }
++        }
+         MTL_FORMAT_RG16_FLOAT => {
+             // Two float16 channels → R,G; B has no source (0), A opaque. Mirrors
+             // the RGBA16Float LUT path (values clamp to [0,1] through the u8 LUT).
+@@ -2151,6 +2163,12 @@ pub fn rgba8_to_texel(format: u16, rgba: [u8; 4], dst: &mut [u8]) -> bool {
+             st16(&mut dst[4..6], u16::from(rgba[COMPONENT_B]) * 257);
+             st16(&mut dst[6..8], u16::from(rgba[COMPONENT_A]) * 257);
+         }
++        MTL_FORMAT_RGBA32_FLOAT => {
++            for c in 0..4 {
++                let f = f32::from(rgba[c]) / 255.0;
++                dst[c * 4..c * 4 + 4].copy_from_slice(&f.to_le_bytes());
++            }
++        }
+         MTL_FORMAT_RG16_FLOAT => {
+             // R,G → two float16 channels; B,A have no destination (RG16 is
+             // 4 bytes). Inverse of the texel_to_rgba8 RG16Float path.
+@@ -2239,6 +2257,7 @@ pub fn narrows_to_unorm8(format: u16) -> bool {
+         MTL_FORMAT_RGBA16_FLOAT
+             | MTL_FORMAT_RG16_FLOAT
+             | MTL_FORMAT_RGBA16_UNORM
++            | MTL_FORMAT_RGBA32_FLOAT
+             | MTL_FORMAT_RGB10A2_UNORM
+             | MTL_FORMAT_BGR10A2_UNORM
+     )
+diff --git a/crates/reims-vgpu/src/runtime/compute_exec/mod.rs b/crates/reims-vgpu/src/runtime/compute_exec/mod.rs
+index c57da4206..2a0821f25 100644
+--- a/crates/reims-vgpu/src/runtime/compute_exec/mod.rs
++++ b/crates/reims-vgpu/src/runtime/compute_exec/mod.rs
+@@ -2633,7 +2633,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
+     }
+     if serve.is_some() || have_bytes {
+         // Engine resident serves this window; no cache/guest read.
+-    } else if let Some(cached) = crate::runtime::surface_cache::get_linear_texture(state, &window) {
++    } else if let Some(cached) = {
++        crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
++        crate::runtime::surface_cache::get_linear_texture(state, &window)
++    } {
+         bytes.copy_from_slice(cached);
+         crate::observe::off(format!(
+             "compute_stage_tex linear_cache task={task_id} ref={texture_ref} gva={gva:#x} fmt={:#x} dims={w}x{h} row_stride={}",
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index d9287b565..6ba91ba2d 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -10286,9 +10286,24 @@ fn merge_guest_writes_into_pages<M: HostMemory + HostOps>(
+     }
+     let readback = match crate::backend::vulkan::engine::read_target(identity) {
+         Ok(rb) => rb,
+-        Err(e) => {
++        Err(first_err) => {
++            if let Ok(native) = crate::backend::vulkan::engine::read_target_native(identity) {
++                if mapping_write::write_native_skipping(
++                    state,
++                    host,
++                    mapping_id,
++                    &native.pixels,
++                    width,
++                    height,
++                    native.layout,
++                    guest_owned,
++                ) {
++                    crate::runtime::drain::note_store_route("t11sample_resident_merged");
++                    return true;
++                }
++            }
+             crate::observe::fail(format!(
+-                "sampled_resident_merge_fail mid={mapping_id} {width}x{height} stage=readback err={e:?}"
++                "sampled_resident_merge_fail mid={mapping_id} {width}x{height} stage=readback err={first_err:?}"
+             ));
+             return false;
+         }
+diff --git a/crates/reims-vgpu/src/runtime/mapping_write/mod.rs b/crates/reims-vgpu/src/runtime/mapping_write/mod.rs
+index 3eccaac12..1a0185343 100644
+--- a/crates/reims-vgpu/src/runtime/mapping_write/mod.rs
++++ b/crates/reims-vgpu/src/runtime/mapping_write/mod.rs
+@@ -681,6 +681,97 @@ pub fn write_native_uncached<M: HostMemory + HostOps>(
+     true
+ }
+ 
++/// [`write_native_uncached`], leaving `skip` mapping-offset ranges untouched so
++/// partial CPU writes on a wide/non-4-byte surface merge cleanly with its GPU resident.
++#[allow(
++    clippy::too_many_arguments,
++    reason = "native geometry, resident layout, and guest-owned skip ranges"
++)]
++pub fn write_native_skipping<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    mapping_id: u32,
++    src: &[u8],
++    width: u32,
++    height: u32,
++    resident_layout: pixel_format::TexelLayout,
++    skip: SkipRanges<'_>,
++) -> bool {
++    if skip.is_empty() {
++        return write_native_uncached(state, host, mapping_id, src, width, height, resident_layout);
++    }
++    if !scanout_extent_ok(width, height) {
++        return false;
++    }
++    let (base_off, surface_bpr, span_end, bpp) = {
++        let Some(m) = state.mappings.get(&mapping_id) else {
++            return false;
++        };
++        if !m.mapped || m.page_entries.is_empty() {
++            return false;
++        }
++        let (mw, mh, format) = mapping_write_geometry(m, width, height);
++        if mw != width || mh != height {
++            return false;
++        }
++        if pixel_format::store_texel_order(format) != Some(resident_layout) {
++            return false;
++        }
++        let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
++            return false;
++        };
++        (base_off, bpr, span_end, resident_layout.bytes_per_texel())
++    };
++    let tight = (width as usize).saturating_mul(bpp as usize);
++    let need_src = tight.saturating_mul(height as usize);
++    if src.len() < need_src || (surface_bpr as usize) < tight {
++        return false;
++    }
++    crate::runtime::writeback_debt::supersede_for_mapping(
++        state,
++        mapping_id,
++        crate::runtime::render_writeback::SettleSite::MappingBgra8Write,
++    );
++    let Some(vouched) = vouch_for_write(state, host, mapping_id, "native_skip") else {
++        return false;
++    };
++    let bpr = surface_bpr as usize;
++    let frame_len = (height as usize)
++        .saturating_sub(1)
++        .saturating_mul(bpr)
++        .saturating_add(tight);
++    let mut frame = vec![0u8; frame_len];
++    let mut runs: Vec<(u64, u64)> = Vec::new();
++    for y in 0..height {
++        let src_off = (y as usize) * tight;
++        let dst_off = (y as usize) * bpr;
++        frame[dst_off..dst_off + tight].copy_from_slice(&src[src_off..src_off + tight]);
++        let row_lo = base_off.saturating_add((y as u64).saturating_mul(surface_bpr as u64));
++        for (lo, hi) in unskipped(row_lo, row_lo.saturating_add(tight as u64), skip) {
++            match runs.last_mut() {
++                Some(last) if last.1 == lo => last.1 = hi,
++                _ => runs.push((lo, hi)),
++            }
++        }
++    }
++    if !mapper::write_mapping_bytes_only(
++        state,
++        host,
++        mapping_id,
++        base_off,
++        &frame,
++        Some(&runs),
++        &vouched,
++    ) {
++        return false;
++    }
++    state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
++    let _ = state.mark_mapping_written(mapping_id);
++    crate::runtime::surface_cache::forget(state, mapping_id);
++    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
++    true
++}
++
+ /// A check that stopped a resident's frame from reaching the guest's pages
+ /// without a host copy, so the flush owes the copying rail instead.
+ ///
+diff --git a/crates/reims-vgpu/tests/vk_engine_parity.rs b/crates/reims-vgpu/tests/vk_engine_parity.rs
+index 34bb648d5..8bec20203 100644
+--- a/crates/reims-vgpu/tests/vk_engine_parity.rs
++++ b/crates/reims-vgpu/tests/vk_engine_parity.rs
+@@ -3710,7 +3710,7 @@ fn framebuffer_fetch_reads_destination_via_input_attachment() {
+     let f = translate_words("render_frag_fetch.air", Stage::Fragment);
+     let (w, h) = (16u32, 16u32);
+     let mut req = engine_req(&v, &f, w, h);
+-    req.color_input = true;
++    req.color_inputs = 1;
+     // Seed (64, 128, 191, 255) → expect ~(191, 127, 64, 255).
+     req.target_rgba8 = Some(std::sync::Arc::new(
+         [64, 128, 191, 255].repeat((w * h) as usize),
+-- 
+2.43.0
+

@@ -1,0 +1,195 @@
+From 77983e76a29f9df89ee8325f9b2a310158c71c4f Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Thu, 12 Nov 2026 10:01:24 +0800
+Subject: [PATCH 65/68] vgpu: enable primitive restart on strip topologies
+
+Metal unconditionally enables primitive restart (0xFFFF for UInt16 and
+0xFFFFFFFF for UInt32) on indexed LineStrip and TriangleStrip draws with
+no state toggle to disable it. Vulkan leaves primitiveRestartEnable off
+by default, which caused multi-quad indexed TriangleStrip batches such
+as RenderBox path_exterior_vertex (13 sub-segment quads separated by 12
+0xFFFF restart sentinels in a 64-index buffer) to execute vertex 65535
+and bridge adjacent quads across the scanline.
+
+Enable primitiveRestartEnable on LineStrip and TriangleStrip graphics
+pipelines, matching Vulkan 1.0 core rules without requiring optional
+list-restart features.
+---
+ .../src/backend/vulkan/engine/caches.rs       |  5 +-
+ .../vulkan/engine/pipeline_compiler/tests.rs  | 89 +++++++++++++++++++
+ .../src/backend/vulkan/engine/types.rs        |  4 +
+ .../src/backend/vulkan/translate/raster.rs    | 25 ++++++
+ 4 files changed, 121 insertions(+), 2 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs b/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
+index 407c33cdf..fc3cf7fc4 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
+@@ -2828,8 +2828,9 @@ pub(crate) unsafe fn create_graphics_pipeline(
+     if !vertex_binding_divisors.is_empty() {
+         vtx_input = vtx_input.push_next(&mut vertex_divisor_state);
+     }
+-    let input_asm =
+-        vk::PipelineInputAssemblyStateCreateInfo::default().topology(key.topology.vk());
++    let input_asm = vk::PipelineInputAssemblyStateCreateInfo::default()
++        .topology(key.topology.vk())
++        .primitive_restart_enable(key.topology.primitive_restart());
+     // Dynamic viewport/scissor so L5 key need not include extent (flip flag is static).
+     // Stencil reference is dynamic (Metal's `SetStencilReferenceValue` is a
+     // command distinct from the state object) so distinct references reuse
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/pipeline_compiler/tests.rs b/crates/reims-vgpu/src/backend/vulkan/engine/pipeline_compiler/tests.rs
+index 68203b0e7..92d8f7147 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/pipeline_compiler/tests.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/pipeline_compiler/tests.rs
+@@ -408,3 +408,92 @@ fn with_the_switch_off_a_cold_pipeline_is_built_inside_its_draw() {
+     assert_eq!(CENSUS.jobs.load(Ordering::Relaxed), jobs_before + 1);
+     assert_eq!(CENSUS.in_draw.load(Ordering::Relaxed), in_draw_before + 1);
+ }
++
++/// Indexed `TriangleStrip` draws split multiple quads with Metal's `0xFFFF`
++/// (`U16`) and `0xFFFFFFFF` (`U32`) primitive-restart sentinels (e.g. RenderBox
++/// `path_exterior_vertex` 13-quad / 64-index strips). Vertices `0..4` cover
++/// `x in [-1.0, -0.5]`, vertices `4..8` cover `x in [0.5, 1.0]`, and any
++/// out-of-bounds index (`>= 8`, including `0xFFFF` / `0xFFFFFFFF` if restart
++/// were left disabled) emits `(0.0, 0.0)` in the centre gap.
++const STRIP_RESTART_VERT: [u32; 199] = [
++    0x07230203, 0x00010500, 0x00070000, 0x00000026, 0x00000000, 0x00020011, 0x00000001, 0x0003000e,
++    0x00000000, 0x00000000, 0x0007000f, 0x00000000, 0x00000001, 0x6e69616d, 0x00000000, 0x00000002,
++    0x00000003, 0x00040047, 0x00000002, 0x0000000b, 0x0000002a, 0x00040047, 0x00000003, 0x0000000b,
++    0x00000000, 0x00020013, 0x00000004, 0x00030021, 0x00000005, 0x00000004, 0x00040015, 0x00000006,
++    0x00000020, 0x00000000, 0x00020014, 0x00000007, 0x00030016, 0x00000008, 0x00000020, 0x00040017,
++    0x00000009, 0x00000008, 0x00000004, 0x00040020, 0x0000000a, 0x00000001, 0x00000006, 0x00040020,
++    0x0000000b, 0x00000003, 0x00000009, 0x0004003b, 0x0000000a, 0x00000002, 0x00000001, 0x0004003b,
++    0x0000000b, 0x00000003, 0x00000003, 0x0004002b, 0x00000006, 0x0000000c, 0x00000001, 0x0004002b,
++    0x00000006, 0x0000000d, 0x00000002, 0x0004002b, 0x00000006, 0x0000000e, 0x00000004, 0x0004002b,
++    0x00000006, 0x0000000f, 0x00000008, 0x0004002b, 0x00000008, 0x00000010, 0x00000000, 0x0004002b,
++    0x00000008, 0x00000011, 0x3f800000, 0x0004002b, 0x00000008, 0x00000012, 0xbf800000, 0x0004002b,
++    0x00000008, 0x00000013, 0xbf000000, 0x0004002b, 0x00000008, 0x00000014, 0x3f000000, 0x0007002c,
++    0x00000009, 0x00000015, 0x00000010, 0x00000010, 0x00000010, 0x00000011, 0x00050036, 0x00000004,
++    0x00000001, 0x00000000, 0x00000005, 0x000200f8, 0x00000016, 0x0004003d, 0x00000006, 0x00000017,
++    0x00000002, 0x000500ae, 0x00000007, 0x00000018, 0x00000017, 0x0000000f, 0x000300f7, 0x00000019,
++    0x00000000, 0x000400fa, 0x00000018, 0x0000001a, 0x0000001b, 0x000200f8, 0x0000001a, 0x0003003e,
++    0x00000003, 0x00000015, 0x000200f9, 0x00000019, 0x000200f8, 0x0000001b, 0x000500ae, 0x00000007,
++    0x0000001c, 0x00000017, 0x0000000e, 0x000600a9, 0x00000008, 0x0000001d, 0x0000001c, 0x00000014,
++    0x00000012, 0x000600a9, 0x00000008, 0x0000001e, 0x0000001c, 0x00000011, 0x00000013, 0x000500c7,
++    0x00000006, 0x0000001f, 0x00000017, 0x0000000c, 0x000500ab, 0x00000007, 0x00000020, 0x0000001f,
++    0x0000000c, 0x000600a9, 0x00000008, 0x00000021, 0x00000020, 0x0000001d, 0x0000001e, 0x000500c7,
++    0x00000006, 0x00000022, 0x00000017, 0x0000000d, 0x000500ab, 0x00000007, 0x00000023, 0x00000022,
++    0x0000000d, 0x000600a9, 0x00000008, 0x00000024, 0x00000023, 0x00000012, 0x00000011, 0x00070050,
++    0x00000009, 0x00000025, 0x00000021, 0x00000024, 0x00000010, 0x00000011, 0x0003003e, 0x00000003,
++    0x00000025, 0x000200f9, 0x00000019, 0x000200f8, 0x00000019, 0x000100fd, 0x00010038,
++];
++
++#[test]
++fn indexed_triangle_strip_restarts_on_u16_and_u32_sentinels() {
++    use crate::backend::vulkan::engine::{BufferContent, IndexType, IndexedDrawResource};
++
++    crate::observe::redirect_logs_for_tests();
++    let vert = Arc::new(STRIP_RESTART_VERT.to_vec());
++    let frag = frag_variant(42);
++
++    let u16_indices: [u16; 9] = [0, 1, 2, 3, 0xFFFF, 4, 5, 6, 7];
++    let mut u16_bytes = Vec::with_capacity(18);
++    for idx in u16_indices {
++        u16_bytes.extend_from_slice(&idx.to_le_bytes());
++    }
++    let u32_indices: [u32; 9] = [0, 1, 2, 3, 0xFFFF_FFFF, 4, 5, 6, 7];
++    let mut u32_bytes = Vec::with_capacity(36);
++    for idx in u32_indices {
++        u32_bytes.extend_from_slice(&idx.to_le_bytes());
++    }
++
++    for (index_type, raw) in [(IndexType::U16, u16_bytes), (IndexType::U32, u32_bytes)] {
++        let req = DrawRequest {
++            vert_spirv: Arc::clone(&vert),
++            frag_spirv: Arc::clone(&frag),
++            width: 8,
++            height: 4,
++            instance_count: Some(1),
++            primitive_topology: PrimitiveTopology::TriangleStrip,
++            indexed: Some(IndexedDrawResource {
++                index_type,
++                index_count: 9,
++                vertex_offset: 0,
++                content: BufferContent::Bytes(Arc::new(raw)),
++            }),
++            ..Default::default()
++        };
++        let pixels = match super::super::execute_draw_request_blocking(&req) {
++            Ok(out) => out.pixels,
++            Err(DrawError::Init(_)) => return,
++            Err(e) => panic!("indexed strip draw failed ({index_type:?}): {e}"),
++        };
++        let alpha_at = |x: usize, y: usize| pixels[(y * 8 + x) * 4 + 3];
++        assert_eq!(alpha_at(0, 2), 255, "left quad must cover x=0 ({index_type:?})");
++        assert_eq!(alpha_at(1, 2), 255, "left quad must cover x=1 ({index_type:?})");
++        for gap_x in 2..6 {
++            assert_eq!(
++                alpha_at(gap_x, 2),
++                0,
++                "gap x={gap_x} bridged across restart sentinel ({index_type:?})"
++            );
++        }
++        assert_eq!(alpha_at(6, 2), 255, "right quad must cover x=6 ({index_type:?})");
++        assert_eq!(alpha_at(7, 2), 255, "right quad must cover x=7 ({index_type:?})");
++    }
++}
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/types.rs b/crates/reims-vgpu/src/backend/vulkan/engine/types.rs
+index 587affa0e..0c857cada 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/types.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/types.rs
+@@ -849,6 +849,10 @@ impl PrimitiveTopology {
+     pub(crate) fn vk(self) -> vk::PrimitiveTopology {
+         translate::raster::vk_topology(self)
+     }
++
++    pub(crate) fn primitive_restart(self) -> bool {
++        translate::raster::primitive_restart(self)
++    }
+ }
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+diff --git a/crates/reims-vgpu/src/backend/vulkan/translate/raster.rs b/crates/reims-vgpu/src/backend/vulkan/translate/raster.rs
+index f175485a1..67e56b9fd 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/translate/raster.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/translate/raster.rs
+@@ -118,6 +118,22 @@ pub fn vk_topology(topology: PrimitiveTopology) -> vk::PrimitiveTopology {
+     }
+ }
+ 
++/// Whether Metal unconditionally enables primitive restart (`0xFFFF` for `U16`,
++/// `0xFFFFFFFF` for `U32`) on indexed draws of this topology.
++///
++/// Metal has no state toggle for primitive restart: it is always active on
++/// `MTLPrimitiveTypeLineStrip` and `MTLPrimitiveTypeTriangleStrip`, and never
++/// on list topologies. That matches Vulkan 1.0 core
++/// (`VUID-VkPipelineInputAssemblyStateCreateInfo-topology-00428`), which allows
++/// `primitiveRestartEnable` on strip topologies without any optional device
++/// feature and ignores it on non-indexed draws.
++pub fn primitive_restart(topology: PrimitiveTopology) -> bool {
++    match topology {
++        PrimitiveTopology::LineStrip | PrimitiveTopology::TriangleStrip => true,
++        PrimitiveTopology::Point | PrimitiveTopology::Line | PrimitiveTopology::Triangle => false,
++    }
++}
++
+ pub fn vk_compare_op(compare: SamplerCompareFunction) -> vk::CompareOp {
+     match compare {
+         SamplerCompareFunction::Never => vk::CompareOp::NEVER,
+@@ -485,4 +501,13 @@ mod tests {
+         assert_eq!(vk_index_type(IndexType::U16), vk::IndexType::UINT16);
+         assert_eq!(vk_index_type(IndexType::U32), vk::IndexType::UINT32);
+     }
++
++    #[test]
++    fn primitive_restart_is_enabled_on_strip_topologies_only() {
++        assert!(!primitive_restart(PrimitiveTopology::Point));
++        assert!(!primitive_restart(PrimitiveTopology::Line));
++        assert!(primitive_restart(PrimitiveTopology::LineStrip));
++        assert!(!primitive_restart(PrimitiveTopology::Triangle));
++        assert!(primitive_restart(PrimitiveTopology::TriangleStrip));
++    }
+ }
+-- 
+2.43.0
+

@@ -1,0 +1,1403 @@
+From 3b171464161e27db5b999c43e0954248ff11b10b Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Thu, 12 Nov 2026 13:44:22 +0800
+Subject: [PATCH 68/68] vgpu: map XR10 IOSurface FourCCs and render per-plane
+ type-11 views
+
+Map the b3a8, w30r, w40a/w40m, l10r and single-channel IOSurface FourCCs to their Metal formats and keep the two-plane XR10 format latched on the mapping. A type-11 texture created on one plane of a multi-plane surface now renders, stores, seeds and samples through that plane: its declared format and geometry pick the plane window, its resident is keyed on that format, and the Store is copied through the native rail so the other plane is left alone. Whole-surface b3a8 binds read plane 0 colour with plane 1 alpha from guest pages. BGR10_XR residents sample opaque alpha, and XR10 or per-plane attachments never alias guest pages directly.
+---
+ .../src/backend/vulkan/translate/pixel.rs     |  23 +-
+ .../src/contract/iosurface_pages.rs           | 113 +++++-
+ .../src/runtime/draw/render_target.rs         |  49 ++-
+ crates/reims-vgpu/src/runtime/draw/vulkan.rs  | 378 +++++++++++++++---
+ crates/reims-vgpu/src/runtime/exec/mod.rs     |  42 +-
+ crates/reims-vgpu/src/runtime/mapper/mod.rs   |  25 +-
+ .../src/runtime/mapping_write/mod.rs          |  49 ++-
+ crates/reims-vgpu/src/runtime/objects/mod.rs  |  56 ++-
+ .../reims-vgpu/src/runtime/objects/tests.rs   |  51 +++
+ .../src/runtime/present_identity.rs           |  32 +-
+ .../src/runtime/render_writeback.rs           |  71 ++++
+ crates/reims-vgpu/src/runtime/texture.rs      |  13 +
+ 12 files changed, 789 insertions(+), 113 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/backend/vulkan/translate/pixel.rs b/crates/reims-vgpu/src/backend/vulkan/translate/pixel.rs
+index 39f520136..797deb0a7 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/translate/pixel.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/translate/pixel.rs
+@@ -89,6 +89,18 @@ const ALPHA_IN_RED: SwizzlePlan = SwizzlePlan {
+     ],
+ };
+ 
++/// 3-channel `BGR10_XR` / `BGR10_XR_sRGB` carry no alpha bits on the wire and
++/// sample `.a = 1.0` in Metal even when rendered into an `R16G16B16A16_SFLOAT`
++/// attachment whose shader write mask or fragment output left `.a` at `0.0`.
++const OPAQUE_ALPHA: SwizzlePlan = SwizzlePlan {
++    source: [
++        SwizzleSource::R,
++        SwizzleSource::G,
++        SwizzleSource::B,
++        SwizzleSource::One,
++    ],
++};
++
+ fn linear(vk: vk::Format, bytes_per_texel: u32) -> PixelFormat {
+     PixelFormat {
+         vk,
+@@ -164,10 +176,13 @@ pub fn translate(mtl: u16) -> Result<PixelFormat, TranslateReason> {
+         p::MTL_FORMAT_RGBA16_UNORM => linear(vk::Format::R16G16B16A16_UNORM, 8),
+         p::MTL_FORMAT_RGBA16_UINT => linear(vk::Format::R16G16B16A16_UINT, 8),
+         p::MTL_FORMAT_RGBA16_FLOAT => linear(vk::Format::R16G16B16A16_SFLOAT, 8),
+-        p::MTL_FORMAT_RGB10A8_2P_XR10
+-        | p::MTL_FORMAT_RGB10A8_2P_XR10_SRGB
+-        | p::MTL_FORMAT_BGR10_XR
+-        | p::MTL_FORMAT_BGR10_XR_SRGB => linear(vk::Format::R16G16B16A16_SFLOAT, 4),
++        p::MTL_FORMAT_RGB10A8_2P_XR10 | p::MTL_FORMAT_RGB10A8_2P_XR10_SRGB => {
++            linear(vk::Format::R16G16B16A16_SFLOAT, 4)
++        }
++        p::MTL_FORMAT_BGR10_XR | p::MTL_FORMAT_BGR10_XR_SRGB => PixelFormat {
++            components: OPAQUE_ALPHA,
++            ..linear(vk::Format::R16G16B16A16_SFLOAT, 4)
++        },
+         p::MTL_FORMAT_BGRA10_XR | p::MTL_FORMAT_BGRA10_XR_SRGB => {
+             linear(vk::Format::R16G16B16A16_SFLOAT, 8)
+         }
+diff --git a/crates/reims-vgpu/src/contract/iosurface_pages.rs b/crates/reims-vgpu/src/contract/iosurface_pages.rs
+index 571099315..17b9f931b 100644
+--- a/crates/reims-vgpu/src/contract/iosurface_pages.rs
++++ b/crates/reims-vgpu/src/contract/iosurface_pages.rs
+@@ -568,18 +568,89 @@ pub fn sample_window_from_device_desc(
+ /// This is the only place the allocation bound is applied, and it is why nothing
+ /// may reach for [`packed_span_estimate`] directly and then take the span this
+ /// refused.
++/// Find the unique plane index in `desc` whose geometry and element size match
++/// `(width, height, pixel_format)` (falling back to row-byte-equivalent planes
++/// in the same order as [`sample_window_from_device_desc`]).
++pub fn find_plane_index_in_device_desc(
++    desc: &[u8],
++    pixel_format: u16,
++    width: u32,
++    height: u32,
++) -> Option<u32> {
++    if desc.len() < DEVICE_DESC_LEN {
++        return None;
++    }
++    let surf = decode_device_surface(desc)?;
++    if surf.plane_count == 0 {
++        return None;
++    }
++    let bpp = format_bytes_per_pixel(pixel_format)?;
++    let cap = surf
++        .plane_count
++        .min(reims_vgpu_wire::device_desc::TYPE4_PLANE_CAP as u8);
++    let mut found = None;
++    let mut matches = 0u32;
++    for p in 0..cap {
++        if let Some((cand, _)) = device_desc_plane(desc, p as u32) {
++            if cand.width == width
++                && cand.height == height
++                && (cand.bytes_per_element == 0 || cand.bytes_per_element as u32 == bpp)
++                && sample_window_from_device_plane(&cand, pixel_format, width, height).is_some()
++            {
++                matches += 1;
++                found = Some(p as u32);
++            }
++        }
++    }
++    if matches == 0 {
++        for p in 0..cap {
++            if let Some((cand, _)) = device_desc_plane(desc, p as u32) {
++                if cand.height == height
++                    && cand.bytes_per_element != 0
++                    && u64::from(cand.width) * u64::from(cand.bytes_per_element)
++                        == u64::from(width) * u64::from(bpp)
++                    && sample_window_from_device_plane(&cand, pixel_format, width, height)
++                        .is_some()
++                {
++                    matches += 1;
++                    found = Some(p as u32);
++                }
++            }
++        }
++    }
++    (matches == 1).then_some(found).flatten()
++}
++
+ pub fn mapping_span_bound(
+     desc: Option<&[u8]>,
+     pixel_format: u16,
+     width: u32,
+     height: u32,
+ ) -> Option<u64> {
+-    if let Some((_, _, end)) =
++    if let Some((_, _, mut end)) =
+         sample_window_from_device_desc(desc, None, pixel_format, width, height)
+     {
++        if pixel_format::is_two_plane_xr10(pixel_format) {
++            if let Some((_, _, a_end)) = sample_window_from_device_desc(
++                desc,
++                Some(1),
++                pixel_format::MTL_FORMAT_R8_UNORM,
++                width,
++                height,
++            ) {
++                end = end.max(a_end);
++            }
++        }
+         return Some(end);
+     }
+-    let end = packed_span_estimate(pixel_format, width, height)?;
++    let mut end = packed_span_estimate(pixel_format, width, height)?;
++    if pixel_format::is_two_plane_xr10(pixel_format) {
++        if let Some(a_span) =
++            packed_span_estimate(pixel_format::MTL_FORMAT_R8_UNORM, width, height)
++        {
++            end = checked_add_u64(end, a_span)?;
++        }
++    }
+     if let Some(desc) = desc {
+         if desc.len() >= DEVICE_DESC_LEN {
+             if let Some(surf) = decode_device_surface(desc) {
+@@ -1452,4 +1523,42 @@ mod tests {
+         )
+         .is_none());
+     }
++
++    #[test]
++    fn two_plane_xr10_span_bound_and_plane_index_lookup() {
++        use crate::contract::endian::{st16, st32, st64};
++        use crate::contract::pixel_format::{
++            MTL_FORMAT_BGR10_XR, MTL_FORMAT_R8_UNORM, MTL_FORMAT_RGB10A8_2P_XR10,
++        };
++
++        let mut desc = vec![0u8; DEVICE_DESC_LEN];
++        st32(&mut desc[DEVICE_DESC_ALLOC_SIZE..], 0x40000);
++        st32(&mut desc[DEVICE_DESC_PIXEL_FORMAT..], 0x6233_6138); // 'b3a8'
++        desc[DEVICE_DESC_PLANE_COUNT] = 2;
++        // Plane 0: 64x64 BGR10_XR (bpe=4, bpr=256, offset=0, size=16384)
++        let p0 = DEVICE_DESC_PLANES;
++        st32(&mut desc[p0 + DEVICE_PLANE_OFFSET..], 0);
++        st32(&mut desc[p0 + DEVICE_PLANE_SIZE..], 16384);
++        st64(&mut desc[p0 + DEVICE_PLANE_DIMS..], pack_plane_dims(64, 64));
++        st32(&mut desc[p0 + DEVICE_PLANE_BPR..], 256);
++        st16(&mut desc[p0 + DEVICE_PLANE_BPE..], 4);
++        // Plane 1: 64x64 R8_UNORM (bpe=1, bpr=64, offset=16384, size=4096)
++        let p1 = DEVICE_DESC_PLANES + DEVICE_PLANE_DESC_LEN;
++        st32(&mut desc[p1 + DEVICE_PLANE_OFFSET..], 16384);
++        st32(&mut desc[p1 + DEVICE_PLANE_SIZE..], 4096);
++        st64(&mut desc[p1 + DEVICE_PLANE_DIMS..], pack_plane_dims(64, 64));
++        st32(&mut desc[p1 + DEVICE_PLANE_BPR..], 64);
++        st16(&mut desc[p1 + DEVICE_PLANE_BPE..], 1);
++
++        assert_eq!(
++            find_plane_index_in_device_desc(&desc, MTL_FORMAT_BGR10_XR, 64, 64),
++            Some(0)
++        );
++        assert_eq!(
++            find_plane_index_in_device_desc(&desc, MTL_FORMAT_R8_UNORM, 64, 64),
++            Some(1)
++        );
++        let bound = mapping_span_bound(Some(&desc), MTL_FORMAT_RGB10A8_2P_XR10, 64, 64).unwrap();
++        assert_eq!(bound, 16384 + 63 * 64 + 64);
++    }
+ }
+diff --git a/crates/reims-vgpu/src/runtime/draw/render_target.rs b/crates/reims-vgpu/src/runtime/draw/render_target.rs
+index f3cec2021..176e0c3ac 100644
+--- a/crates/reims-vgpu/src/runtime/draw/render_target.rs
++++ b/crates/reims-vgpu/src/runtime/draw/render_target.rs
+@@ -899,6 +899,26 @@ fn resolve_render_target<M: HostMemory + HostOps>(
+         }
+         .ok_or(C::Type11Unresolved.at(resolved_ref))?;
+         let _ = mapper::ensure_resolved_for_scanout(state, host, mapping_id);
++        let (decl_w, decl_h, decl_fmt) = if live_type == Some(OBJECT_TYPE_IOSURFACE) {
++            objects::resolve_resource(state, host, task_id, resolved_ref)
++                .ok()
++                .and_then(|res| match res.decoded().as_ref().ok() {
++                    Some(crate::runtime::decode::resource::Descriptor::IOSurfaceTexture {
++                        width,
++                        height,
++                        pixel_format,
++                        ..
++                    }) => Some((*width, *height, *pixel_format)),
++                    _ => crate::contract::iosurface_pages::decode_texture_descriptor(
++                        &res.descriptor,
++                    )
++                    .ok()
++                    .map(|t| (t.width, t.height, t.pixel_format)),
++                })
++                .unwrap_or((0, 0, 0))
++        } else {
++            (0, 0, 0)
++        };
+         // This rung is terminal either way, and both directions were already
+         // true before it said so. A live type-11 that fails geometry must not
+         // be decoded as type-2/3 — that is the sticky-latch bug above. And in
+@@ -910,20 +930,35 @@ fn resolve_render_target<M: HostMemory + HostOps>(
+             .mappings
+             .get(&mapping_id)
+             .ok_or(C::Type11NoMapping { mapping_id }.at(resolved_ref))?;
+-        if !m.has_geom || m.width == 0 || m.height == 0 {
++        let rt_w = if decl_w != 0 && decl_h != 0 {
++            decl_w
++        } else {
++            m.width
++        };
++        let rt_h = if decl_w != 0 && decl_h != 0 {
++            decl_h
++        } else {
++            m.height
++        };
++        if (!m.has_geom && (rt_w == 0 || rt_h == 0)) || rt_w == 0 || rt_h == 0 {
+             return Err(C::Type11Geometry {
+                 mapping_id,
+                 has_geom: m.has_geom,
+-                width: m.width,
+-                height: m.height,
++                width: rt_w,
++                height: rt_h,
+             }
+             .at(resolved_ref));
+         }
+         // Not `rt_type4_base_format`: a type-11 mapping's format has
+         // writers other than the type-4 decoder, so 0 here can mean "not
+         // latched yet" rather than "refused", and BGRA8 is the display
+-        // contract's default for that case. See that function.
+-        let base_fmt = if m.format != 0 {
++        // contract's default for that case. When the live type-11 texture
++        // descriptor names a per-plane format (e.g. BGR10_XR on plane 0 or
++        // R8Unorm on plane 1 of a 'b3a8' surface), honour its declared format
++        // rather than the whole-surface mapping format.
++        let base_fmt = if decl_fmt != 0 {
++            decl_fmt
++        } else if m.format != 0 {
+             m.format
+         } else {
+             MTL_FORMAT_BGRA8_UNORM
+@@ -935,8 +970,8 @@ fn resolve_render_target<M: HostMemory + HostOps>(
+         return Ok(ResolvedRenderTarget {
+             mapping_id,
+             target_gva: 0,
+-            width: m.width,
+-            height: m.height,
++            width: rt_w,
++            height: rt_h,
+             row_stride: 0,
+             format: fmt,
+             sample_count: 1,
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index 01bb150e0..533fe9700 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -268,8 +268,17 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
+                     .first()
+                     .map(|c0| (c0.mapping_id, c0.width, c0.height, c0.format));
+                 let stored = c0_store
+-                    .map(|(mid, cw, ch, _)| {
+-                        store_surface_resident(state, host, &identity, mid, cw, ch, guest_store)
++                    .map(|(mid, cw, ch, fmt)| {
++                        store_surface_resident_with_format(
++                            state,
++                            host,
++                            &identity,
++                            mid,
++                            cw,
++                            ch,
++                            guest_store,
++                            Some(fmt),
++                        )
+                     })
+                     .unwrap_or(false);
+                 match (stored, c0_store) {
+@@ -301,8 +310,16 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
+                         if let Some(expected_layout) = req
+                             .colors
+                             .first()
+-                            .and_then(|c0| state.mappings.get(&c0.mapping_id))
+-                            .map(mapping_write::mapping_store_format)
++                            .and_then(|c0| {
++                                if c0.format != 0 {
++                                    Some(c0.format)
++                                } else {
++                                    state
++                                        .mappings
++                                        .get(&c0.mapping_id)
++                                        .map(mapping_write::mapping_store_format)
++                                }
++                            })
+                             .and_then(mapping_write::mapping_native_resident_layout)
+                         {
+                             if let Ok(rb) =
+@@ -454,7 +471,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
+                     // resolve rendered into a pooled RGBA target.
+                     let mut bgra = rgba;
+                     let native_ok = draw_native.as_ref().is_some_and(|(native_bytes, layout)| {
+-                        mapping_write::write_native_uncached(
++                        mapping_write::write_native_uncached_format(
+                             state,
+                             host,
+                             c0.mapping_id,
+@@ -462,6 +479,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
+                             c0.width,
+                             c0.height,
+                             *layout,
++                            Some(c0.format),
+                         )
+                     });
+                     let ok = if native_ok {
+@@ -859,26 +877,30 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
+                 let _span = StoreCostSpan::new("clear_seed_t11_us");
+                 crate::runtime::drain::note_store_route("clear_seed_t11");
+                 crate::runtime::drain::note_store_route_n("clear_seed_t11_kb", seed_kb);
+-                let native_ok = state
+-                    .mappings
+-                    .get(&c.mapping_id)
+-                    .map(mapping_write::mapping_store_format)
+-                    .and_then(mapping_write::mapping_native_resident_layout)
+-                    .and_then(|layout| {
+-                        pixel_format::solid_native_texels(c.width, c.height, layout, &c.clear_color)
+-                            .map(|texels| {
+-                                mapping_write::write_native_uncached(
+-                                    state,
+-                                    host,
+-                                    c.mapping_id,
+-                                    &texels,
+-                                    c.width,
+-                                    c.height,
+-                                    layout,
+-                                )
+-                            })
+-                    })
+-                    .unwrap_or(false);
++                let native_ok = (if c.format != 0 {
++                    Some(c.format)
++                } else {
++                    state
++                        .mappings
++                        .get(&c.mapping_id)
++                        .map(mapping_write::mapping_store_format)
++                })
++                .and_then(|fmt| {
++                    let layout = mapping_write::mapping_native_resident_layout(fmt)?;
++                    let texels =
++                        pixel_format::solid_native_texels(c.width, c.height, layout, &c.clear_color)?;
++                    Some(mapping_write::write_native_uncached_format(
++                        state,
++                        host,
++                        c.mapping_id,
++                        &texels,
++                        c.width,
++                        c.height,
++                        layout,
++                        Some(fmt),
++                    ))
++                })
++                .unwrap_or(false);
+                 if native_ok {
+                     true
+                 } else {
+@@ -1567,6 +1589,49 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
+                 objects::resolve_type11_resource(state, task_id, texture_ref, resource)
+             })
+         });
++        // A type-11 texture created on one plane of a multi-plane surface
++        // ('b3a8' plane 0 as BGR10_XR, plane 1 as R8Unorm, or a YCbCr plane)
++        // declares that plane's format and geometry, not the surface's. The
++        // rungs below read the mapping's whole-surface geometry, so hand the
++        // declaration to the serialized-view rail, which places a plane by
++        // index — the same thing a type-5 view of the plane would carry.
++        if let (Some(mid), Some(resource)) = (surface, resolved_resource.as_ref()) {
++            if let Ok(crate::runtime::decode::resource::Descriptor::IOSurfaceTexture {
++                pixel_format: view_fmt,
++                width: view_w,
++                height: view_h,
++                ..
++            }) = resource.decoded()
++            {
++                let (view_fmt, view_w, view_h) = (*view_fmt, *view_w, *view_h);
++                type5_view = state
++                    .mappings
++                    .get(&mid)
++                    .filter(|m| {
++                        view_fmt != 0
++                            && view_w != 0
++                            && view_h != 0
++                            && objects::mapping_is_multiplanar(m)
++                            && !pixel_format::is_two_plane_xr10(view_fmt)
++                            && crate::runtime::ycbcr::Sampling::of(view_fmt).is_none()
++                    })
++                    .and_then(|m| {
++                        crate::contract::iosurface_pages::find_plane_index_in_device_desc(
++                            &m.device_desc,
++                            view_fmt,
++                            view_w,
++                            view_h,
++                        )
++                    })
++                    .map(|plane_index| objects::Type5TextureView {
++                        pixel_format: view_fmt,
++                        width: view_w,
++                        height: view_h,
++                        depth: 1,
++                        plane_index,
++                    });
++            }
++        }
+     }
+ 
+     if let Some(mid) = surface {
+@@ -1639,7 +1704,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
+         }
+         if let Some(m) = state.mappings.get(&mid) {
+             if m.has_geom && m.width > 0 && m.height > 0 {
+-                let (w, h) = (m.width, m.height);
++                let (w, h, base_format) = (m.width, m.height, m.format);
+                 // A biplanar YCbCr surface bound whole samples as one image,
+                 // which none of the rungs below can produce: they serve the
+                 // surface's bytes, and its bytes are two planes.
+@@ -1666,6 +1731,37 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
+                         ));
+                     }
+                 }
++                // A two-plane XR10 surface bound whole is plane 0's colour
++                // under plane 1's alpha. No resident holds that pair — a
++                // render writes one plane or encodes both into pages — so the
++                // pages are the only place the combined texel exists. Every
++                // Store into such a surface is copied now (see
++                // `store_is_plane_override`), so they are current once any
++                // debt is paid.
++                if pixel_format::is_two_plane_xr10(base_format) {
++                    crate::runtime::writeback_debt::pay_for_mapping(state, host, mid);
++                    let memo_source =
++                        crate::runtime::draw::mapping_declared_format(state, mid, None);
++                    if let Some((rgba, identity, layout)) = load_type11_rgba_memoized(
++                        state,
++                        host,
++                        mid,
++                        native_uploads_for(memo_source),
++                    ) {
++                        crate::runtime::drain::note_store_route("t11rung_xr10_2p");
++                        return Some((
++                            w,
++                            h,
++                            mid,
++                            SampledSourceRequest::Bytes(
++                                rgba,
++                                Some(identity),
++                                SampledByteFormat::from_source(layout, memo_source),
++                                crate::backend::vulkan::engine::SampledByteOrigin::SurfaceGuestFallback,
++                            ),
++                        ));
++                    }
++                }
+                 // Compute the resident-surface identity once and reuse it for
+                 // both the readiness check and the direct bind.
+                 let resident_id =
+@@ -1730,7 +1826,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
+                         w,
+                         h,
+                         mid,
+-                        SampledSourceRequest::Target(resident_id, format),
++                        surface_target_source(state, mid, resident_id, format),
+                     ));
+                 }
+ 
+@@ -1805,7 +1901,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
+                             w,
+                             h,
+                             mid,
+-                            SampledSourceRequest::Target(resident_id, format),
++                            surface_target_source(state, mid, resident_id, format),
+                         ));
+                     }
+                     note_type11_sample_rung("t11rung_resident_refused", guest_write);
+@@ -2658,13 +2754,14 @@ fn stage_uses_sampled_band(textures: &[TextureBind], samplers: &[SamplerBind]) -
+     textures.iter().any(|t| t.texture_ref != 0) || samplers.iter().any(|s| s.sampler_ref != 0)
+ }
+ 
+-fn try_type11_target_guest_seed<M: HostMemory + HostOps>(
++fn try_type11_target_guest_seed_for_format<M: HostMemory + HostOps>(
+     state: &mut DeviceState,
+     host: &mut M,
+     mapping_id: u32,
+     w: u32,
+     h: u32,
+     target_format: ash::vk::Format,
++    format_override: Option<u16>,
+ ) -> Option<crate::backend::vulkan::engine::GuestTargetSeed> {
+     use crate::backend::vulkan::engine::{GuestRunSource, GuestTargetSeed};
+     use crate::runtime::mapping_write::type11_sample_window;
+@@ -2674,18 +2771,21 @@ fn try_type11_target_guest_seed<M: HostMemory + HostOps>(
+     }
+     let (base_off, bpr, layout) = {
+         let mapping = state.mappings.get(&mapping_id)?;
+-        if !mapping.mapped
+-            || mapping.page_entries.is_empty()
+-            || !mapping.has_geom
+-            || mapping.width != w
+-            || mapping.height != h
+-        {
++        if !mapping.mapped || mapping.page_entries.is_empty() || !mapping.has_geom {
+             return None;
+         }
+-        let format = if mapping.format == 0 {
+-            pixel_format::MTL_FORMAT_BGRA8_UNORM
+-        } else {
+-            mapping.format
++        let format = match format_override.filter(|&f| f != 0) {
++            Some(fmt) => fmt,
++            None => {
++                if mapping.width != w || mapping.height != h {
++                    return None;
++                }
++                if mapping.format == 0 {
++                    pixel_format::MTL_FORMAT_BGRA8_UNORM
++                } else {
++                    mapping.format
++                }
++            }
+         };
+         let layout = pixel_format::store_texel_order(format)?;
+         let (base_off, bpr, _) = type11_sample_window(mapping, w, h, format)?;
+@@ -2717,6 +2817,7 @@ fn try_type11_target_guest_seed<M: HostMemory + HostOps>(
+     })
+ }
+ 
++#[cfg(test)]
+ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
+     state: &mut DeviceState,
+     host: &mut M,
+@@ -2724,8 +2825,28 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
+     w: u32,
+     h: u32,
+     target_format: ash::vk::Format,
++) -> Option<Type11LoadSeed> {
++    resolve_type11_load_seed_for_format(state, host, mapping_id, w, h, target_format, None)
++}
++
++/// [`resolve_type11_load_seed`] for an attachment whose declared format may
++/// name one plane of a multi-plane surface. A plane seed reads that plane's
++/// window only: the host cache and the RGBA reader both describe the whole
++/// surface, so neither may serve it.
++fn resolve_type11_load_seed_for_format<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    mapping_id: u32,
++    w: u32,
++    h: u32,
++    target_format: ash::vk::Format,
++    declared: Option<u16>,
+ ) -> Option<Type11LoadSeed> {
+     use crate::backend::vulkan::engine::SeedOrder;
++    let format_override = declared.filter(|_| {
++        crate::runtime::render_writeback::store_is_plane_override(state, mapping_id, declared)
++    });
++    let plane = format_override.is_some();
+     // A condemned incarnation is seeded from nothing. Its pages are another
+     // owner's, and the cache is a copy of them; a `LOAD` that could take its
+     // resident took it before coming here.
+@@ -2755,7 +2876,7 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
+     if guest_replaced {
+         crate::runtime::drain::note_store_route("t11seed_cache_refused_guest_wrote");
+     }
+-    let cached = (!guest_replaced)
++    let cached = (!guest_replaced && !plane)
+         .then(|| crate::runtime::surface_cache::get_shared(state, mapping_id, w, h))
+         .flatten();
+     let served = if let Some(bgra) = cached {
+@@ -2764,7 +2885,15 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
+             Type11SeedRung::Cache,
+         ))
+     } else {
+-        try_type11_target_guest_seed(state, host, mapping_id, w, h, target_format)
++        try_type11_target_guest_seed_for_format(
++            state,
++            host,
++            mapping_id,
++            w,
++            h,
++            target_format,
++            format_override,
++        )
+             .map(|seed| (Type11LoadSeed::Guest(seed), Type11SeedRung::GuestPages))
+             .or_else(|| {
+                 let target_layout = translate::pixel::texel_layout_of(target_format)
+@@ -2772,15 +2901,24 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
+                 if !mapper::ensure_resolved_for_scanout(state, host, mapping_id) {
+                     return None;
+                 }
+-                let declared_fmt = state
+-                    .mappings
+-                    .get(&mapping_id)
+-                    .map(mapping_write::mapping_store_format)?;
++                let declared_fmt = match format_override {
++                    Some(fmt) => fmt,
++                    None => state
++                        .mappings
++                        .get(&mapping_id)
++                        .map(mapping_write::mapping_store_format)?,
++                };
+                 if target_layout == TexelLayout::Rgba16Float
+                     && pixel_format::is_xr10(declared_fmt)
+                 {
+-                    let native =
+-                        mapping_write::read_xr10_to_rgba16f(state, host, mapping_id, w, h)?;
++                    let native = mapping_write::read_xr10_to_rgba16f_format(
++                        state,
++                        host,
++                        mapping_id,
++                        w,
++                        h,
++                        format_override,
++                    )?;
+                     return Some((
+                         Type11LoadSeed::Host(
+                             std::sync::Arc::new(native),
+@@ -2791,11 +2929,10 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
+                 }
+                 let (base_off, surface_bpr, span_end) = {
+                     let m = state.mappings.get(&mapping_id)?;
+-                    let fmt = mapping_write::mapping_store_format(m);
+-                    if pixel_format::store_texel_order(fmt) != Some(target_layout) {
++                    if pixel_format::store_texel_order(declared_fmt) != Some(target_layout) {
+                         return None;
+                     }
+-                    mapping_write::type11_sample_window(m, w, h, fmt)?
++                    mapping_write::type11_sample_window(m, w, h, declared_fmt)?
+                 };
+                 let bpp = target_layout.bytes_per_texel();
+                 let tight = w.checked_mul(bpp)?;
+@@ -2828,6 +2965,9 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
+                 ))
+             })
+             .or_else(|| {
++                if plane {
++                    return None;
++                }
+                 load_type11_mapping_rgba(state, host, mapping_id, None)
+                     .map(|(_, _, r)| r)
+                     .filter(|rgba| rgba.len() == (w as usize) * (h as usize) * 4)
+@@ -4772,9 +4912,9 @@ pub(super) fn try_gva_resident_sample<M: HostMemory + HostOps>(
+         }
+     };
+     let declared_format = tex.declared_pixel_format()?;
+-    let format = translate::pixel::translate(declared_format).ok()?.vk;
++    let pf = translate::pixel::translate(declared_format).ok()?;
+     note_store_route("gvarung_resident");
+-    Some((w, h, SampledSourceRequest::Target(identity, format)))
++    Some((w, h, target_source_with_components(identity, pf.vk, pf.components)))
+ }
+ 
+ /// Which repair would let the linear zero-copy rung carry this format, as a
+@@ -6850,11 +6990,12 @@ pub(super) fn secondary_target_identity<M: HostMemory + HostOps>(
+             format,
+         })
+     } else if c.mapping_id != 0 {
+-        Some(crate::runtime::present_identity::surface_identity(
++        Some(type11_target_identity(
+             state,
+             c.mapping_id,
+             c.width,
+             c.height,
++            c.format,
+         ))
+     } else if let Some(&target) = (c.mapping_id == 0 && !c.memoryless)
+         .then(|| state.heap_texture_targets.get(&(task_id, c.texture_ref)))
+@@ -8808,13 +8949,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+                             .as_ref()
+                             .map(|identity| identity.resident_format())
+                             .unwrap_or(translate::pixel::RESIDENT_RGBA_FORMAT);
+-                        match resolve_type11_load_seed(
++                        match resolve_type11_load_seed_for_format(
+                             state,
+                             host,
+                             c0.mapping_id,
+                             w,
+                             h,
+                             target_format,
++                            Some(c0.format),
+                         ) {
+                             Some(Type11LoadSeed::Host(bytes, order)) => {
+                                 target_rgba8 = Some(bytes);
+@@ -10256,16 +10398,43 @@ pub(crate) fn render_chain_identity(
+         return Some(identity);
+     }
+     if c0.mapping_id != 0 {
+-        return Some(crate::runtime::present_identity::surface_identity(
++        return Some(type11_target_identity(
+             state,
+             c0.mapping_id,
+             width,
+             height,
++            c0.format,
+         ));
+     }
+     gva_chain_identity(req)
+ }
+ 
++/// The resident a type-11 attachment renders into. A per-plane view of a
++/// multi-plane surface (or a view whose storage differs from the mapping's)
++/// gets a resident of its own declared format, so plane 1's `R8Unorm` never
++/// shares an image with plane 0's half-float one.
++fn type11_target_identity(
++    state: &DeviceState,
++    mapping_id: u32,
++    width: u32,
++    height: u32,
++    declared: u16,
++) -> crate::backend::vulkan::engine::TargetIdentity {
++    let format_override = crate::runtime::render_writeback::store_is_plane_override(
++        state,
++        mapping_id,
++        Some(declared),
++    )
++    .then_some(declared);
++    crate::runtime::present_identity::surface_identity_for_format(
++        state,
++        mapping_id,
++        width,
++        height,
++        format_override,
++    )
++}
++
+ /// The registry resident a type-11 composite Store renders into, if this record
+ /// is one.
+ ///
+@@ -10360,9 +10529,26 @@ fn type11_guest_target_backing<H: HostMemory + HostOps>(
+     }
+     let c0 = req.colors.first()?;
+     type11_render_identity(state, req)?;
++    // A Vulkan attachment aliased over guest pages must be the guest's texel,
++    // byte for byte. XR10 packs ten-bit channels (and a separate alpha plane)
++    // where the attachment holds binary16, and a per-plane view of a
++    // multi-plane surface names one plane of an allocation whose other planes
++    // the alias would cover. Both take the copying rail instead.
++    if pixel_format::is_xr10(c0.format)
++        || crate::runtime::render_writeback::store_is_plane_override(
++            state,
++            c0.mapping_id,
++            Some(c0.format),
++        )
++    {
++        return None;
++    }
+     let (plane_offset, row_pitch, span_end) = {
+         let mapping = state.mappings.get(&c0.mapping_id)?;
+         let format = crate::runtime::mapping_write::mapping_store_format(mapping);
++        if pixel_format::is_xr10(format) {
++            return None;
++        }
+         crate::runtime::mapping_write::type11_sample_window(mapping, c0.width, c0.height, format)?
+     };
+     let (import, footprint) =
+@@ -10486,6 +10672,42 @@ pub(super) fn type11_guest_wrote_since_store<M: HostOps>(
+     }
+ }
+ 
++/// A resident bind carrying its Metal format's channel plan when that plan is
++/// not the identity. `BGR10_XR` has no alpha bits and samples `.a = 1` in
++/// Metal; the half-float resident it renders into holds whatever the pass left
++/// in `.a`, so the plan is what makes the two agree.
++fn target_source_with_components(
++    identity: crate::backend::vulkan::engine::TargetIdentity,
++    format: ash::vk::Format,
++    components: pixel_format::SwizzlePlan,
++) -> SampledSourceRequest {
++    if components.is_identity() {
++        SampledSourceRequest::Target(identity, format)
++    } else {
++        SampledSourceRequest::TargetWithComponents(identity, format, components)
++    }
++}
++
++/// [`target_source_with_components`] for a type-4/11 surface resident, with
++/// the plan of the mapping's own declared format. Limited to XR10, the only
++/// renderable surface family whose plan is not the identity.
++fn surface_target_source(
++    state: &DeviceState,
++    mid: u32,
++    identity: crate::backend::vulkan::engine::TargetIdentity,
++    format: ash::vk::Format,
++) -> SampledSourceRequest {
++    let components = state
++        .mappings
++        .get(&mid)
++        .map(mapping_write::mapping_store_format)
++        .filter(|&fmt| pixel_format::is_xr10(fmt))
++        .and_then(|fmt| translate::pixel::translate(fmt).ok())
++        .map(|pf| pf.components)
++        .unwrap_or_else(pixel_format::swizzle_identity);
++    target_source_with_components(identity, format, components)
++}
++
+ /// A sampled bind of a surface whose incarnation the wire guard condemned.
+ ///
+ /// From the condemnation on, its pages hold memory the guest gave to someone
+@@ -10526,7 +10748,7 @@ fn condemned_sampled_source(
+             });
+         condemned_sample_takes_resident(backing, may_bind_resident && view_is_base).then(|| {
+             let format = resident_id.resident_format();
+-            (w, h, mid, SampledSourceRequest::Target(resident_id, format))
++            (w, h, mid, surface_target_source(state, mid, resident_id, format))
+         })
+     });
+     match taken {
+@@ -11254,6 +11476,7 @@ fn surface_store_plan(lazy_enabled: bool, guest_backed: bool) -> SurfaceStorePla
+     }
+ }
+ 
++#[cfg(test)]
+ fn store_surface_resident<M: HostMemory + HostOps>(
+     state: &mut DeviceState,
+     host: &mut M,
+@@ -11262,11 +11485,54 @@ fn store_surface_resident<M: HostMemory + HostOps>(
+     width: u32,
+     height: u32,
+     guest_store: GuestStoreStatus,
++) -> bool {
++    store_surface_resident_with_format(
++        state,
++        host,
++        identity,
++        mapping_id,
++        width,
++        height,
++        guest_store,
++        None,
++    )
++}
++
++/// [`store_surface_resident`] for a target whose declared format may name one
++/// plane of a multi-plane surface. Such a Store is copied now through that
++/// plane's native window: neither the lazy debt nor the guest-backed alias
++/// knows about planes, and both would publish the whole mapping.
++#[allow(clippy::too_many_arguments)]
++fn store_surface_resident_with_format<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    identity: &crate::backend::vulkan::engine::TargetIdentity,
++    mapping_id: u32,
++    width: u32,
++    height: u32,
++    guest_store: GuestStoreStatus,
++    format_override: Option<u16>,
+ ) -> bool {
+     // The union belongs to the draws that just ran whether or not the write
+     // below succeeds, and leaving it un-reset on a refused write would fold this
+     // pass into the next Store's reading.
+     note_pass_scissor_union(width, height);
++    if crate::runtime::render_writeback::store_is_plane_override(state, mapping_id, format_override)
++    {
++        if !crate::runtime::render_writeback::store_render_frame_with_format(
++            state,
++            host,
++            mapping_id,
++            identity,
++            width,
++            height,
++            format_override,
++        ) {
++            return false;
++        }
++        crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
++        return true;
++    }
+     // A copied resident may defer the transfer until something reads the
+     // mapping. A guest-backed resident may not: its Store is already the draw
+     // into that allocation, so deferring creates an invented second operation
+diff --git a/crates/reims-vgpu/src/runtime/exec/mod.rs b/crates/reims-vgpu/src/runtime/exec/mod.rs
+index 6cc08749e..d423c0da0 100644
+--- a/crates/reims-vgpu/src/runtime/exec/mod.rs
++++ b/crates/reims-vgpu/src/runtime/exec/mod.rs
+@@ -4513,25 +4513,29 @@ fn apply_clear<M: HostMemory + HostOps>(
+     if c0.mapping_id == 0 {
+         return false;
+     }
+-    let native_ok = state
+-        .mappings
+-        .get(&c0.mapping_id)
+-        .map(mapping_write::mapping_store_format)
+-        .and_then(mapping_write::mapping_native_resident_layout)
+-        .and_then(|layout| {
+-            crate::contract::pixel_format::solid_native_texels(w, h, layout, &att.clear_color).map(
+-                |texels| {
+-                    mapping_write::write_native_uncached(
+-                        state,
+-                        host,
+-                        c0.mapping_id,
+-                        &texels,
+-                        w,
+-                        h,
+-                        layout,
+-                    )
+-                },
+-            )
++    let effective_fmt = if c0.format != 0 {
++        Some(c0.format)
++    } else {
++        state
++            .mappings
++            .get(&c0.mapping_id)
++            .map(mapping_write::mapping_store_format)
++    };
++    let native_ok = effective_fmt
++        .and_then(|fmt| {
++            let layout = mapping_write::mapping_native_resident_layout(fmt)?;
++            let texels =
++                crate::contract::pixel_format::solid_native_texels(w, h, layout, &att.clear_color)?;
++            Some(mapping_write::write_native_uncached_format(
++                state,
++                host,
++                c0.mapping_id,
++                &texels,
++                w,
++                h,
++                layout,
++                Some(fmt),
++            ))
+         })
+         .unwrap_or(false);
+     let ok = if native_ok {
+diff --git a/crates/reims-vgpu/src/runtime/mapper/mod.rs b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+index ff5355954..dce2c17e5 100644
+--- a/crates/reims-vgpu/src/runtime/mapper/mod.rs
++++ b/crates/reims-vgpu/src/runtime/mapper/mod.rs
+@@ -685,10 +685,29 @@ fn resolve_mapping_backing_walked<H: HostMemory + HostOps>(
+     // multi-plane, prefer alloc_size already latched from the device descriptor.
+     if let Some(m) = state.mappings.get(&mapping_id) {
+         if m.has_geom && m.width > 0 && m.height > 0 {
+-            width = m.width;
+-            height = m.height;
+-            format = if m.format != 0 { m.format } else { format };
+             let desc_slice = device_desc.as_deref().or(m.device_desc_complete());
++            let desc_surf = desc_slice.and_then(decode_device_surface);
++            let desc_multiplane = desc_surf.is_some_and(|s| {
++                s.plane_count > 1
++                    || crate::runtime::objects::iosurface_fourcc_is_biplanar(s.pixel_format)
++            });
++            if !desc_multiplane || width == 0 || height == 0 {
++                width = m.width;
++                height = m.height;
++            }
++            format = if desc_multiplane {
++                if crate::contract::pixel_format::is_two_plane_xr10(m.format)
++                    || crate::runtime::ycbcr::Sampling::of(m.format).is_some()
++                {
++                    m.format
++                } else {
++                    format
++                }
++            } else if m.format != 0 {
++                m.format
++            } else {
++                format
++            };
+             if let Some(end) = mapping_span_bound(desc_slice, format, width, height) {
+                 min_size = min_size.max(end).max(guest_page);
+             }
+diff --git a/crates/reims-vgpu/src/runtime/mapping_write/mod.rs b/crates/reims-vgpu/src/runtime/mapping_write/mod.rs
+index e3667f602..7abe99283 100644
+--- a/crates/reims-vgpu/src/runtime/mapping_write/mod.rs
++++ b/crates/reims-vgpu/src/runtime/mapping_write/mod.rs
+@@ -719,6 +719,32 @@ pub fn write_native_uncached<M: HostMemory + HostOps>(
+     width: u32,
+     height: u32,
+     resident_layout: pixel_format::TexelLayout,
++) -> bool {
++    write_native_uncached_format(
++        state,
++        host,
++        mapping_id,
++        src,
++        width,
++        height,
++        resident_layout,
++        None,
++    )
++}
++
++/// [`write_native_uncached`] for a per-plane type-11 view of a multi-plane
++/// surface: `format_override` names the view's own format and geometry, so the
++/// write lands in that plane's window and leaves the others untouched.
++#[allow(clippy::too_many_arguments)]
++pub fn write_native_uncached_format<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    mapping_id: u32,
++    src: &[u8],
++    width: u32,
++    height: u32,
++    resident_layout: pixel_format::TexelLayout,
++    format_override: Option<u16>,
+ ) -> bool {
+     if !scanout_extent_ok(width, height) {
+         return false;
+@@ -730,7 +756,10 @@ pub fn write_native_uncached<M: HostMemory + HostOps>(
+         if !m.mapped || m.page_entries.is_empty() {
+             return false;
+         }
+-        let (mw, mh, format) = mapping_write_geometry(m, width, height);
++        let (mw, mh, format) = match format_override.filter(|&f| f != 0) {
++            Some(fmt) => (width, height, fmt),
++            None => mapping_write_geometry(m, width, height),
++        };
+         if mw != width || mh != height {
+             return false;
+         }
+@@ -2707,6 +2736,19 @@ pub fn read_xr10_to_rgba16f<M: HostMemory + HostOps>(
+     mapping_id: u32,
+     width: u32,
+     height: u32,
++) -> Option<Vec<u8>> {
++    read_xr10_to_rgba16f_format(state, host, mapping_id, width, height, None)
++}
++
++/// [`read_xr10_to_rgba16f`] for a per-plane view whose declared format and
++/// geometry differ from the whole-surface mapping.
++pub fn read_xr10_to_rgba16f_format<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    mapping_id: u32,
++    width: u32,
++    height: u32,
++    format_override: Option<u16>,
+ ) -> Option<Vec<u8>> {
+     if !scanout_extent_ok(width, height) {
+         return None;
+@@ -2717,7 +2759,10 @@ pub fn read_xr10_to_rgba16f<M: HostMemory + HostOps>(
+         if !m.mapped || m.page_entries.is_empty() {
+             return None;
+         }
+-        let (mw, mh, format) = mapping_write_geometry(m, width, height);
++        let (mw, mh, format) = match format_override.filter(|&f| f != 0) {
++            Some(fmt) => (width, height, fmt),
++            None => mapping_write_geometry(m, width, height),
++        };
+         if mw != width || mh != height || !pixel_format::is_xr10(format) {
+             return None;
+         }
+diff --git a/crates/reims-vgpu/src/runtime/objects/mod.rs b/crates/reims-vgpu/src/runtime/objects/mod.rs
+index 8c3eb2b98..f339d07e8 100644
+--- a/crates/reims-vgpu/src/runtime/objects/mod.rs
++++ b/crates/reims-vgpu/src/runtime/objects/mod.rs
+@@ -657,8 +657,11 @@ pub fn device_desc_format_to_mtl(raw: u32) -> u16 {
+ /// Unknown formats fail closed.
+ pub fn iosurface_pixel_format_to_mtl(pixel_format: u32) -> u16 {
+     use crate::contract::pixel_format::{
+-        MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM, MTL_FORMAT_RGBA16_FLOAT,
+-        MTL_FORMAT_RGBA8_UNORM,
++        MTL_FORMAT_BGR10A2_UNORM, MTL_FORMAT_BGR10_XR, MTL_FORMAT_BGRA10_XR,
++        MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R16_FLOAT, MTL_FORMAT_R16_UNORM, MTL_FORMAT_R32_FLOAT,
++        MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG16_FLOAT, MTL_FORMAT_RG16_UNORM, MTL_FORMAT_RG32_FLOAT,
++        MTL_FORMAT_RG8_UNORM, MTL_FORMAT_RGB10A8_2P_XR10, MTL_FORMAT_RGBA16_FLOAT,
++        MTL_FORMAT_RGBA16_UNORM, MTL_FORMAT_RGBA32_FLOAT, MTL_FORMAT_RGBA8_UNORM,
+     };
+     if pixel_format == 0 {
+         return 0;
+@@ -680,17 +683,38 @@ pub fn iosurface_pixel_format_to_mtl(pixel_format: u32) -> u16 {
+     // BGRA10_XR is 552 (0x228) and its three siblings are 553-555, so a 10-bit
+     // XR surface passed 0x200 and fell into the FourCC match below regardless.
+     match pixel_format {
+-        // 'BGRA' / 'ARGB' (kb: ARGB fourcc → BGRA8Unorm 0x50 for render targets)
+-        0x4247_5241 | 0x4152_4742 => MTL_FORMAT_BGRA8_UNORM,
++        // 'BGRA' / 'ARGB' / '&BGA' (compressed/lossless BGRA8 IOSurface)
++        0x4247_5241 | 0x4152_4742 | 0x2642_4741 => MTL_FORMAT_BGRA8_UNORM,
+         // 'RGBA'
+         0x5247_4241 => MTL_FORMAT_RGBA8_UNORM,
+-        // 'RGhA' / half-float variants seen as AhGR in notes
+-        0x5247_6841 | 0x4168_4752 => MTL_FORMAT_RGBA16_FLOAT,
+-        // Single-plane R8 / RG8 OSTypes used as plane textures (not biplanar media fourcc).
+-        // 'L008' / common R8 fourccs are rare on type-4; MTL ordinals already handled above.
+-        // 'R8  ' / 'RG08' if ever seen as OSType:
+-        0x5238_2020 => MTL_FORMAT_R8_UNORM,
+-        0x5247_3038 => MTL_FORMAT_RG8_UNORM,
++        // 'RGhA' / 'AhGR' / '&RhA'
++        0x5247_6841 | 0x4168_4752 | 0x2652_6841 => MTL_FORMAT_RGBA16_FLOAT,
++        // 'RGfA'
++        0x5247_6641 => MTL_FORMAT_RGBA32_FLOAT,
++        // 'l64r'
++        0x6c36_3472 => MTL_FORMAT_RGBA16_UNORM,
++        // 'l10r' (10-bit packed RGB10A2 LE → BGR10A2Unorm)
++        0x6c31_3072 => MTL_FORMAT_BGR10A2_UNORM,
++        // 'b3a8' / '&b38' (2-plane 30-bit XR10 RGB + 8-bit alpha, Liquid Glass UI/icons)
++        0x6233_6138 | 0x2662_3338 => MTL_FORMAT_RGB10A8_2P_XR10,
++        // 'w30r' / '&w3r' (single-plane 30-bit XR10 RGB → BGR10_XR)
++        0x7733_3072 | 0x2677_3372 => MTL_FORMAT_BGR10_XR,
++        // 'w40a' / 'w40m' (64-bit XR10 RGBA → BGRA10_XR)
++        0x7734_3061 | 0x7734_306d => MTL_FORMAT_BGRA10_XR,
++        // Single-plane R / RG OSTypes used on IOSurfaces:
++        // 'R8  ' / 'L008'
++        0x5238_2020 | 0x4c30_3038 => MTL_FORMAT_R8_UNORM,
++        // 'RG08' / '2C08'
++        0x5247_3038 | 0x3243_3038 => MTL_FORMAT_RG8_UNORM,
++        // 'L016' / '2C16'
++        0x4c30_3136 => MTL_FORMAT_R16_UNORM,
++        0x3243_3136 => MTL_FORMAT_RG16_UNORM,
++        // 'L00h' / '2C0h'
++        0x4c30_3068 => MTL_FORMAT_R16_FLOAT,
++        0x3243_3068 => MTL_FORMAT_RG16_FLOAT,
++        // 'L00f' / '2C0f'
++        0x4c30_3066 => MTL_FORMAT_R32_FLOAT,
++        0x3243_3066 => MTL_FORMAT_RG32_FLOAT,
+         // Unknown FourCC: 0 — callers fail closed (no BGRA invent).
+         _ => 0,
+     }
+@@ -1032,6 +1056,10 @@ fn synthesize_device_desc_from_type4(surf: &Type4Surface) -> Vec<u8> {
+                 // arbitrary multi-plane. Matches Metal R8/RG8 plane bind bpp.
+                 let bpe = if i == 0 { 1u16 } else { 2u16 };
+                 st16(&mut device_desc[base + DEVICE_PLANE_BPE..], bpe);
++            } else if crate::contract::pixel_format::is_two_plane_xr10(mtl) {
++                // 'b3a8' / '&b38': plane 0 is 30-bit XR10 RGB (4 B/px), plane 1 is R8 alpha (1 B/px).
++                let bpe = if i == 0 { 4u16 } else { 1u16 };
++                st16(&mut device_desc[base + DEVICE_PLANE_BPE..], bpe);
+             }
+         }
+     } else {
+@@ -2660,10 +2688,14 @@ fn note_type4_claimants<M: HostMemory>(
+ /// a freshly-read descriptor against `m.format`, which is whatever this returned
+ /// last time.
+ fn latched_mapping_format(surf: &Type4Surface) -> u16 {
++    let mtl = iosurface_pixel_format_to_mtl(surf.pixel_format);
++    if crate::contract::pixel_format::is_two_plane_xr10(mtl) {
++        return mtl;
++    }
+     if type4_is_multiplanar(surf) {
+         return 0;
+     }
+-    iosurface_pixel_format_to_mtl(surf.pixel_format)
++    mtl
+ }
+ 
+ /// Whether the geometry already latched on this mapping is still the geometry
+diff --git a/crates/reims-vgpu/src/runtime/objects/tests.rs b/crates/reims-vgpu/src/runtime/objects/tests.rs
+index 39f42d32c..083b926d7 100644
+--- a/crates/reims-vgpu/src/runtime/objects/tests.rs
++++ b/crates/reims-vgpu/src/runtime/objects/tests.rs
+@@ -2331,3 +2331,54 @@ fn a_claimant_count_is_banded_against_the_tasks_that_could_have_claimed() {
+     assert_eq!(band(0, 1), "list_miss_slot_empty_claimed_nowhere");
+     assert_eq!(band(0, 0), "list_miss_slot_empty_claimed_nowhere");
+ }
++
++#[test]
++fn iosurface_xr10_and_extended_fourccs_map_to_metal_formats() {
++    use crate::contract::pixel_format::{
++        MTL_FORMAT_BGR10A2_UNORM, MTL_FORMAT_BGR10_XR, MTL_FORMAT_BGRA10_XR,
++        MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R16_FLOAT, MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM,
++        MTL_FORMAT_RGB10A8_2P_XR10, MTL_FORMAT_RGBA16_FLOAT,
++    };
++
++    assert_eq!(
++        device_desc_format_to_mtl(u32::from_be_bytes(*b"b3a8")),
++        MTL_FORMAT_RGB10A8_2P_XR10
++    );
++    assert_eq!(
++        device_desc_format_to_mtl(u32::from_be_bytes(*b"&b38")),
++        MTL_FORMAT_RGB10A8_2P_XR10
++    );
++    assert_eq!(
++        device_desc_format_to_mtl(u32::from_be_bytes(*b"w30r")),
++        MTL_FORMAT_BGR10_XR
++    );
++    assert_eq!(
++        device_desc_format_to_mtl(u32::from_be_bytes(*b"w40a")),
++        MTL_FORMAT_BGRA10_XR
++    );
++    assert_eq!(
++        device_desc_format_to_mtl(u32::from_be_bytes(*b"l10r")),
++        MTL_FORMAT_BGR10A2_UNORM
++    );
++    assert_eq!(
++        device_desc_format_to_mtl(u32::from_be_bytes(*b"&BGA")),
++        MTL_FORMAT_BGRA8_UNORM
++    );
++    assert_eq!(
++        device_desc_format_to_mtl(u32::from_be_bytes(*b"&RhA")),
++        MTL_FORMAT_RGBA16_FLOAT
++    );
++    assert_eq!(
++        device_desc_format_to_mtl(u32::from_be_bytes(*b"L008")),
++        MTL_FORMAT_R8_UNORM
++    );
++    assert_eq!(
++        device_desc_format_to_mtl(u32::from_be_bytes(*b"2C08")),
++        MTL_FORMAT_RG8_UNORM
++    );
++    assert_eq!(
++        device_desc_format_to_mtl(u32::from_be_bytes(*b"L00h")),
++        MTL_FORMAT_R16_FLOAT
++    );
++    assert_eq!(device_desc_format_to_mtl(IOSURFACE_FOURCC_420F), 0);
++}
+diff --git a/crates/reims-vgpu/src/runtime/present_identity.rs b/crates/reims-vgpu/src/runtime/present_identity.rs
+index 28d86dd33..a65699be0 100644
+--- a/crates/reims-vgpu/src/runtime/present_identity.rs
++++ b/crates/reims-vgpu/src/runtime/present_identity.rs
+@@ -45,22 +45,29 @@ use ash::vk;
+ /// refuses that pair by name and the copying rail converts, exactly as it did.
+ /// No capability is asked here: a host that cannot render the format refuses
+ /// the pass before any image is created (`host_color_attachment`).
+-fn surface_format(state: &DeviceState, mapping_id: u32) -> vk::Format {
++fn surface_format_with_override(
++    state: &DeviceState,
++    mapping_id: u32,
++    format_override: Option<u16>,
++) -> vk::Format {
+     use crate::backend::vulkan::translate::pixel;
+-    state
+-        .mappings
+-        .get(&mapping_id)
+-        .map(crate::runtime::mapping_write::mapping_store_format)
+-        .and_then(|format| pixel::color_attachment(format).ok())
++    let mtl = format_override.filter(|&f| f != 0).or_else(|| {
++        state
++            .mappings
++            .get(&mapping_id)
++            .map(crate::runtime::mapping_write::mapping_store_format)
++    });
++    mtl.and_then(|format| pixel::color_attachment(format).ok())
+         .map(|(attachment, _)| pixel::ResidentFormat::of(attachment).allocation())
+         .unwrap_or(pixel::SCANOUT_FORMAT)
+ }
+ 
+-pub fn surface_identity(
++pub fn surface_identity_for_format(
+     state: &DeviceState,
+     mapping_id: u32,
+     width: u32,
+     height: u32,
++    format_override: Option<u16>,
+ ) -> TargetIdentity {
+     let gen = state
+         .mappings
+@@ -72,10 +79,19 @@ pub fn surface_identity(
+         width,
+         height,
+         generation: gen,
+-        format: surface_format(state, mapping_id),
++        format: surface_format_with_override(state, mapping_id, format_override),
+     }
+ }
+ 
++pub fn surface_identity(
++    state: &DeviceState,
++    mapping_id: u32,
++    width: u32,
++    height: u32,
++) -> TargetIdentity {
++    surface_identity_for_format(state, mapping_id, width, height, None)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/crates/reims-vgpu/src/runtime/render_writeback.rs b/crates/reims-vgpu/src/runtime/render_writeback.rs
+index 7ae277429..e2fc4036a 100644
+--- a/crates/reims-vgpu/src/runtime/render_writeback.rs
++++ b/crates/reims-vgpu/src/runtime/render_writeback.rs
+@@ -844,9 +844,80 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
+     identity: &crate::backend::vulkan::engine::TargetIdentity,
+     width: u32,
+     height: u32,
++) -> bool {
++    store_render_frame_with_format(state, host, mapping_id, identity, width, height, None)
++}
++
++/// Whether a Store into `mapping_id` under `format_override` names one plane
++/// of a multi-plane surface (or a view whose format is not the mapping's own),
++/// so it must land through that plane's native window and nothing else.
++#[cfg(feature = "backend-vulkan")]
++pub fn store_is_plane_override(state: &DeviceState, mapping_id: u32, format_override: Option<u16>) -> bool {
++    let Some(m) = state.mappings.get(&mapping_id) else {
++        return false;
++    };
++    let multiplane = crate::runtime::objects::mapping_is_multiplanar(m)
++        || crate::contract::pixel_format::is_two_plane_xr10(m.format);
++    let Some(fmt) = format_override.filter(|&f| f != 0) else {
++        return false;
++    };
++    let own = crate::runtime::mapping_write::mapping_store_format(m);
++    multiplane
++        || crate::contract::pixel_format::bytes_per_pixel(fmt)
++            != crate::contract::pixel_format::bytes_per_pixel(own)
++        || crate::contract::pixel_format::is_xr10(fmt) != crate::contract::pixel_format::is_xr10(own)
++}
++
++/// [`store_render_frame`] for a target whose declared format may differ from
++/// the mapping's: a per-plane type-11 view of a multi-plane surface writes only
++/// its own plane, through the native rail.
++#[cfg(feature = "backend-vulkan")]
++pub fn store_render_frame_with_format<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    mapping_id: u32,
++    identity: &crate::backend::vulkan::engine::TargetIdentity,
++    width: u32,
++    height: u32,
++    format_override: Option<u16>,
+ ) -> bool {
+     let started = std::time::Instant::now();
+     crate::runtime::drain::note_store_route("surface_flush");
++    if store_is_plane_override(state, mapping_id, format_override) {
++        let fmt = format_override.unwrap_or(0);
++        let expected = if crate::contract::pixel_format::is_xr10(fmt) {
++            Some(crate::contract::pixel_format::TexelLayout::Rgba16Float)
++        } else {
++            crate::contract::pixel_format::store_texel_order(fmt)
++        };
++        let read = crate::backend::vulkan::engine::read_target_native(identity);
++        let ok = match (&read, expected) {
++            (Ok(rb), Some(layout)) if rb.layout == layout => {
++                crate::runtime::mapping_write::write_native_uncached_format(
++                    state,
++                    host,
++                    mapping_id,
++                    &rb.pixels,
++                    width,
++                    height,
++                    rb.layout,
++                    Some(fmt),
++                )
++            }
++            _ => false,
++        };
++        if !ok {
++            crate::observe::fail(format!(
++                "render_store_lost mapping={mapping_id} {width}x{height} fmt={fmt:#x} reason=plane_write_refused layout={:?}",
++                read.as_ref().ok().map(|rb| rb.layout)
++            ));
++            return false;
++        }
++        crate::runtime::drain::note_store_route("render_flush_plane_native");
++        let len = read.map(|rb| rb.pixels.len()).unwrap_or(0);
++        finish(state, mapping_id, identity, len, started, false);
++        return true;
++    }
+     // The GPU writes the guest's pages directly. Tried first because when it
+     // works there is nothing left to do: no staging buffer is mapped and no
+     // host pass over the frame happens at all.
+diff --git a/crates/reims-vgpu/src/runtime/texture.rs b/crates/reims-vgpu/src/runtime/texture.rs
+index f969e6937..b4dda4dc4 100644
+--- a/crates/reims-vgpu/src/runtime/texture.rs
++++ b/crates/reims-vgpu/src/runtime/texture.rs
+@@ -23,6 +23,19 @@ pub fn register_type11_geom(
+         if m.has_geom && m.width == width && m.height == height && m.format == format {
+             return true;
+         }
++        // A multi-plane IOSurface ('b3a8' two-plane XR10 or biplanar YCbCr)
++        // creates per-plane single-format type-11 views (e.g. BGR10_XR on plane 0
++        // and R8Unorm on plane 1) alongside the whole-surface view. Keep the
++        // whole-surface geometry/format on the mapping entry so per-plane views
++        // do not clobber each other or hide Plane 1 from whole-surface readers.
++        let mapping_multiplane = crate::runtime::objects::mapping_is_multiplanar(m)
++            || crate::contract::pixel_format::is_two_plane_xr10(m.format)
++            || crate::runtime::ycbcr::Sampling::of(m.format).is_some();
++        let view_multiplane = crate::contract::pixel_format::is_two_plane_xr10(format)
++            || crate::runtime::ycbcr::Sampling::of(format).is_some();
++        if m.has_geom && mapping_multiplane && !view_multiplane {
++            return true;
++        }
+     }
+     state.set_mapping_geom(mapping_id, width, height, format)
+ }
+-- 
+2.43.0
+

@@ -1,0 +1,893 @@
+From 123dbdd025dc149e528fb7b17f5cfd800496458c Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Thu, 12 Nov 2026 00:46:54 +0800
+Subject: [PATCH 62/68] vgpu: clear GPU-resident GVA targets natively and avoid
+ pre-draw DontCare seed wipes
+
+Clear-only render passes (apply_clear) targeting GVA-backed attachments previously wrote 8-bit UNORM texels directly to guest memory without clearing or superseding the Vulkan GPU resident. Subsequent LOAD passes whose seed was elided (gva_resident_authoritative) composited onto stale GPU pixels instead of the cleared surface, and RGBA16Float clear values were quantized to 8-bit UNORM.
+
+Route Vulkan GVA clear-only passes through clear_resident_target + writeback_debt::arm_gva when defer-eligible, and drop any unpaid GVA debt while encoding native-precision float/10-bit/16-bit texels on the synchronous fallback and type-11 mapping clear paths. Also release gpu_only_content when superseding a mapping debt, and run encode_draw_vulkan's CPU clear_seed fallback only when no engine draw returned so real draws never pre-wipe MTLLoadActionDontCare guest pages.
+---
+ .../reims-vgpu/src/contract/pixel_format.rs   | 246 ++++++++++++++
+ crates/reims-vgpu/src/runtime/draw/mod.rs     |  84 ++++-
+ crates/reims-vgpu/src/runtime/draw/vulkan.rs  | 309 ++++++++++++------
+ crates/reims-vgpu/src/runtime/exec/mod.rs     |  88 +++--
+ .../reims-vgpu/src/runtime/writeback_debt.rs  |  34 +-
+ 5 files changed, 619 insertions(+), 142 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/contract/pixel_format.rs b/crates/reims-vgpu/src/contract/pixel_format.rs
+index 355d646cb..82258b599 100644
+--- a/crates/reims-vgpu/src/contract/pixel_format.rs
++++ b/crates/reims-vgpu/src/contract/pixel_format.rs
+@@ -1524,6 +1524,226 @@ pub fn solid_bgra8(w: u32, h: u32, clear: &[f64; 4]) -> Vec<u8> {
+     solid_image8(w, h, [b, g, r, a])
+ }
+ 
++/// IEEE-754 binary32 to binary16 conversion with round-to-nearest-even,
++/// preserving signed zeros, negative channels, extended-range (> 1.0) HDR
++/// values, infinities, and quiet NaNs.
++pub fn f32_to_f16(value: f32) -> u16 {
++    let x = value.to_bits();
++    let sign = ((x >> F16_F32_SIGN_SHIFT) as u16) & F16_SIGN_MASK;
++    let raw_exp = (x >> F32_EXP_SHIFT) & F32_EXP_MASK;
++    let mut m = x & F32_MANT_MASK;
++
++    if raw_exp == F32_EXP_MASK {
++        return if m != 0 {
++            sign | F16_INF_BITS | 0x0200
++        } else {
++            sign | F16_INF_BITS
++        };
++    }
++    if raw_exp == 0 {
++        return sign;
++    }
++
++    let e = raw_exp as i32 - F32_EXP_BIAS + F16_EXP_BIAS;
++    if e >= F16_EXP_INF_NAN as i32 {
++        return sign | F16_INF_BITS;
++    }
++    if e <= 0 {
++        if e < F16_SUBNORMAL_EXP_MIN {
++            return sign;
++        }
++        m |= F32_HIDDEN_BIT;
++        let shift = (F16_SUBNORMAL_SHIFT_BASE - e) as u32;
++        let half = 1u32 << (shift - 1);
++        let rem = m & ((1u32 << shift) - 1);
++        let mut hm = m >> shift;
++        if rem > half || (rem == half && (hm & 1) != 0) {
++            hm += 1;
++        }
++        return sign | (hm as u16);
++    }
++
++    let mut h = sign | (((e as u32) << F16_EXP_SHIFT) as u16) | ((m >> F16_F32_MANT_SHIFT) as u16);
++    let rem = m & ((1u32 << F16_F32_MANT_SHIFT) - 1);
++    if rem > F32_TO_F16_ROUND_BIT || (rem == F32_TO_F16_ROUND_BIT && (h & 1) != 0) {
++        h = h.wrapping_add(1);
++    }
++    h
++}
++
++fn f64_to_unorm16(v: f64) -> u16 {
++    if !v.is_finite() || v <= 0.0 {
++        0
++    } else if v >= 1.0 {
++        u16::MAX
++    } else {
++        (v * f64::from(u16::MAX) + 0.5) as u16
++    }
++}
++
++fn f64_to_unorm10(v: f64) -> u32 {
++    if !v.is_finite() || v <= 0.0 {
++        0
++    } else if v >= 1.0 {
++        1023
++    } else {
++        (v * 1023.0 + 0.5) as u32
++    }
++}
++
++fn f64_to_unorm2(v: f64) -> u32 {
++    if !v.is_finite() || v <= 0.0 {
++        0
++    } else if v >= 1.0 {
++        3
++    } else {
++        (v * 3.0 + 0.5) as u32
++    }
++}
++
++fn f64_to_u16_clamped(v: f64) -> u16 {
++    if !v.is_finite() || v <= 0.0 {
++        0
++    } else if v >= f64::from(u16::MAX) {
++        u16::MAX
++    } else {
++        v as u16
++    }
++}
++
++/// Build `w * h` tightly packed native texels for `layout` directly from the
++/// 64-bit clear channels without quantizing float/10-bit/16-bit formats through
++/// 8-bit UNORM.
++pub fn solid_native_texels(
++    w: u32,
++    h: u32,
++    layout: TexelLayout,
++    clear: &[f64; 4],
++) -> Option<Vec<u8>> {
++    let mut texel = [0u8; 8];
++    let bpp: usize = match layout {
++        TexelLayout::Rgba8 => {
++            texel[..4].copy_from_slice(&unorm8_rgba(clear));
++            4
++        }
++        TexelLayout::Bgra8 => {
++            let [r, g, b, a] = unorm8_rgba(clear);
++            texel[..4].copy_from_slice(&[b, g, r, a]);
++            4
++        }
++        TexelLayout::R8 => {
++            texel[0] = f64_to_unorm8(clear[COMPONENT_R]);
++            1
++        }
++        TexelLayout::Rg8 => {
++            texel[0] = f64_to_unorm8(clear[COMPONENT_R]);
++            texel[1] = f64_to_unorm8(clear[COMPONENT_G]);
++            2
++        }
++        TexelLayout::R16Float => {
++            st16(&mut texel[0..2], f32_to_f16(clear[COMPONENT_R] as f32));
++            2
++        }
++        TexelLayout::Rg16Float => {
++            st16(&mut texel[0..2], f32_to_f16(clear[COMPONENT_R] as f32));
++            st16(&mut texel[2..4], f32_to_f16(clear[COMPONENT_G] as f32));
++            4
++        }
++        TexelLayout::Rgba16Float => {
++            st16(&mut texel[0..2], f32_to_f16(clear[COMPONENT_R] as f32));
++            st16(&mut texel[2..4], f32_to_f16(clear[COMPONENT_G] as f32));
++            st16(&mut texel[4..6], f32_to_f16(clear[COMPONENT_B] as f32));
++            st16(&mut texel[6..8], f32_to_f16(clear[COMPONENT_A] as f32));
++            8
++        }
++        TexelLayout::R32Float => {
++            texel[0..4].copy_from_slice(&(clear[COMPONENT_R] as f32).to_le_bytes());
++            4
++        }
++        TexelLayout::Rg32Float => {
++            texel[0..4].copy_from_slice(&(clear[COMPONENT_R] as f32).to_le_bytes());
++            texel[4..8].copy_from_slice(&(clear[COMPONENT_G] as f32).to_le_bytes());
++            8
++        }
++        TexelLayout::R16Unorm => {
++            st16(&mut texel[0..2], f64_to_unorm16(clear[COMPONENT_R]));
++            2
++        }
++        TexelLayout::Rg16Unorm => {
++            st16(&mut texel[0..2], f64_to_unorm16(clear[COMPONENT_R]));
++            st16(&mut texel[2..4], f64_to_unorm16(clear[COMPONENT_G]));
++            4
++        }
++        TexelLayout::Rgba16Unorm => {
++            st16(&mut texel[0..2], f64_to_unorm16(clear[COMPONENT_R]));
++            st16(&mut texel[2..4], f64_to_unorm16(clear[COMPONENT_G]));
++            st16(&mut texel[4..6], f64_to_unorm16(clear[COMPONENT_B]));
++            st16(&mut texel[6..8], f64_to_unorm16(clear[COMPONENT_A]));
++            8
++        }
++        TexelLayout::Rg16Uint => {
++            st16(&mut texel[0..2], f64_to_u16_clamped(clear[COMPONENT_R]));
++            st16(&mut texel[2..4], f64_to_u16_clamped(clear[COMPONENT_G]));
++            4
++        }
++        TexelLayout::Rgb10a2Unorm => {
++            let word = f64_to_unorm10(clear[COMPONENT_R])
++                | (f64_to_unorm10(clear[COMPONENT_G]) << 10)
++                | (f64_to_unorm10(clear[COMPONENT_B]) << 20)
++                | (f64_to_unorm2(clear[COMPONENT_A]) << 30);
++            texel[0..4].copy_from_slice(&word.to_le_bytes());
++            4
++        }
++        TexelLayout::Bgr10a2Unorm => {
++            let word = f64_to_unorm10(clear[COMPONENT_B])
++                | (f64_to_unorm10(clear[COMPONENT_G]) << 10)
++                | (f64_to_unorm10(clear[COMPONENT_R]) << 20)
++                | (f64_to_unorm2(clear[COMPONENT_A]) << 30);
++            texel[0..4].copy_from_slice(&word.to_le_bytes());
++            4
++        }
++        TexelLayout::Rg11b10Float => return None,
++    };
++    let count = (w as usize).checked_mul(h as usize)?;
++    let total = count.checked_mul(bpp)?;
++    let mut out = Vec::with_capacity(total);
++    if total == 0 {
++        return Some(out);
++    }
++    let pat = &texel[..bpp];
++    out.extend_from_slice(pat);
++    while out.len() < total {
++        let take = out.len().min(total - out.len());
++        out.extend_from_within(..take);
++    }
++    Some(out)
++}
++
++/// Fill one row (`pixels` texels) of `format` directly from `clear`, preserving
++/// float and wide-channel precision when `store_texel_order(format)` names a
++/// native layout and falling back to RGBA8 row conversion otherwise.
++pub fn encode_solid_native_row(
++    format: u16,
++    pixels: u32,
++    clear: &[f64; 4],
++    dst: &mut [u8],
++) -> bool {
++    if pixels == 0 {
++        return true;
++    }
++    if let Some(layout) = store_texel_order(format) {
++        if let Some(bytes) = solid_native_texels(pixels, 1, layout, clear) {
++            if dst.len() < bytes.len() {
++                return false;
++            }
++            dst[..bytes.len()].copy_from_slice(&bytes);
++            return true;
++        }
++    }
++    let rgba = solid_rgba8(pixels, 1, clear);
++    convert_rgba8_to_row(format, &rgba, pixels, dst)
++}
++
+ /// The clear colour as one unorm8 RGBA texel.
+ fn unorm8_rgba(clear: &[f64; 4]) -> [u8; 4] {
+     [
+@@ -2418,6 +2638,32 @@ mod tests {
+     /// window away when there is a CPU path to turn it away *to*, so a `true`
+     /// here that the loader does not honour is a black sample rather than a
+     /// slow one.
++    #[test]
++    fn solid_native_texels_preserves_signed_and_hdr_float16_channels() {
++        let clear = [-1.5, 0.0, 2.25, 0.5];
++        let bytes = solid_native_texels(2, 1, TexelLayout::Rgba16Float, &clear)
++            .expect("Rgba16Float native clear encodes");
++        assert_eq!(bytes.len(), 16);
++        let c0 = u16::from_le_bytes([bytes[0], bytes[1]]);
++        let c1 = u16::from_le_bytes([bytes[2], bytes[3]]);
++        let c2 = u16::from_le_bytes([bytes[4], bytes[5]]);
++        let c3 = u16::from_le_bytes([bytes[6], bytes[7]]);
++        assert_eq!(c0, 0xbe00); // -1.5 in IEEE binary16
++        assert_eq!(c1, 0x0000); // +0.0
++        assert_eq!(c2, 0x4080); // +2.25
++        assert_eq!(c3, 0x3800); // +0.5
++        assert_eq!(&bytes[0..8], &bytes[8..16]);
++
++        let mut row = [0u8; 16];
++        assert!(encode_solid_native_row(
++            MTL_FORMAT_RGBA16_FLOAT,
++            2,
++            &clear,
++            &mut row
++        ));
++        assert_eq!(row, bytes.as_slice());
++    }
++
+     #[test]
+     fn the_cpu_loader_arm_predicate_agrees_with_the_loader() {
+         // One representative Metal format per layout, and a source buffer wide
+diff --git a/crates/reims-vgpu/src/runtime/draw/mod.rs b/crates/reims-vgpu/src/runtime/draw/mod.rs
+index 307457bc0..c94e9ced7 100644
+--- a/crates/reims-vgpu/src/runtime/draw/mod.rs
++++ b/crates/reims-vgpu/src/runtime/draw/mod.rs
+@@ -5240,20 +5240,74 @@ pub(crate) fn write_gva_solid8<M: HostMemory + HostOps>(
+     format: u16,
+     clear: &[f64; 4],
+ ) -> Result<(), crate::runtime::host::MemError> {
+-    let row = pixel_format::solid_rgba8(width, 1, clear);
+-    write_gva_rows_within(
+-        state,
+-        host,
+-        task_id,
+-        gva,
+-        width,
+-        height,
+-        bpr,
+-        format,
+-        &row,
+-        SourceRows::Repeated,
+-        None,
+-    )
++    write_gva_solid_native_within(state, host, task_id, gva, width, height, bpr, format, clear, None)
++}
++
++#[allow(
++    clippy::too_many_arguments,
++    reason = "mirrors the target GVA and native row geometry every GVA writer takes"
++)]
++pub(crate) fn write_gva_solid_native_within<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    task_id: u32,
++    gva: u64,
++    width: u32,
++    height: u32,
++    bpr: u32,
++    format: u16,
++    clear: &[f64; 4],
++    allowed: crate::runtime::gva_view::WindowPages<'_>,
++) -> Result<(), crate::runtime::host::MemError> {
++    use crate::runtime::host::MemError;
++    if gva == 0 || width == 0 || height == 0 || bpr == 0 {
++        return Err(MemError::BadArgs);
++    }
++    let Some(tight) = pixel_format::tight_row_bytes(width, format) else {
++        return Err(MemError::BadArgs);
++    };
++    if bpr < tight {
++        return Err(MemError::BadArgs);
++    }
++    let tight_usize = tight as usize;
++    let mut row = vec![0u8; tight_usize];
++    if !pixel_format::encode_solid_native_row(format, width, clear, &mut row) {
++        return Err(MemError::BadArgs);
++    }
++    let span = (height as u64).saturating_mul(bpr as u64);
++    if let Some(span_map) =
++        crate::runtime::gva_view::map_fresh_span_within(state, host, task_id, gva, span, allowed)
++    {
++        let (base, avail) = (span_map.ptr, span_map.avail);
++        let mut res = Ok(());
++        for y in 0..height as usize {
++            let off = y.saturating_mul(bpr as usize);
++            if off + tight_usize > avail {
++                res = Err(MemError::RunOutOfRange);
++                break;
++            }
++            unsafe {
++                std::ptr::copy_nonoverlapping(row.as_ptr(), base.add(off), tight_usize);
++            }
++        }
++        crate::runtime::gva_view::unmap_fresh_span(host, span_map);
++        return res;
++    }
++    for y in 0..height as usize {
++        let row_gva = gva.saturating_add((y as u64).saturating_mul(bpr as u64));
++        if let Err(err) =
++            crate::runtime::gva_view::write_span_within(state, host, task_id, row_gva, &row, allowed)
++        {
++            let reason = crate::observe::Decline::slug(&err);
++            crate::observe::fail(format!(
++                "gva_write fail reason={reason} task={task_id} gva={row_gva:#x} span={span:#x} 
++                 row={y} rowlen={:#x} (solid native multi)",
++                row.len()
++            ));
++            return Err(err);
++        }
++    }
++    Ok(())
+ }
+ 
+ /// Whether the source buffer holds one row per destination row, or a single row
+@@ -5273,7 +5327,7 @@ pub(crate) enum SourceRows {
+     ///
+     /// Constructed only by [`write_gva_solid8`], which the Metal rail does not
+     /// reach — the two arms seed a CLEAR through different encoders.
+-    #[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
++    #[allow(dead_code)]
+     Repeated,
+ }
+ 
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index bd769667e..a7c245603 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -134,101 +134,6 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
+     // why its draws were skipped instead of guessing. `None` means the engine
+     // draw was never attempted — this record carried no pipeline or no vertices.
+     let mut engine_refusal: Option<&'static str> = None;
+-    // Solid CLEAR seed Stores only when this record owns guest writeback
+-    // (last of a serialized chain, or unified always-writeback).
+-    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::PrepSeed);
+-    if writeback_guest && clear_seed_enabled() {
+-        for (i, c) in colors.iter().enumerate() {
+-            // Reports an out-of-contract value; the gate below is unchanged, and
+-            // it is the site that disagrees with this module's writeback loop
+-            // about what such a value means. See `super::store_action_in_contract`.
+-            let _ = super::store_action_in_contract(req.pipeline_ref, c.store_action);
+-            if !crate::contract::pass_action::store_action_publishes_single_sample(c.store_action) {
+-                continue;
+-            }
+-            if c.load_action != MTL_LOAD_ACTION_CLEAR && c.load_action != MTL_LOAD_ACTION_DONT_CARE
+-            {
+-                // Load/composite needs real encode (metal2vulkan) — skip Store.
+-                continue;
+-            }
+-            if c.width == 0 || c.height == 0 {
+-                continue;
+-            }
+-            // Neither writer below takes a full-surface RGBA copy — the GVA
+-            // landing repeats a single row and the type-11 landing builds its own
+-            // image in the mapping's order — so the only reader of one is the
+-            // clear-only exit, and it is the one place that builds it.
+-            let solid = (i == 0).then_some((c.width, c.height, c.clear_color));
+-            // Which branch this loop actually takes, how many bytes it lands and
+-            // what the landing costs. `prep_seed_us` is 8.6 µs of a 41 µs chain
+-            // on the `blur=40` dial and rebuilding the images without their two
+-            // redundant passes did not move it by a hundredth, so the cost is in
+-            // one of these two writes and there was no reading that said which.
+-            let seed_kb = u64::from(c.width)
+-                .saturating_mul(u64::from(c.height))
+-                .saturating_mul(u64::from(RGBA8_BPP))
+-                / 1024;
+-            let ok = if c.target_gva != 0 {
+-                let _span = StoreCostSpan::new("clear_seed_gva_us");
+-                crate::runtime::drain::note_store_route("clear_seed_gva");
+-                crate::runtime::drain::note_store_route_n("clear_seed_gva_kb", seed_kb);
+-                // A solid landing, so the writer converts one row rather than
+-                // this surface's thousand identical ones. The full RGBA image
+-                // above is built for `color0_rgba` and is not this write's
+-                // source.
+-                write_gva_solid8(
+-                    state,
+-                    host,
+-                    req.task_id,
+-                    c.target_gva,
+-                    c.width,
+-                    c.height,
+-                    c.row_stride,
+-                    c.format,
+-                    &c.clear_color,
+-                )
+-                .is_ok()
+-            } else if c.mapping_id != 0 {
+-                // Type-11 CLEAR. `write_bgra8` takes guest scanout order and
+-                // converts to the mapping's native format per row; it handles a
+-                // fragmented mapping too, staging native rows and landing them
+-                // through `mapper::write_mapping_bytes`. (A comment here used to
+-                // call it contig-only, which it has not been.)
+-                //
+-                // Built from the swapped *pixel* rather than by exchanging the
+-                // channels of the RGBA image: a solid image is one repeated
+-                // word, so the exchange belongs to the word and doing it per
+-                // texel cost an allocation and two passes over the whole
+-                // surface. See `contract::pixel_format::solid_bgra8`.
+-                let _span = StoreCostSpan::new("clear_seed_t11_us");
+-                crate::runtime::drain::note_store_route("clear_seed_t11");
+-                crate::runtime::drain::note_store_route_n("clear_seed_t11_kb", seed_kb);
+-                let bgra = solid_bgra8(c.width, c.height, &c.clear_color);
+-                let stride = c.width.saturating_mul(RGBA8_BPP);
+-                mapping_write::write_bgra8(
+-                    state,
+-                    host,
+-                    c.mapping_id,
+-                    &bgra,
+-                    stride,
+-                    c.width,
+-                    c.height,
+-                )
+-            } else {
+-                false
+-            };
+-            if ok {
+-                any_store = true;
+-                if i == 0 {
+-                    color0_solid = solid;
+-                }
+-                crate::observe::line(format!(
+-                    "linux_clear_store mid={} gva={:#x} {}x{} pipe={} load={}",
+-                    c.mapping_id, c.target_gva, c.width, c.height, req.pipeline_ref, c.load_action
+-                ));
+-            }
+-        }
+-    }
+ 
+     // Pages the eager GVA fallback below is allowed to reach, resolved
+     // **before** any GPU work.
+@@ -812,6 +717,112 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
+         }
+     }
+ 
++    // Solid CLEAR fallback Store: runs ONLY when no engine draw returned or
++    // stored above (a clear-only record with no pipeline/vertices, or a refused
++    // engine draw). Running this before `try_metal2vulkan_draw` wiped live
++    // `MTLLoadActionDontCare` guest pages (such as the Menu Bar surface) and
++    // superseded residents before the real GPU draw or `PipelinePending` ran.
++    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::PrepSeed);
++    if writeback_guest && clear_seed_enabled() {
++        for (i, c) in colors.iter().enumerate() {
++            let _ = super::store_action_in_contract(req.pipeline_ref, c.store_action);
++            if !crate::contract::pass_action::store_action_publishes_single_sample(c.store_action) {
++                continue;
++            }
++            if c.load_action != MTL_LOAD_ACTION_CLEAR && c.load_action != MTL_LOAD_ACTION_DONT_CARE
++            {
++                continue;
++            }
++            if engine_refusal.is_some() && c.load_action == MTL_LOAD_ACTION_DONT_CARE {
++                // A refused draw on a DontCare target must not wipe guest pages
++                // that already hold prior frame contents.
++                continue;
++            }
++            if c.width == 0 || c.height == 0 {
++                continue;
++            }
++            let solid = (i == 0).then_some((c.width, c.height, c.clear_color));
++            let seed_kb = u64::from(c.width)
++                .saturating_mul(u64::from(c.height))
++                .saturating_mul(u64::from(RGBA8_BPP))
++                / 1024;
++            let ok = if c.target_gva != 0 {
++                let _span = StoreCostSpan::new("clear_seed_gva_us");
++                crate::runtime::drain::note_store_route("clear_seed_gva");
++                crate::runtime::drain::note_store_route_n("clear_seed_gva_kb", seed_kb);
++                super::write_gva_solid_native_within(
++                    state,
++                    host,
++                    req.task_id,
++                    c.target_gva,
++                    c.width,
++                    c.height,
++                    c.row_stride,
++                    c.format,
++                    &c.clear_color,
++                    if i == 0 {
++                        sync_store_pages.as_ref().map(|p| p.membership())
++                    } else {
++                        None
++                    },
++                )
++                .is_ok()
++            } else if c.mapping_id != 0 {
++                let _span = StoreCostSpan::new("clear_seed_t11_us");
++                crate::runtime::drain::note_store_route("clear_seed_t11");
++                crate::runtime::drain::note_store_route_n("clear_seed_t11_kb", seed_kb);
++                let native_ok = state
++                    .mappings
++                    .get(&c.mapping_id)
++                    .map(mapping_write::mapping_store_format)
++                    .and_then(pixel_format::store_texel_order)
++                    .filter(|layout| !layout.is_four_byte_color())
++                    .and_then(|layout| {
++                        pixel_format::solid_native_texels(c.width, c.height, layout, &c.clear_color)
++                            .map(|texels| {
++                                mapping_write::write_native_uncached(
++                                    state,
++                                    host,
++                                    c.mapping_id,
++                                    &texels,
++                                    c.width,
++                                    c.height,
++                                    layout,
++                                )
++                            })
++                    })
++                    .unwrap_or(false);
++                if native_ok {
++                    true
++                } else {
++                    let bgra = solid_bgra8(c.width, c.height, &c.clear_color);
++                    let stride = c.width.saturating_mul(RGBA8_BPP);
++                    mapping_write::write_bgra8(
++                        state,
++                        host,
++                        c.mapping_id,
++                        &bgra,
++                        stride,
++                        c.width,
++                        c.height,
++                    )
++                }
++            } else {
++                false
++            };
++            if ok {
++                any_store = true;
++                if i == 0 {
++                    color0_solid = solid;
++                }
++                crate::observe::line(format!(
++                    "linux_clear_store mid={} gva={:#x} {}x{} pipe={} load={}",
++                    c.mapping_id, c.target_gva, c.width, c.height, req.pipeline_ref, c.load_action
++                ));
++            }
++        }
++    }
++
+     if any_store {
+         if req.vertex_count > 0 || req.indexed.is_some() {
+             // This used to end in the literal `(m2v pending)`, which was a
+@@ -9850,6 +9861,73 @@ pub(crate) fn heap_target_identity(
+ 
+ /// Acquire or refresh a serialized `TaskResource`'s lease over its heap
+ /// resident so deleting or replacing the heap texture retires the image.
++/// Execute a clear-only render pass targeting a GVA-backed attachment.
++///
++/// When the target is eligible for host-authoritative GPU residency, clears the
++/// Vulkan resident directly via [`crate::backend::vulkan::engine::clear_resident_target`]
++/// and arms [`crate::runtime::writeback_debt::arm_gva`] so subsequent `LOAD` or
++/// sampled binds see the cleared resident instead of stale pre-clear GPU texels.
++/// Otherwise (buffer-backed texture, portability host, or headless test), drops
++/// any unpaid GVA debt, invalidates host copies, and writes native-precision
++/// clear texels directly to guest pages.
++pub fn apply_gva_clear<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    task_id: u32,
++    mut req: DrawEncodeRequest,
++    clear_color: &[f64; 4],
++) -> bool {
++    req.gva_alloc_gen = gva_alloc_generation(state, host, &req);
++    let Some(c0) = req.colors.first().cloned() else {
++        return false;
++    };
++    if crate::backend::vulkan::engine::deferred_gpu_only_content_allowed()
++        && gva_store_defer_eligible(&req)
++    {
++        if let Some(identity) = gva_chain_identity(&req) {
++            if crate::backend::vulkan::engine::clear_resident_target(
++                identity.clone(),
++                *clear_color,
++                c0.format,
++            )
++            .is_ok()
++            {
++                if let Some(resource) = state
++                    .task_resources
++                    .get(task_id, c0.texture_ref)
++                    .filter(|r| resource_type_owns_gva_resident(r.entry.object_type))
++                {
++                    let _ = resource.resident_target_backing(&identity);
++                }
++                if crate::runtime::writeback_debt::arm_gva(state, host, task_id, &c0, &identity) {
++                    note_type11_store_route("gva_resident_authoritative");
++                    return true;
++                }
++                crate::backend::vulkan::engine::note_resident_content_copied_out(&identity);
++            }
++        }
++    }
++    crate::runtime::writeback_debt::supersede_gva_plane(
++        state,
++        task_id,
++        c0.texture_ref,
++        c0.target_gva,
++    );
++    super::write_gva_solid_native_within(
++        state,
++        host,
++        task_id,
++        c0.target_gva,
++        c0.width,
++        c0.height,
++        c0.row_stride,
++        c0.format,
++        clear_color,
++        None,
++    )
++    .is_ok()
++}
++
+ pub(crate) fn retain_heap_target(
+     state: &DeviceState,
+     task_id: u32,
+@@ -13175,6 +13253,47 @@ mod vulkan_split_tests {
+         assert!(!super::gva_store_defer_eligible(&req));
+     }
+ 
++    #[test]
++    fn sync_gva_clear_supersedes_unpaid_debt_and_writes_native_float16() {
++        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
++        let mut host = FakeHost::new();
++        map_one_gva_page(&mut host, 4);
++        state.define_task(1, 0x1_0000, 2);
++
++        let mut req = one_page_gva_request();
++        req.colors[0].format = crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
++        req.colors[0].width = 4;
++        req.colors[0].height = 4;
++        req.colors[0].row_stride = 32;
++        req.colors[0].buffer_backed = true; // Force synchronous guest-page arm without a GPU.
++        req.gva_alloc_gen = super::gva_alloc_generation(&mut state, &mut host, &req);
++        let id = super::gva_chain_identity(&req).expect("GVA identity");
++
++        // Simulate a prior unpaid resident debt on the same plane.
++        let mut prior_c0 = req.colors[0].clone();
++        prior_c0.buffer_backed = false;
++        assert!(crate::runtime::writeback_debt::arm_gva(
++            &mut state, &mut host, 1, &prior_c0, &id
++        ));
++        assert!(crate::runtime::writeback_debt::gva_resident_authoritative(
++            &state, &id
++        ));
++
++        let clear = [-1.5, 0.0, 2.25, 1.0];
++        assert!(super::apply_gva_clear(&mut state, &mut host, 1, req, &clear));
++        assert!(
++            !crate::runtime::writeback_debt::gva_resident_authoritative(&state, &id),
++            "synchronous GVA clear must supersede stale unpaid resident debt"
++        );
++
++        let mut texel0 = [0u8; 8];
++        host.read_gpa(4 * 0x1000, &mut texel0).unwrap();
++        assert_eq!(u16::from_le_bytes([texel0[0], texel0[1]]), 0xbe00); // -1.5
++        assert_eq!(u16::from_le_bytes([texel0[2], texel0[3]]), 0x0000); //  0.0
++        assert_eq!(u16::from_le_bytes([texel0[4], texel0[5]]), 0x4080); // +2.25
++        assert_eq!(u16::from_le_bytes([texel0[6], texel0[7]]), 0x3c00); // +1.0
++    }
++
+     #[test]
+     fn mask_unwritten_render_targets_preserves_only_declared_locations() {
+         use crate::backend::vulkan::engine::{
+diff --git a/crates/reims-vgpu/src/runtime/exec/mod.rs b/crates/reims-vgpu/src/runtime/exec/mod.rs
+index a1ab476d2..6fb13cb66 100644
+--- a/crates/reims-vgpu/src/runtime/exec/mod.rs
++++ b/crates/reims-vgpu/src/runtime/exec/mod.rs
+@@ -12,7 +12,7 @@ use crate::contract::pass_action::{
+     MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
+ };
+ use crate::contract::pixel_format::{
+-    f64_to_unorm8, solid_rgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
++    MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
+ };
+ use crate::model::DeviceState;
+ use crate::runtime::blit_exec::{self, BlitStatus};
+@@ -4453,23 +4453,35 @@ fn apply_clear<M: HostMemory + HostOps>(
+         );
+         return false;
+     };
+-    let c0 = req.colors.first().unwrap_or_else(|| unreachable!());
++    let c0 = req.colors.first().unwrap_or_else(|| unreachable!()).clone();
+     let w = c0.width;
+     let h = c0.height;
+-    let rgba = solid_rgba8(w, h, &att.clear_color);
+     if c0.target_gva != 0 {
+-        return draw::write_gva_rgba8(
+-            state,
+-            host,
+-            task_id,
+-            c0.target_gva,
+-            w,
+-            h,
+-            c0.row_stride,
+-            c0.format,
+-            &rgba,
+-        )
+-        .is_ok();
++        #[cfg(feature = "backend-vulkan")]
++        {
++            return draw::apply_gva_clear(state, host, task_id, req, &att.clear_color);
++        }
++        #[cfg(not(feature = "backend-vulkan"))]
++        {
++            crate::runtime::writeback_debt::supersede_gva_plane(
++                state,
++                task_id,
++                c0.texture_ref,
++                c0.target_gva,
++            );
++            return draw::write_gva_solid8(
++                state,
++                host,
++                task_id,
++                c0.target_gva,
++                w,
++                h,
++                c0.row_stride,
++                c0.format,
++                &att.clear_color,
++            )
++            .is_ok();
++        }
+     }
+     #[cfg(feature = "backend-vulkan")]
+     if c0.mapping_id == 0 && !c0.memoryless {
+@@ -4491,22 +4503,36 @@ fn apply_clear<M: HostMemory + HostOps>(
+     if c0.mapping_id == 0 {
+         return false;
+     }
+-    let r = f64_to_unorm8(att.clear_color[0]);
+-    let g = f64_to_unorm8(att.clear_color[1]);
+-    let b = f64_to_unorm8(att.clear_color[2]);
+-    let a = f64_to_unorm8(att.clear_color[3]);
+-    let px = [b, g, r, a];
+-    let stride = w.saturating_mul(RGBA8_BPP);
+-    let mut img = vec![0u8; (stride as usize).saturating_mul(h as usize)];
+-    for y in 0..h as usize {
+-        for x in 0..w as usize {
+-            let o = y * stride as usize + x * 4;
+-            img[o..o + 4].copy_from_slice(&px);
+-        }
+-    }
+-    let _ = MTL_FORMAT_BGRA8_UNORM;
+-    let ok = mapping_write::write_bgra8(state, host, c0.mapping_id, &img, stride, w, h);
+-    // host_cache also updated inside write_bgra8 (surface_cache::store).
++    let native_ok = state
++        .mappings
++        .get(&c0.mapping_id)
++        .map(mapping_write::mapping_store_format)
++        .and_then(crate::contract::pixel_format::store_texel_order)
++        .filter(|layout| !layout.is_four_byte_color())
++        .and_then(|layout| {
++            crate::contract::pixel_format::solid_native_texels(w, h, layout, &att.clear_color).map(
++                |texels| {
++                    mapping_write::write_native_uncached(
++                        state,
++                        host,
++                        c0.mapping_id,
++                        &texels,
++                        w,
++                        h,
++                        layout,
++                    )
++                },
++            )
++        })
++        .unwrap_or(false);
++    let ok = if native_ok {
++        true
++    } else {
++        let img = crate::contract::pixel_format::solid_bgra8(w, h, &att.clear_color);
++        let stride = w.saturating_mul(RGBA8_BPP);
++        let _ = MTL_FORMAT_BGRA8_UNORM;
++        mapping_write::write_bgra8(state, host, c0.mapping_id, &img, stride, w, h)
++    };
+     state.note_surface_clear(c0.mapping_id);
+     ok
+ }
+diff --git a/crates/reims-vgpu/src/runtime/writeback_debt.rs b/crates/reims-vgpu/src/runtime/writeback_debt.rs
+index 10081c2f5..e3ec763b1 100644
+--- a/crates/reims-vgpu/src/runtime/writeback_debt.rs
++++ b/crates/reims-vgpu/src/runtime/writeback_debt.rs
+@@ -1375,12 +1375,44 @@ pub fn supersede_for_mapping(
+     mapping_id: u32,
+     site: crate::runtime::render_writeback::SettleSite,
+ ) {
+-    if state.pending_writebacks.take(mapping_id).is_some() {
++    if let Some(debt) = state.pending_writebacks.take(mapping_id) {
+         crate::runtime::drain::note_store_route("wbdebt_superseded_by_skipping_write");
++        #[cfg(feature = "backend-vulkan")]
++        crate::backend::vulkan::engine::note_resident_content_copied_out(&debt.identity);
++        #[cfg(not(feature = "backend-vulkan"))]
++        let _ = debt;
+     }
+     crate::runtime::render_writeback::settle_guest_writes(site);
+ }
+ 
++/// Drop an unpaid GVA plane debt and invalidate host-side copies before a
++/// synchronous CPU write replaces the plane directly in guest memory.
++pub fn supersede_gva_plane(
++    state: &mut DeviceState,
++    task_id: u32,
++    texture_ref: u32,
++    gva: u64,
++) {
++    if texture_ref != 0 {
++        let key = GvaResourceKey {
++            task_id,
++            texture_ref,
++        };
++        if let Some(debt) = state.pending_writebacks.take_gva_plane(key.plane(gva)) {
++            crate::runtime::drain::note_store_route("gvadebt_superseded");
++            #[cfg(feature = "backend-vulkan")]
++            release_gva(debt);
++            #[cfg(not(feature = "backend-vulkan"))]
++            let _ = debt;
++        }
++        state.invalidate_object_host_copies(task_id, texture_ref);
++        crate::runtime::surface_cache::evict_texture(state, task_id, texture_ref);
++    }
++    if gva != 0 {
++        crate::runtime::surface_cache::evict_gva(state, gva);
++    }
++}
++
+ /// [`settle_for_mapping`] for a caller that cannot name the mapping it is about
+ /// to touch, so it owes every debt.
+ pub fn settle_unnamed<M: HostMemory + HostOps>(
+-- 
+2.43.0
+

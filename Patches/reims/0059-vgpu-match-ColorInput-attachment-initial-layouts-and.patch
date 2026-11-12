@@ -1,0 +1,569 @@
+From 3d3a9c9496ec09213c650e8b48e85a4d393b44d9 Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Wed, 11 Nov 2026 22:27:19 +0800
+Subject: [PATCH 59/68] vgpu: match ColorInput attachment initial layouts and
+ discard memoryless MRT scratch
+
+---
+ .../src/backend/vulkan/engine/caches.rs       |   7 +-
+ .../src/backend/vulkan/engine/exec.rs         | 171 ++++++++++--------
+ .../engine/pools/images_and_registry.rs       |  16 ++
+ crates/reims-vgpu/src/runtime/draw/vulkan.rs  |  82 ++++++++-
+ crates/reims-vgpu/tests/vk_engine_parity.rs   | 160 ++++++++++++++++
+ 5 files changed, 363 insertions(+), 73 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs b/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
+index b0aca1f93..407c33cdf 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/caches.rs
+@@ -1896,7 +1896,12 @@ impl ObjectCaches {
+         if key.color_inputs != 0 {
+             deps.push(fetch_dep);
+         }
+-        deps.push(color_feedback_self_dependency(key.color_layout(0)));
++        let feedback_layout = if key.feedback_colors != 0 {
++            color_feedback_layout()
++        } else {
++            key.color_layout(0)
++        };
++        deps.push(color_feedback_self_dependency(feedback_layout));
+         let rp_info = vk::RenderPassCreateInfo::default()
+             .attachments(&attachments)
+             .subpasses(&subpass)
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs b/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
+index ca6f725e2..9b30796fa 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
+@@ -4321,7 +4321,7 @@ pub(crate) unsafe fn execute_draw_inner(
+     };
+     let target_feedback = pass_key.color_feedback(0);
+     let target_fetched = pass_key.color_fetched(0);
+-    let target_pass_layout = pass_key.color_layout(0);
++    let target_pass_layout = pass_key.color_final_layout(0);
+     let target_dst_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+         | if target_feedback {
+             vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER
+@@ -4573,11 +4573,14 @@ pub(crate) unsafe fn execute_draw_inner(
+         );
+     } else if load_uses_gpu_content
+         && !(target_feedback && req.continues_render_pass && pools.open_pass_echoes(&echo))
+-        && !pass_exit_needs_no_barrier(target_prior_access(
+-            target_snapshotted,
+-            target_access,
+-            target_guest_backed,
+-        ))
++        && !pass_exit_needs_no_barrier(
++            target_prior_access(
++                target_snapshotted,
++                target_access,
++                target_guest_backed,
++            ),
++            target_pass_layout,
++        )
+     {
+         unsafe { outside_pass.before_record(PassObstacle::TargetLayout, pools, &ctx.device, cb) };
+         // A prior direct sample may have left this target shader-readable, or a
+@@ -4974,55 +4977,76 @@ pub(crate) unsafe fn execute_draw_inner(
+         let attachment_index = secondary_index + 1;
+         let feedback = pass_key.color_feedback(attachment_index);
+         let fetched = pass_key.color_fetched(attachment_index);
+-        let desired_layout = pass_key.color_layout(attachment_index);
+-        if (feedback || access.layout() == desired_layout)
++        let sec_load = pass_key.secondary[secondary_index].load;
++        let initial_layout = pass_key.color_final_layout(attachment_index);
++        if (feedback || access.layout() == initial_layout)
+             && req.continues_render_pass
+             && pools.open_pass_echoes(&echo)
+         {
+             continue;
+         }
+-        let dst_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+-            | if feedback {
+-                vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER
+-            } else if fetched {
+-                vk::PipelineStageFlags::FRAGMENT_SHADER
+-            } else {
+-                vk::PipelineStageFlags::empty()
+-            };
+-        let dst_access = vk::AccessFlags::COLOR_ATTACHMENT_READ
+-            | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+-            | if feedback {
+-                vk::AccessFlags::SHADER_READ
+-            } else {
+-                vk::AccessFlags::empty()
++        if sec_load {
++            if pass_exit_needs_no_barrier(*access, initial_layout) {
++                continue;
+             }
+-            | if fetched {
+-                vk::AccessFlags::INPUT_ATTACHMENT_READ
+-            } else {
+-                vk::AccessFlags::empty()
+-            };
+-        unsafe { outside_pass.before_record(PassObstacle::MrtLayout, pools, &ctx.device, cb) };
+-        let (src_stage, src_access) = access.source_scope();
+-        let barrier = [vk::ImageMemoryBarrier::default()
+-            .src_access_mask(src_access)
+-            .dst_access_mask(dst_access)
+-            .old_layout(access.layout())
+-            .new_layout(pass_key.color_layout(attachment_index))
+-            .image(*image)
+-            .subresource_range(super::color_subresource_range())];
+-        ctx.device.cmd_pipeline_barrier(
+-            cb,
+-            src_stage,
+-            dst_stage,
+-            if feedback {
+-                vk::DependencyFlags::FEEDBACK_LOOP_EXT
+-            } else {
+-                vk::DependencyFlags::empty()
+-            },
+-            &[],
+-            &[],
+-            &barrier,
+-        );
++            let dst_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
++                | if feedback {
++                    vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER
++                } else if fetched {
++                    vk::PipelineStageFlags::FRAGMENT_SHADER
++                } else {
++                    vk::PipelineStageFlags::empty()
++                };
++            let dst_access = vk::AccessFlags::COLOR_ATTACHMENT_READ
++                | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
++                | if feedback {
++                    vk::AccessFlags::SHADER_READ
++                } else {
++                    vk::AccessFlags::empty()
++                }
++                | if fetched {
++                    vk::AccessFlags::INPUT_ATTACHMENT_READ
++                } else {
++                    vk::AccessFlags::empty()
++                };
++            unsafe { outside_pass.before_record(PassObstacle::MrtLayout, pools, &ctx.device, cb) };
++            let (src_stage, src_access) = access.source_scope();
++            let barrier = [vk::ImageMemoryBarrier::default()
++                .src_access_mask(src_access)
++                .dst_access_mask(dst_access)
++                .old_layout(access.layout())
++                .new_layout(initial_layout)
++                .image(*image)
++                .subresource_range(super::color_subresource_range())];
++            ctx.device.cmd_pipeline_barrier(
++                cb,
++                src_stage,
++                dst_stage,
++                if feedback {
++                    vk::DependencyFlags::FEEDBACK_LOOP_EXT
++                } else {
++                    super::feedback_transition_dependency(access.layout())
++                },
++                &[],
++                &[],
++                &barrier,
++            );
++        } else {
++            unsafe { outside_pass.before_record(PassObstacle::ClearWait, pools, &ctx.device, cb) };
++            let (src_stage, src_access) = access.source_scope();
++            let barrier = [vk::MemoryBarrier::default()
++                .src_access_mask(src_access)
++                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
++            ctx.device.cmd_pipeline_barrier(
++                cb,
++                src_stage,
++                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
++                vk::DependencyFlags::empty(),
++                &barrier,
++                &[],
++                &[],
++            );
++        }
+     }
+ 
+     let clear = clear_values(req);
+@@ -5254,7 +5278,7 @@ pub(crate) unsafe fn execute_draw_inner(
+             src_stage,
+             dst_stage,
+             vk::DependencyFlags::BY_REGION
+-                | super::feedback_transition_dependency(pass_key.color_layout(0)),
++                | super::feedback_transition_dependency(super::caches::color_feedback_layout()),
+             &barrier,
+             &[],
+             &[],
+@@ -5799,22 +5823,16 @@ pub(crate) unsafe fn execute_draw_inner(
+     if is_mrt {
+         for (secondary_index, (identity, _image, _old)) in mrt_secondaries.iter().enumerate() {
+             let attachment_index = secondary_index + 1;
+-            if pass_key.color_feedback(attachment_index) {
+-                pools.registry_mark_ready_with_access(
+-                    identity,
+-                    super::pools::ResidentAccess::ColorFeedback(
+-                        pass_key.color_final_layout(attachment_index),
+-                    ),
+-                );
++            let final_layout = pass_key.color_final_layout(attachment_index);
++            let access = if pass_key.color_feedback(attachment_index) {
++                super::pools::ResidentAccess::ColorFeedback(final_layout)
++            } else {
++                super::pools::ResidentAccess::ColorWrite(final_layout)
++            };
++            if !req.render_pass_continues && matches!(identity, TargetIdentity::Texture { .. }) {
++                pools.registry_discard_transient_color(identity, access);
+             } else {
+-                // The pass's own `finalLayout` for this slot, asked of the key
+-                // rather than respelled. The feedback arm beside it already
+-                // derives; this one carried a hand-written
+-                // `COLOR_ATTACHMENT_OPTIMAL`, which is the second spelling
+-                // `color0_pass_exit_layout` exists to remove — a registry record
+-                // naming a layout the pass did not leave the image in is a later
+-                // barrier's wrong `oldLayout`.
+-                pools.registry_mark_ready_at(identity, pass_key.color_final_layout(attachment_index));
++                pools.registry_mark_ready_with_access(identity, access);
+             }
+         }
+     }
+@@ -6356,8 +6374,12 @@ fn target_source_scope(
+ /// removes the `vkCmdPipelineBarrier` that was left recording nothing. The
+ /// counter follows honestly — a draw that records no barrier is not charged an
+ /// obstacle, so `passmerge_reachable` can be non-zero for the first time.
+-fn pass_exit_needs_no_barrier(prior: super::pools::ResidentAccess) -> bool {
+-    prior == super::pools::ResidentAccess::ColorWrite(super::caches::color0_pass_exit_layout())
++fn pass_exit_needs_no_barrier(
++    prior: super::pools::ResidentAccess,
++    initial_layout: vk::ImageLayout,
++) -> bool {
++    initial_layout == super::caches::color0_pass_exit_layout()
++        && prior == super::pools::ResidentAccess::ColorWrite(initial_layout)
+ }
+ 
+ /// Record the barrier that makes a registry-resident image readable as a
+@@ -7662,18 +7684,25 @@ mod tests {
+     /// transition, which is undefined behaviour and not an error.
+     #[test]
+     fn only_a_target_left_where_the_next_pass_wants_it_may_skip_its_barrier() {
++        let exit = super::super::caches::color0_pass_exit_layout();
+         for tracked in every_access() {
+-            let skippable = tracked
+-                == ResidentAccess::ColorWrite(super::super::caches::color0_pass_exit_layout());
++            let skippable = tracked == ResidentAccess::ColorWrite(exit);
+             assert_eq!(
+-                pass_exit_needs_no_barrier(tracked),
++                pass_exit_needs_no_barrier(tracked, exit),
+                 skippable,
+                 "{tracked:?}"
+             );
++            assert!(
++                !pass_exit_needs_no_barrier(
++                    tracked,
++                    vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT,
++                ),
++                "a pass entering feedback layout needs an explicit transition from {tracked:?}"
++            );
+             // A snapshot is this draw's own transfer read and always needs the
+             // transition back, whatever the registry was tracking.
+             assert!(
+-                !pass_exit_needs_no_barrier(target_prior_access(true, tracked, false)),
++                !pass_exit_needs_no_barrier(target_prior_access(true, tracked, false), exit),
+                 "a snapshotted {tracked:?} target still has to come back from TRANSFER_SRC"
+             );
+         }
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/pools/images_and_registry.rs b/crates/reims-vgpu/src/backend/vulkan/engine/pools/images_and_registry.rs
+index a7fdbaeab..120e80fe6 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/pools/images_and_registry.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/pools/images_and_registry.rs
+@@ -1858,6 +1858,22 @@ impl ResourcePools {
+         self.set_sole_copy(identity, !guest_backed);
+     }
+ 
++    /// Record the GPU access left on a transient (`MTLStorageModeMemoryless`)
++    /// secondary colour attachment at encoder end without retaining rendered
++    /// contents across encoders or pinning the slot as sole-copy.
++    pub(crate) fn registry_discard_transient_color(
++        &mut self,
++        identity: &TargetIdentity,
++        access: ResidentAccess,
++    ) {
++        if let Some(slot) = self.registry.get_mut(identity) {
++            slot.content_ready = false;
++            slot.content_epoch = None;
++            slot.access = access;
++        }
++        self.set_sole_copy(identity, false);
++    }
++
+     /// Mark a depth resident as holding rendered contents, after a pass that
+     /// stored them.
+     ///
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index 49d6520ca..92542b58a 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -6781,7 +6781,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
+                 _ => true,
+             },
+             crate::contract::pass_action::LoadAction::DontCare => {
+-                crate::backend::vulkan::engine::resident_content_ready(&identity)
++                !c.memoryless && crate::backend::vulkan::engine::resident_content_ready(&identity)
+             }
+         };
+         if matches!(
+@@ -12954,6 +12954,86 @@ mod vulkan_split_tests {
+         assert!(!condemned_sample_takes_resident(GuestAllocation, true));
+         assert!(!condemned_sample_takes_resident(NotReady, true));
+     }
++
++    #[test]
++    fn a_memoryless_secondary_dont_care_clears_instead_of_loading_prior_pass_scratch() {
++        use crate::backend::vulkan::engine::TargetIdentity;
++        use crate::contract::pass_action::{MTL_LOAD_ACTION_DONT_CARE, MTL_LOAD_ACTION_LOAD};
++        use crate::runtime::decode::resource::{PipelineColorAttachment, RenderPipelineDescriptor};
++
++        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
++        let mut host = FakeHost::new();
++        state.define_task(1, 0x1_0000, 2);
++
++        let pipeline = RenderPipelineDescriptor {
++            color_attachments: vec![
++                PipelineColorAttachment { slot: 0, ..PipelineColorAttachment::default() },
++                PipelineColorAttachment { slot: 1, ..PipelineColorAttachment::default() },
++            ],
++            ..RenderPipelineDescriptor::default()
++        };
++        let primary = TargetIdentity::Surface {
++            id: 0x42,
++            width: 32,
++            height: 32,
++            generation: 1,
++            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
++        };
++        let make_colors = |load_action: u16| {
++            vec![
++                ColorRtRequest {
++                    slot: 0,
++                    width: 32,
++                    height: 32,
++                    format: crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT,
++                    ..ColorRtRequest::default()
++                },
++                ColorRtRequest {
++                    slot: 1,
++                    texture_ref: 77,
++                    width: 32,
++                    height: 32,
++                    format: crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT,
++                    load_action,
++                    memoryless: true,
++                    ..ColorRtRequest::default()
++                },
++            ]
++        };
++
++        let secs = super::build_secondary_targets(
++            &mut state,
++            &mut host,
++            1,
++            &make_colors(MTL_LOAD_ACTION_DONT_CARE),
++            &pipeline,
++            &primary,
++            32,
++            32,
++            [0.0; 4],
++        )
++        .expect("memoryless secondary builds");
++        assert!(
++            !secs[0].load,
++            "a new encoder opening a memoryless secondary with DontCare must clear"
++        );
++        let secs_load = super::build_secondary_targets(
++            &mut state,
++            &mut host,
++            1,
++            &make_colors(MTL_LOAD_ACTION_LOAD),
++            &pipeline,
++            &primary,
++            32,
++            32,
++            [0.0; 4],
++        )
++        .expect("memoryless secondary continuation builds");
++        assert!(
++            !secs_load[0].load,
++            "an unrendered memoryless secondary cannot load undefined bytes"
++        );
++    }
+ }
+ 
+ /// Whether the CLEAR-seed Store at the head of a draw chain runs, for this
+diff --git a/crates/reims-vgpu/tests/vk_engine_parity.rs b/crates/reims-vgpu/tests/vk_engine_parity.rs
+index 8bec20203..215ce0a63 100644
+--- a/crates/reims-vgpu/tests/vk_engine_parity.rs
++++ b/crates/reims-vgpu/tests/vk_engine_parity.rs
+@@ -3893,3 +3893,163 @@ fn resident_content_state_separates_an_absent_slot_from_an_unstamped_one() {
+         "a draw since the stamp clears it — the slot is still there"
+     );
+ }
++
++/// Multi-draw MRT + `color_inputs` (`dest_1` subpass fetch) across a pass-key
++/// transition (`color_inputs: 0 -> 0b10`) followed by an in-pass continuation
++/// (`color_inputs: 0b10 -> 0b10`) on a `448x192` `R16G16B16A16_SFLOAT`
++/// transient `TargetIdentity::Texture` secondary (the exact Notification Banner
++/// and Liquid Glass `WindowServer` / `RenderBox` shape).
++///
++/// Verifies three contracts on real GPU compression (NVIDIA DCC / tile memory):
++/// 1. Transitioning from an un-fetched MRT draw into a `color_fetched` MRT draw
++///    keeps `initialLayout == COLOR_ATTACHMENT_OPTIMAL` instead of emitting an
++///    outside-pass `GENERAL` barrier that disagrees with `VkRenderPass`.
++/// 2. Consecutive `color_fetched` MRT draws keep the `VkRenderPass` open
++///    (`render_pass_continuations` increments) and order `OpImageRead` via the
++///    intra-subpass `BY_REGION` barrier.
++/// 3. Ending the encoder (`render_pass_continues = false`) discards transient
++///    `TargetIdentity::Texture` content (`!resident_content_ready`) so the next
++///    encoder cannot inherit stale scratch pixels.
++#[test]
++fn mrt_color_input_secondary_preserves_dcc_continues_pass_and_discards_transient() {
++    const MRT_INIT_FRAG: &[u32] = &[
++        0x07230203, 0x00010300, 0x00070000, 0x0000000f, 0x00000000, 0x00020011, 0x00000001,
++        0x0003000e, 0x00000000, 0x00000001, 0x0007000f, 0x00000004, 0x00000001, 0x6e69616d,
++        0x00000000, 0x00000002, 0x00000003, 0x00030010, 0x00000001, 0x00000007, 0x00040047,
++        0x00000002, 0x0000001e, 0x00000000, 0x00040047, 0x00000003, 0x0000001e, 0x00000001,
++        0x00020013, 0x00000004, 0x00030021, 0x00000005, 0x00000004, 0x00030016, 0x00000006,
++        0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004, 0x00040020, 0x00000008,
++        0x00000003, 0x00000007, 0x0004003b, 0x00000008, 0x00000002, 0x00000003, 0x0004003b,
++        0x00000008, 0x00000003, 0x00000003, 0x0004002b, 0x00000006, 0x00000009, 0x3e800000,
++        0x0004002b, 0x00000006, 0x0000000a, 0x3f000000, 0x0004002b, 0x00000006, 0x0000000b,
++        0x3f400000, 0x0004002b, 0x00000006, 0x0000000c, 0x3f800000, 0x0007002c, 0x00000007,
++        0x0000000d, 0x00000009, 0x0000000a, 0x0000000b, 0x0000000c, 0x00050036, 0x00000004,
++        0x00000001, 0x00000000, 0x00000005, 0x000200f8, 0x0000000e, 0x0003003e, 0x00000002,
++        0x0000000d, 0x0003003e, 0x00000003, 0x0000000d, 0x000100fd, 0x00010038,
++    ];
++    const MRT_ACCUM_FRAG: &[u32] = &[
++        0x07230203, 0x00010300, 0x00070000, 0x00000017, 0x00000000, 0x00020011, 0x00000001,
++        0x00020011, 0x00000028, 0x0003000e, 0x00000000, 0x00000001, 0x0007000f, 0x00000004,
++        0x00000001, 0x6e69616d, 0x00000000, 0x00000002, 0x00000003, 0x00030010, 0x00000001,
++        0x00000007, 0x00040047, 0x00000004, 0x00000022, 0x00000000, 0x00040047, 0x00000004,
++        0x00000021, 0x000000c1, 0x00040047, 0x00000004, 0x0000002b, 0x00000001, 0x00040047,
++        0x00000002, 0x0000001e, 0x00000000, 0x00040047, 0x00000003, 0x0000001e, 0x00000001,
++        0x00020013, 0x00000005, 0x00030021, 0x00000006, 0x00000005, 0x00030016, 0x00000007,
++        0x00000020, 0x00040015, 0x00000008, 0x00000020, 0x00000001, 0x00040017, 0x00000009,
++        0x00000007, 0x00000004, 0x00040017, 0x0000000a, 0x00000008, 0x00000002, 0x00090019,
++        0x0000000b, 0x00000007, 0x00000006, 0x00000000, 0x00000000, 0x00000000, 0x00000002,
++        0x00000000, 0x00040020, 0x0000000c, 0x00000000, 0x0000000b, 0x00040020, 0x0000000d,
++        0x00000003, 0x00000009, 0x0004003b, 0x0000000c, 0x00000004, 0x00000000, 0x0004003b,
++        0x0000000d, 0x00000002, 0x00000003, 0x0004003b, 0x0000000d, 0x00000003, 0x00000003,
++        0x0004002b, 0x00000008, 0x0000000e, 0x00000000, 0x0005002c, 0x0000000a, 0x0000000f,
++        0x0000000e, 0x0000000e, 0x0004002b, 0x00000007, 0x00000010, 0x3e800000, 0x0004002b,
++        0x00000007, 0x00000011, 0x00000000, 0x0007002c, 0x00000009, 0x00000012, 0x00000010,
++        0x00000011, 0x00000011, 0x00000011, 0x00050036, 0x00000005, 0x00000001, 0x00000000,
++        0x00000006, 0x000200f8, 0x00000013, 0x0004003d, 0x0000000b, 0x00000014, 0x00000004,
++        0x00050062, 0x00000009, 0x00000015, 0x00000014, 0x0000000f, 0x00050081, 0x00000009,
++        0x00000016, 0x00000015, 0x00000012, 0x0003003e, 0x00000002, 0x00000016, 0x0003003e,
++        0x00000003, 0x00000016, 0x000100fd, 0x00010038,
++    ];
++
++    let _g = engine_test_session();
++    let (v, _) = triangle_spirv();
++    let (w, h) = (448u32, 192u32);
++    let primary = TargetIdentity::Surface {
++        id: 0x9B01,
++        width: w,
++        height: h,
++        generation: 1,
++        format: SURFACE_TEST_FORMAT,
++    };
++    let secondary = TargetIdentity::Texture {
++        ref_: 246,
++        width: w,
++        height: h,
++        generation: 7,
++        stencil: false,
++    };
++
++    // Draw 0: color_inputs == 0, clears & writes (0.25, 0.50, 0.75, 1.0) into s0 & s1.
++    let mut draw0 = engine_req(&v, MRT_INIT_FRAG, w, h);
++    draw0.target_identity = Some(primary.clone());
++    draw0.skip_readback = true;
++    draw0.render_pass_continues = true;
++    draw0.secondary_targets.push(SecondaryColorTarget {
++        identity: secondary.clone(),
++        width: w,
++        height: h,
++        format: ash::vk::Format::R16G16B16A16_SFLOAT,
++        clear: [0.0, 0.0, 0.0, 0.0],
++        load: false,
++        blend: None,
++        color_write_mask: Default::default(),
++    });
++    match engine::execute_draw_request_blocking(&draw0) {
++        Ok(_) => {}
++        Err(e) if skip_if_no_gpu(&e.to_string()) => {
++            eprintln!("SKIP mrt_color_input_secondary: {e}");
++            return;
++        }
++        Err(e) => panic!("draw0 failed: {e}"),
++    }
++    assert!(
++        engine::resident_content_ready(&secondary),
++        "intra-encoder secondary must stay content_ready while render_pass_continues is true"
++    );
++
++    // Draw 1: color_inputs == 0b10 (slot 1), loads s1 -> writes (0.50, 0.50, 0.75, 1.0).
++    let mut draw1 = engine_req(&v, MRT_ACCUM_FRAG, w, h);
++    draw1.target_identity = Some(primary.clone());
++    draw1.load_from_target = true;
++    draw1.color_inputs = 0b10;
++    draw1.continues_render_pass = true;
++    draw1.render_pass_continues = true;
++    draw1.skip_readback = true;
++    draw1.secondary_targets.push(SecondaryColorTarget {
++        identity: secondary.clone(),
++        width: w,
++        height: h,
++        format: ash::vk::Format::R16G16B16A16_SFLOAT,
++        clear: [0.0, 0.0, 0.0, 0.0],
++        load: true,
++        blend: None,
++        color_write_mask: Default::default(),
++    });
++    engine::execute_draw_request_blocking(&draw1).expect("draw1 failed");
++
++    // Draw 2: same pass compatibility (color_inputs == 0b10), reads (0.50, 0.50, 0.75, 1.0),
++    // outputs (0.75, 0.50, 0.75, 1.0) without corrupting DCC compression, and discards
++    // transient Texture content_ready at encoder end.
++    let mut draw2 = engine_req(&v, MRT_ACCUM_FRAG, w, h);
++    draw2.target_identity = Some(primary.clone());
++    draw2.load_from_target = true;
++    draw2.color_inputs = 0b10;
++    draw2.continues_render_pass = true;
++    draw2.render_pass_continues = false;
++    draw2.skip_readback = false;
++    draw2.secondary_targets.push(SecondaryColorTarget {
++        identity: secondary.clone(),
++        width: w,
++        height: h,
++        format: ash::vk::Format::R16G16B16A16_SFLOAT,
++        clear: [0.0, 0.0, 0.0, 0.0],
++        load: true,
++        blend: None,
++        color_write_mask: Default::default(),
++    });
++    let out = engine::execute_draw_request_blocking(&draw2).expect("draw2 failed");
++    assert!(
++        !engine::resident_content_ready(&secondary),
++        "transient Texture secondary must discard content_ready when encoder ends"
++    );
++
++    let px = semantic_rgba(&out);
++    assert_eq!(px.len(), (w * h * 4) as usize, "readback size");
++    for p in 0..(w * h) as usize {
++        let (r, g, b, a) = (px[p * 4], px[p * 4 + 1], px[p * 4 + 2], px[p * 4 + 3]);
++        assert!(
++            near(r, 191) && near(g, 128) && near(b, 191) && near(a, 255),
++            "pixel {p} RGBA=({r},{g},{b},{a}); expected ~(191,128,191,255)"
++        );
++    }
++}
+-- 
+2.43.0
+

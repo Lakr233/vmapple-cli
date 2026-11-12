@@ -1,0 +1,171 @@
+From 5f0ecb0f4c7b09f630f83f82ced1f068fdb17ab9 Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Wed, 11 Nov 2026 18:10:27 +0800
+Subject: [PATCH 55/68] vgpu: admit larger secondary MRT attachments and coerce
+ unrendered heap LOAD
+
+Metal and Vulkan framebuffers allow secondary color attachments whose dimensions cover at least the render area (width >= fb_w && height >= fb_h) while retaining each attachment's own dimensions in the resident registry; only smaller secondary attachments stay refused. On Vulkan, preserve MTLLoadActionLoad on secondary heap slots in mrt_draw_request and resolve unrendered heap/memoryless secondary LOADs to cleared residents in build_secondary_targets instead of failing LoadSecondaryContentNotReady.
+---
+ crates/reims-vgpu/src/runtime/draw/mod.rs    | 24 ++++++--
+ crates/reims-vgpu/src/runtime/draw/tests.rs  | 58 ++++++++++++++++++++
+ crates/reims-vgpu/src/runtime/draw/vulkan.rs | 15 +++--
+ 3 files changed, 88 insertions(+), 9 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/draw/mod.rs b/crates/reims-vgpu/src/runtime/draw/mod.rs
+index 2504ae8c3..b99f202a0 100644
+--- a/crates/reims-vgpu/src/runtime/draw/mod.rs
++++ b/crates/reims-vgpu/src/runtime/draw/mod.rs
+@@ -4698,7 +4698,16 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
+         if base_w == 0 {
+             base_w = mw;
+             base_h = mh;
+-        } else if mw != base_w || mh != base_h {
++        } else if {
++            #[cfg(feature = "backend-vulkan")]
++            {
++                mw < base_w || mh < base_h
++            }
++            #[cfg(not(feature = "backend-vulkan"))]
++            {
++                mw != base_w || mh != base_h
++            }
++        } {
+             // An attachment whose geometry differs from the first one is
+             // dropped, and the draw goes on with the rest. **This is a loss the
+             // guest is not told about**: the shader still writes that
+@@ -4737,14 +4746,19 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
+             && !memoryless
+             && state.heap_texture_targets.contains_key(&(task_id, target_ref));
+         if heap {
+-            // A heap texture's content lives in its engine resident. Colour0's
+-            // LOAD is honoured from there by `encode_draw_chain`; a secondary
+-            // has no way to load one, so it starts undefined.
++            // A heap texture's content lives in its engine resident. On Vulkan,
++            // both colour0 (`encode_draw_chain`) and secondary slots
++            // (`build_secondary_targets`) load from that resident when ready
++            // and start cleared when unrendered; on Metal a secondary has no
++            // resident rail and starts undefined.
+             if let Some(cl) = clears.iter().find(|a| a.texture_ref == att.texture_ref) {
+                 load_action = MTL_LOAD_ACTION_CLEAR;
+                 clear_color = cl.clear_color;
+             } else if load_action == MTL_LOAD_ACTION_LOAD && !colors.is_empty() {
+-                load_action = MTL_LOAD_ACTION_DONT_CARE;
++                #[cfg(not(feature = "backend-vulkan"))]
++                {
++                    load_action = MTL_LOAD_ACTION_DONT_CARE;
++                }
+             }
+         } else if memoryless {
+             // Nothing to seed from: a memoryless attachment starts cleared or
+diff --git a/crates/reims-vgpu/src/runtime/draw/tests.rs b/crates/reims-vgpu/src/runtime/draw/tests.rs
+index de08e9f55..024ec9298 100644
+--- a/crates/reims-vgpu/src/runtime/draw/tests.rs
++++ b/crates/reims-vgpu/src/runtime/draw/tests.rs
+@@ -5439,6 +5439,64 @@ fn an_unbuildable_secondary_refuses_the_draw_rather_than_dropping_to_single_rt()
+         single.is_empty(),
+         "one colour attachment produces no secondaries"
+     );
++
++    // A secondary attachment larger than the pass's render area is legal in
++    // Metal and Vulkan (`attachment >= framebuffer`), retaining its own backing
++    // dimensions while smaller attachments (`32 < 64` above) stay refused.
++    let larger_slot1 = ColorRtRequest {
++        width: 128,
++        height: 128,
++        row_stride: 128 * 4,
++        ..good_slot1.clone()
++    };
++    let larger = build_secondary_targets(
++        &mut state,
++        &mut host,
++        1,
++        &[slot0.clone(), larger_slot1],
++        &pipeline,
++        &primary,
++        64,
++        64,
++        [0.0; 4],
++    )
++    .expect("larger secondary MRT attachment must build");
++    assert_eq!((larger[0].width, larger[0].height), (128, 128));
++
++    // An unrendered heap secondary declaring `MTLLoadActionLoad` coerces to
++    // `load = false` instead of reaching the engine with an unready `LOAD`.
++    state.heap_texture_targets.insert(
++        (1, 77),
++        crate::model::HeapTargetRef {
++            base_ref: 77,
++            generation: 3,
++            base_format: crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM,
++        },
++    );
++    let unrendered_heap_slot1 = ColorRtRequest {
++        texture_ref: 77,
++        mapping_id: 0,
++        target_gva: 0,
++        format: crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM,
++        load_action: crate::contract::pass_action::MTL_LOAD_ACTION_LOAD,
++        ..good_slot1.clone()
++    };
++    let heap_secs = build_secondary_targets(
++        &mut state,
++        &mut host,
++        1,
++        &[slot0.clone(), unrendered_heap_slot1],
++        &pipeline,
++        &primary,
++        64,
++        64,
++        [0.0; 4],
++    )
++    .expect("unrendered heap secondary must build");
++    assert!(
++        !heap_secs[0].load,
++        "unrendered heap secondary LOAD must coerce to false instead of tripping LoadSecondaryContentNotReady"
++    );
+ }
+ 
+ /// Two attachments over one destination are refused wherever the pair sits, not
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index c631528e3..d9287b565 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -6638,7 +6638,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
+     Vec<crate::backend::vulkan::engine::SecondaryColorTarget>,
+     crate::runtime::census::present_proxy::SecondaryMrtRefusal,
+ > {
+-    use crate::backend::vulkan::engine::SecondaryColorTarget;
++    use crate::backend::vulkan::engine::{SecondaryColorTarget, TargetIdentity};
+     use crate::runtime::census::present_proxy::SecondaryMrtRefusal;
+     if colors.len() <= 1 {
+         return Ok(Vec::new());
+@@ -6658,8 +6658,10 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
+                 reason: crate::runtime::census::present_proxy::MrtDrop::NonContiguousSlot,
+             });
+         }
+-        // MRT requires every attachment to share the framebuffer geometry.
+-        if c.width != fb_w || c.height != fb_h {
++        // MRT requires every attachment to cover at least the framebuffer's
++        // render area; larger attachments render into `(fb_w, fb_h)` while
++        // retaining their own dimensions in the resident registry.
++        if c.width < fb_w || c.height < fb_h {
+             crate::runtime::census::present_proxy::note_secondary_mrt_drop(
+                 crate::runtime::census::present_proxy::MrtDrop::GeometryMismatch,
+                 c.width,
+@@ -6767,7 +6769,12 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
+         let declared = crate::contract::pass_action::LoadAction::from_declared(c.load_action);
+         let load = match declared {
+             crate::contract::pass_action::LoadAction::Clear => false,
+-            crate::contract::pass_action::LoadAction::Load => true,
++            crate::contract::pass_action::LoadAction::Load => match &identity {
++                TargetIdentity::Heap { .. } | TargetIdentity::Texture { .. } => {
++                    crate::backend::vulkan::engine::resident_content_ready(&identity)
++                }
++                _ => true,
++            },
+             crate::contract::pass_action::LoadAction::DontCare => {
+                 crate::backend::vulkan::engine::resident_content_ready(&identity)
+             }
+-- 
+2.43.0
+

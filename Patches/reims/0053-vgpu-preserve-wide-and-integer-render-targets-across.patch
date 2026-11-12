@@ -1,0 +1,1731 @@
+From 4884b5b85b4a9f5a4bffb7f1e95be52a0d24fae1 Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Wed, 11 Nov 2026 17:48:52 +0800
+Subject: [PATCH 53/68] vgpu: preserve wide and integer render targets across
+ Store, LOAD seed and sampled reads
+
+Keep R16Float, RG16Float, RGBA16Float, RGBA16Unorm, RG16Uint, R32Float and RG32Float render targets in their declared texel format across engine resident allocation, verbatim CPU seed staging, native readback, synchronous and deferred Store writeback, heap-to-buffer blits, and buffer/surface sampled uploads instead of clamping through 8-bit RGBA8.
+---
+ .../src/backend/vulkan/engine/exec.rs         |  53 ++-
+ .../src/backend/vulkan/engine/mod.rs          |  40 +-
+ .../src/backend/vulkan/engine/types.rs        |   5 +
+ .../reims-vgpu/src/contract/pixel_format.rs   |  37 +-
+ .../reims-vgpu/src/runtime/blit_exec/mod.rs   |  29 ++
+ .../reims-vgpu/src/runtime/blit_exec/tests.rs |   8 +-
+ crates/reims-vgpu/src/runtime/draw/mod.rs     | 328 ++++++++++++++--
+ crates/reims-vgpu/src/runtime/draw/tests.rs   |   2 +
+ .../src/runtime/draw/texture_view.rs          |  15 +
+ crates/reims-vgpu/src/runtime/draw/vulkan.rs  | 365 +++++++++++++-----
+ crates/reims-vgpu/src/runtime/exec/mod.rs     |   2 +
+ crates/reims-vgpu/src/runtime/exec/tests.rs   |   1 +
+ .../src/runtime/mapping_write/mod.rs          |  58 +++
+ .../src/runtime/render_writeback.rs           |  62 +++
+ 14 files changed, 844 insertions(+), 161 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs b/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
+index 3f243d890..6e95220d4 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
+@@ -1509,24 +1509,21 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
+         }
+     }
+     if let Some(target) = &req.target_rgba8 {
+-        // The seed is one tightly-packed RGBA8 slice of the target, and the
+-        // length is checked rather than taken. `w as usize * h as usize` widens
+-        // its operands, which reads as safe and is — but only just: two u32
+-        // maxima multiply to a hair under u64::MAX, so the bytes-per-texel is a
+-        // third factor that overflows. A refusal rather than a clamp, because
+-        // this length is what the next line compares the buffer against and a
+-        // wrapped one would let a short buffer match.
++        let seed_bpp = match req.target_seed_order {
++            SeedOrder::Rgba8 | SeedOrder::Bgra8 => crate::contract::pixel_format::RGBA8_BPP,
++            SeedOrder::Native(layout) => layout.bytes_per_texel(),
++        };
+         let Some(expected) = crate::contract::extent::tight_image_bytes(
+             req.width,
+             req.height,
+-            crate::contract::pixel_format::RGBA8_BPP as usize,
++            seed_bpp as usize,
+         ) else {
+             return Err(DrawError::DrawValidation(
+                 DrawValidationDecline::UnrepresentableImageBytes {
+                     width: req.width,
+                     height: req.height,
+                     layers: 1,
+-                    bytes_per_texel: crate::contract::pixel_format::RGBA8_BPP,
++                    bytes_per_texel: seed_bpp,
+                 },
+             ));
+         };
+@@ -3381,13 +3378,43 @@ pub(crate) unsafe fn execute_draw_inner(
+     // wide as RGBA8 and still needs its seed restated.
+     phase.enter(super::draw_phase::Phase::StageSeed);
+     let seed_wide = seed_bytes.and_then(|rgba8| {
++        if matches!(req.target_seed_order, SeedOrder::Native(_)) {
++            return None;
++        }
+         let layout = crate::backend::vulkan::translate::pixel::texel_layout_of(color0_format)?;
+         if layout.is_four_byte_color() {
+             return None;
+         }
+         Some((rgba8, layout))
+     });
+-    let seed_slot = if let Some((rgba8, layout)) = seed_wide {
++    let seed_slot = if let (Some(native), SeedOrder::Native(seed_layout)) =
++        (seed_bytes, req.target_seed_order)
++    {
++        if crate::backend::vulkan::translate::pixel::texel_layout_of(color0_format)
++            != Some(seed_layout)
++        {
++            return Err(DrawError::DrawExecution(
++                DrawExecutionDecline::SeedFormatUnwritable {
++                    format: color0_format,
++                },
++            ));
++        }
++        let slot = {
++            let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
++            pools.acquire_staging(
++                ctx,
++                native.len() as u64,
++                vk::BufferUsageFlags::TRANSFER_SRC,
++                counters,
++            )?
++        };
++        {
++            let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, native.len() as u64);
++            pools.write_staging(ctx, &slot, native)?;
++        }
++        counters.note_seed_upload(native.len() as u64);
++        Some(slot)
++    } else if let Some((rgba8, layout)) = seed_wide {
+         // The seed's own order first, because `expand_rgba8_to_texel` reads
+         // semantic RGBA8 — the same normalization the four-byte arm folds into
+         // its copy, done here as a step because a widening pass cannot also
+@@ -5862,6 +5889,7 @@ pub(crate) unsafe fn execute_draw_inner(
+             .render_post_wait_skips
+             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+         return Ok(DrawAnswer::Drawn(DrawOutput {
++            native_pixels: None,
+             pixels: Vec::new(),
+             storage_pixels: Vec::new(),
+             target_guest_backed,
+@@ -5942,6 +5970,7 @@ pub(crate) unsafe fn execute_draw_inner(
+         phase.enter(super::draw_phase::Phase::Wait);
+         pools.wait_entry_fence(ctx, counters, fence)?;
+         return Ok(DrawAnswer::Drawn(DrawOutput {
++            native_pixels: None,
+             pixels: Vec::new(),
+             storage_pixels: read_storage(ctx)?,
+             target_guest_backed,
+@@ -5962,6 +5991,7 @@ pub(crate) unsafe fn execute_draw_inner(
+             phase.enter(super::draw_phase::Phase::Wait);
+             pools.wait_entry_fence(ctx, counters, fence)?;
+             return Ok(DrawAnswer::Drawn(DrawOutput {
++                native_pixels: None,
+                 pixels: Vec::new(),
+                 storage_pixels: Vec::new(),
+                 target_guest_backed,
+@@ -5975,6 +6005,7 @@ pub(crate) unsafe fn execute_draw_inner(
+             .render_post_wait_skips
+             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+         return Ok(DrawAnswer::Drawn(DrawOutput {
++            native_pixels: None,
+             pixels: Vec::new(),
+             storage_pixels: Vec::new(),
+             target_guest_backed,
+@@ -6015,6 +6046,7 @@ pub(crate) unsafe fn execute_draw_inner(
+             format: color0_format,
+         }),
+     )?;
++    let native_pixels = (!layout.is_four_byte_color()).then(|| (out.clone(), layout));
+     let (pixels, pixels_bgra) = super::narrow_readback_to_rgba8(
+         out,
+         layout,
+@@ -6025,6 +6057,7 @@ pub(crate) unsafe fn execute_draw_inner(
+ 
+     Ok(DrawAnswer::Drawn(DrawOutput {
+         pixels,
++        native_pixels,
+         storage_pixels: read_storage(ctx)?,
+         target_guest_backed,
+         guest_store_recorded,
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs b/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
+index 951e11d8f..965c97a1c 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
+@@ -2962,6 +2962,12 @@ pub struct TargetReadback {
+     pub bgra: bool,
+ }
+ 
++/// Unclamped native texels read back from a resident render target.
++pub struct NativeTargetReadback {
++    pub pixels: Vec<u8>,
++    pub layout: crate::contract::pixel_format::TexelLayout,
++}
++
+ impl TargetReadback {
+     /// The frame in semantic RGBA8, exchanging R and B only when it is not
+     /// already in that order.
+@@ -4756,7 +4762,18 @@ fn readback_snapshot(
+     Ok((snap, layout))
+ }
+ 
+-fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
++fn read_target_raw(
++    identity: &TargetIdentity,
++) -> Result<
++    (
++        Vec<u8>,
++        crate::contract::pixel_format::TexelLayout,
++        ash::vk::Format,
++        u64,
++        bool,
++    ),
++    DrawError,
++> {
+     let mut guard = lock_engine();
+     let EngineState {
+         ref mut owner,
+@@ -4767,9 +4784,6 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
+     let ctx = owner.ensure(counters)?;
+     unsafe { pools.ensure_init(ctx, counters)? };
+     let (snap, layout) = readback_snapshot(pools, identity)?;
+-    // Asked for at the resident's own width — the copy is a raw image→buffer
+-    // move and reads the image format's texel — and narrowed below if that is
+-    // not what the caller can read.
+     let pixels = (snap.width as u64) * (snap.height as u64);
+     let rb_size = pixels * u64::from(layout.bytes_per_texel());
+     let read_access = pools::ResidentAccess::transfer_read(snap.guest_backing.is_some());
+@@ -4789,19 +4803,27 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
+         )?;
+         pools.registry_note_access(identity, read_access);
+         counters.note_target_read(rb_size);
+-        // A wide resident is quantized here rather than refused; see
+-        // `narrow_readback_to_rgba8` for why that direction is the safe one.
+-        let (pixels, bgra) =
+-            narrow_readback_to_rgba8(out, layout, snap.format, pixels, snap.bgra())?;
+-        Ok(TargetReadback { pixels, bgra })
++        Ok((out, layout, snap.format, pixels, snap.bgra()))
+     }
+ }
+ 
++fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
++    let (out, layout, format, pixels, snap_bgra) = read_target_raw(identity)?;
++    let (pixels, bgra) = narrow_readback_to_rgba8(out, layout, format, pixels, snap_bgra)?;
++    Ok(TargetReadback { pixels, bgra })
++}
++
+ /// Full-frame readback of a resident target (present / Synchronize / Map / Store boundary).
+ pub fn read_target(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
+     read_target_inner(identity)
+ }
+ 
++/// Full-frame native-texel readback of a resident target, without narrowing to RGBA8.
++pub fn read_target_native(identity: &TargetIdentity) -> Result<NativeTargetReadback, DrawError> {
++    let (pixels, layout, _, _, _) = read_target_raw(identity)?;
++    Ok(NativeTargetReadback { pixels, layout })
++}
++
+ /// Run bounded maintenance for dead resources and already-free pool entries.
+ /// Live residency is controlled by resource lifetime and allocation pressure,
+ /// never by this clock.
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/types.rs b/crates/reims-vgpu/src/backend/vulkan/engine/types.rs
+index 4fa7bd11a..6e1fee16e 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/types.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/types.rs
+@@ -768,6 +768,9 @@ pub enum DrawAnswer {
+ #[derive(Debug, Default)]
+ pub struct DrawOutput {
+     pub pixels: Vec<u8>,
++    /// Unclamped attachment-native texels when the attachment is not 4-byte
++    /// RGBA8/BGRA8 colour (`!layout.is_four_byte_color()`).
++    pub native_pixels: Option<(Vec<u8>, crate::contract::pixel_format::TexelLayout)>,
+     /// The texels of each scratch storage image with `read_back`, in request
+     /// order, tight rows.
+     pub storage_pixels: Vec<Vec<u8>>,
+@@ -2034,6 +2037,8 @@ pub enum SeedOrder {
+     Rgba8,
+     /// Guest scanout order — B, G, R, A in memory.
+     Bgra8,
++    /// Attachment-native texels, staged verbatim without 8-bit expansion.
++    Native(crate::contract::pixel_format::TexelLayout),
+ }
+ 
+ /// Where a sampled image's content comes from.
+diff --git a/crates/reims-vgpu/src/contract/pixel_format.rs b/crates/reims-vgpu/src/contract/pixel_format.rs
+index 51aa80031..89a73ff51 100644
+--- a/crates/reims-vgpu/src/contract/pixel_format.rs
++++ b/crates/reims-vgpu/src/contract/pixel_format.rs
+@@ -227,6 +227,11 @@ pub enum SampledClass {
+     Bgra8Unorm,
+     Rgba16Float,
+     Rg16Float,
++    R16Float,
++    Rgba16Unorm,
++    Rg16Uint,
++    Rg32Float,
++    R32Float,
+     /// The packed ten-bit words. Their guest bytes are already the upload bytes
+     /// of `A2B10G10R10_UNORM_PACK32` / `A2R10G10B10_UNORM_PACK32`, so a loader
+     /// that carries the native layout hands them over unconverted.
+@@ -1186,6 +1191,11 @@ pub fn sampled_class(format: u16) -> Option<SampledClass> {
+         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => SampledClass::Bgra8Unorm,
+         MTL_FORMAT_RGBA16_FLOAT => SampledClass::Rgba16Float,
+         MTL_FORMAT_RG16_FLOAT => SampledClass::Rg16Float,
++        MTL_FORMAT_R16_FLOAT => SampledClass::R16Float,
++        MTL_FORMAT_RGBA16_UNORM => SampledClass::Rgba16Unorm,
++        MTL_FORMAT_RG16_UINT => SampledClass::Rg16Uint,
++        MTL_FORMAT_RG32_FLOAT => SampledClass::Rg32Float,
++        MTL_FORMAT_R32_FLOAT => SampledClass::R32Float,
+         MTL_FORMAT_RGB10A2_UNORM => SampledClass::Rgb10a2Unorm,
+         MTL_FORMAT_BGR10A2_UNORM => SampledClass::Bgr10a2Unorm,
+         _ => return None,
+@@ -1373,7 +1383,13 @@ pub fn store_texel_order(format: u16) -> Option<TexelLayout> {
+     Some(match format {
+         MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => TexelLayout::Rgba8,
+         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => TexelLayout::Bgra8,
++        MTL_FORMAT_R8_UNORM => TexelLayout::R8,
+         MTL_FORMAT_RGBA16_FLOAT => TexelLayout::Rgba16Float,
++        MTL_FORMAT_RG16_FLOAT => TexelLayout::Rg16Float,
++        MTL_FORMAT_R16_FLOAT => TexelLayout::R16Float,
++        MTL_FORMAT_RG16_UINT => TexelLayout::Rg16Uint,
++        MTL_FORMAT_RG32_FLOAT => TexelLayout::Rg32Float,
++        MTL_FORMAT_R32_FLOAT => TexelLayout::R32Float,
+         MTL_FORMAT_RGB10A2_UNORM => TexelLayout::Rgb10a2Unorm,
+         MTL_FORMAT_BGR10A2_UNORM => TexelLayout::Bgr10a2Unorm,
+         _ => return None,
+@@ -2626,7 +2642,10 @@ mod tests {
+             sampled_class(MTL_FORMAT_A8_UNORM),
+             Some(SampledClass::A8Unorm)
+         );
+-        assert_eq!(sampled_class(MTL_FORMAT_R16_FLOAT), None);
++        assert_eq!(
++            sampled_class(MTL_FORMAT_R16_FLOAT),
++            Some(SampledClass::R16Float)
++        );
+         assert_eq!(
+             storage_selector(MTL_FORMAT_R8_UNORM),
+             Some(StorageImageSelector::R8Unorm)
+@@ -3454,7 +3473,13 @@ mod tests {
+                 Some(match order {
+                     TexelLayout::Rgba8 => SampledClass::Rgba8Unorm,
+                     TexelLayout::Bgra8 => SampledClass::Bgra8Unorm,
++                    TexelLayout::R8 => SampledClass::R8Unorm,
+                     TexelLayout::Rgba16Float => SampledClass::Rgba16Float,
++                    TexelLayout::Rg16Float => SampledClass::Rg16Float,
++                    TexelLayout::R16Float => SampledClass::R16Float,
++                    TexelLayout::Rg16Uint => SampledClass::Rg16Uint,
++                    TexelLayout::Rg32Float => SampledClass::Rg32Float,
++                    TexelLayout::R32Float => SampledClass::R32Float,
+                     TexelLayout::Rgb10a2Unorm => SampledClass::Rgb10a2Unorm,
+                     TexelLayout::Bgr10a2Unorm => SampledClass::Bgr10a2Unorm,
+                     other => {
+@@ -3464,12 +3489,10 @@ mod tests {
+                 "{fmt:#x} is read as one layout by the sampler and copied as another"
+             );
+         }
+-        // A renderable format that is still not a byte-copy destination, so a
+-        // further widening of the set above has to change this line to pass.
+-        assert!(render_target_bpp(MTL_FORMAT_RG16_FLOAT).is_some());
+-        assert!(
+-            store_texel_order(MTL_FORMAT_RG16_FLOAT).is_none(),
+-            "RG16_FLOAT renders but is not admitted to a copy"
++        assert_eq!(
++            store_texel_order(MTL_FORMAT_RG16_FLOAT),
++            Some(TexelLayout::Rg16Float),
++            "RG16_FLOAT render targets store native half-float texels"
+         );
+         // The widened one, named so that removing it from the rule is a test
+         // failure rather than a silent narrowing back to eight bits.
+diff --git a/crates/reims-vgpu/src/runtime/blit_exec/mod.rs b/crates/reims-vgpu/src/runtime/blit_exec/mod.rs
+index a08012267..392426d0f 100644
+--- a/crates/reims-vgpu/src/runtime/blit_exec/mod.rs
++++ b/crates/reims-vgpu/src/runtime/blit_exec/mod.rs
+@@ -2827,6 +2827,35 @@ fn copy_heap_resident_to_buffer<M: HostMemory + HostOps>(
+     if !engine::resident_content_ready(&identity) {
+         return br(BlitStatus::MissingResource, "t2b_heap_unrendered");
+     }
++    if let Some(expected_layout) = pixel_format::store_texel_order(heap.format) {
++        if let Ok(rb) = engine::read_target_native(&identity) {
++            if rb.layout == expected_layout {
++                let bpp = rb.layout.bytes_per_texel() as usize;
++                let src_row = heap.width as usize * bpp;
++                if rb.pixels.len() >= src_row * heap.height as usize {
++                    let allowed = dest_window(state, host, task_id, dst_base, span);
++                    for y in 0..copy_h {
++                        let at = (oy + y) as usize * src_row + ox as usize * bpp;
++                        let slice = &rb.pixels[at..at + row_bytes as usize];
++                        if gva_mem::write_task_gva_product_within(
++                            state,
++                            host,
++                            task_id,
++                            dst_base + y * dst_bpr,
++                            slice,
++                            allowed.as_ref(),
++                        )
++                        .is_err()
++                        {
++                            return br(BlitStatus::GuestIo, "t2b_heap_write_io");
++                        }
++                    }
++                    crate::runtime::drain::note_store_route("blit_t2b_heap");
++                    return BlitStatus::Ok;
++                }
++            }
++        }
++    }
+     let Ok(readback) = engine::read_target(&identity) else {
+         return br(BlitStatus::MissingResource, "t2b_heap_read_refused");
+     };
+diff --git a/crates/reims-vgpu/src/runtime/blit_exec/tests.rs b/crates/reims-vgpu/src/runtime/blit_exec/tests.rs
+index b31eb7b43..3cd3c25c3 100644
+--- a/crates/reims-vgpu/src/runtime/blit_exec/tests.rs
++++ b/crates/reims-vgpu/src/runtime/blit_exec/tests.rs
+@@ -2814,7 +2814,7 @@ fn the_gpu_whole_plane_arm_refuses_a_plane_the_rail_would_not_write() {
+ #[test]
+ fn the_gpu_whole_plane_arm_compares_stored_texels_and_not_transfer_functions() {
+     use crate::contract::pixel_format::{
+-        MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_R32_FLOAT, MTL_FORMAT_RGBA8_UNORM_SRGB,
++        MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_A8_UNORM, MTL_FORMAT_RGBA8_UNORM_SRGB,
+     };
+     use GpuPlaneRefusal::*;
+ 
+@@ -2877,18 +2877,18 @@ fn the_gpu_whole_plane_arm_compares_stored_texels_and_not_transfer_functions() {
+     // which this arm does not do. It must refuse rather than fold to `None ==
+     // None` and read as agreement.
+     let unlayed = GpuPlane {
+-        pixel_format: MTL_FORMAT_R32_FLOAT,
++        pixel_format: MTL_FORMAT_A8_UNORM,
+         ..dst
+     };
+     assert_eq!(
+         gpu_whole_plane_destination(
+             Some(unlayed),
+             Some(GpuMappingWindow {
+-                pixel_format: MTL_FORMAT_R32_FLOAT,
++                pixel_format: MTL_FORMAT_A8_UNORM,
+                 ..window
+             }),
+             GpuResidentSource {
+-                pixel_format: MTL_FORMAT_R32_FLOAT,
++                pixel_format: MTL_FORMAT_A8_UNORM,
+                 ..src
+             }
+         ),
+diff --git a/crates/reims-vgpu/src/runtime/draw/mod.rs b/crates/reims-vgpu/src/runtime/draw/mod.rs
+index a16672ef9..2504ae8c3 100644
+--- a/crates/reims-vgpu/src/runtime/draw/mod.rs
++++ b/crates/reims-vgpu/src/runtime/draw/mod.rs
+@@ -812,6 +812,9 @@ pub struct ColorRtRequest {
+     pub store_action: u16,
+     pub clear_color: [f64; 4],
+     pub target_seed_rgba: Option<Vec<u8>>,
++    /// `Some(layout)` when `target_seed_rgba` holds attachment-native texels
++    /// rather than RGBA8.
++    pub target_seed_layout: Option<crate::contract::pixel_format::TexelLayout>,
+     /// Multisample attachment discarded into this request's single-sample
+     /// target at pass end. Zero for an ordinary colour attachment.
+     pub multisample_source_ref: u32,
+@@ -1816,13 +1819,14 @@ pub(crate) fn note_sampled_narrowing(
+ /// every early-return here logs a fail-visible reason (the buffer is unresolved,
+ /// the format is unknown, or the span overruns the buffer) — those are real
+ /// dropped-draw causes, not speculative "not ready yet" polls.
+-fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
++fn load_buffer_texture_sampled<M: HostMemory + HostOps>(
+     state: &mut DeviceState,
+     host: &mut M,
+     task_id: u32,
+     texture_ref: u32,
+     bt: &BufferTextureDescriptor,
+-) -> Option<(u32, u32, Vec<u8>)> {
++    native: NativeUploads,
++) -> Option<(u32, u32, Vec<u8>, SampledByteFormat)> {
+     let (w, h) = (bt.desc.width, bt.desc.height);
+     if w == 0 || h == 0 {
+         crate::observe::fail(format!(
+@@ -1843,7 +1847,6 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
+         ));
+         return None;
+     };
+-    // A guest bytesPerRow of 0 means tight rows (single-row / API default).
+     let bpr = if bt.bytes_per_row == 0 {
+         tight as u64
+     } else {
+@@ -1857,13 +1860,6 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
+         return None;
+     }
+     let span = bpr.checked_mul(h as u64)?;
+-    // A buffer-backed texture is two contract references over one allocation:
+-    // the type-8 texture object the guest binds and samples, and the type-1
+-    // buffer that owns the storage. A synchronize names the former and a debt
+-    // may be armed under either, so both are paid. `load_buffer_bytes` below
+-    // pays for `bt.buffer_ref`; this is the sibling call every other sampled
+-    // rail makes, and its absence here is what let a rendered frame stay in a
+-    // host resident while this read served the guest the frame before it.
+     crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
+     let raw = load_buffer_bytes(state, host, task_id, bt.buffer_ref, bt.offset)?;
+     if (raw.len() as u64) < span {
+@@ -1875,6 +1871,24 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
+         ));
+         return None;
+     }
++    if let Some(layout) = linear_native_upload_format(fmt, native).filter(|layout| {
++        (tight as u64) == (w as u64).saturating_mul(layout.bytes_per_texel() as u64)
++    }) {
++        let tight_usize = tight as usize;
++        let bpr_usize = bpr as usize;
++        let out_len = tight_usize.checked_mul(h as usize)?;
++        let out = if bpr_usize == tight_usize && raw.len() == out_len {
++            raw
++        } else {
++            let mut packed = vec![0u8; out_len];
++            for y in 0..h as usize {
++                packed[y * tight_usize..(y + 1) * tight_usize]
++                    .copy_from_slice(&raw[y * bpr_usize..y * bpr_usize + tight_usize]);
++            }
++            packed
++        };
++        return Some((w, h, out, SampledByteFormat::from_source(layout, fmt)));
++    }
+     note_sampled_narrowing("buftex_narrowed", texture_ref, fmt, w, h);
+     let row_pixels = w as usize;
+     let dst_row = row_pixels.checked_mul(RGBA8_BPP as usize)?;
+@@ -1884,10 +1898,6 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
+     for y in 0..h as usize {
+         let src = &raw[y * bpr..y * bpr + tight];
+         let dst = &mut rgba[y * dst_row..(y + 1) * dst_row];
+-        // The packed ten-bit icons 26 and 27 draw from buffer textures narrow
+-        // here through the shared converter, the same arm the scanout capture
+-        // and the readback rails use, so every eight-bit reading of one word
+-        // agrees.
+         if !pixel_format::convert_row_to_rgba8(fmt, src, w, dst) {
+             crate::observe::fail(format!(
+                 "buftex convert_fail ref={texture_ref} buf={} fmt={fmt:#x} row={y} {w}x{h}",
+@@ -1896,7 +1906,24 @@ fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
+             return None;
+         }
+     }
+-    Some((w, h, rgba))
++    Some((
++        w,
++        h,
++        rgba,
++        SampledByteFormat::from_source(TexelLayout::Rgba8, fmt),
++    ))
++}
++
++#[cfg_attr(feature = "backend-vulkan", allow(dead_code))]
++fn load_buffer_texture_rgba<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    task_id: u32,
++    texture_ref: u32,
++    bt: &BufferTextureDescriptor,
++) -> Option<(u32, u32, Vec<u8>)> {
++    load_buffer_texture_sampled(state, host, task_id, texture_ref, bt, NativeUploads::NONE)
++        .map(|(w, h, r, _)| (w, h, r))
+ }
+ 
+ fn index_elem_size(index_type: u32) -> Option<usize> {
+@@ -4523,6 +4550,7 @@ pub fn color_target_request<M: HostMemory + HostOps>(
+         store_action: MTL_STORE_ACTION_STORE,
+         clear_color: [0.0; 4],
+         target_seed_rgba: None,
++        target_seed_layout: None,
+         multisample_source_ref: 0,
+         memoryless: rt.memoryless,
+     };
+@@ -4781,8 +4809,30 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
+                 // slot number, which is the guest's and need not start at zero.
+                 let elided = elided && colors.is_empty();
+                 gva_load_from_resident = elided;
++                let mut seed_layout = None;
+                 if !elided {
+-                    seed = seed_color_load(state, host, task_id, att.texture_ref, gva, mw, mh);
++                    #[cfg(feature = "backend-vulkan")]
++                    {
++                        if let Some((bytes, layout)) = seed_color_load_native(
++                            state,
++                            host,
++                            task_id,
++                            att.texture_ref,
++                            gva,
++                            mw,
++                            mh,
++                            mfmt,
++                        ) {
++                            seed = Some(bytes);
++                            if layout != TexelLayout::Rgba8 {
++                                seed_layout = Some(layout);
++                            }
++                        }
++                    }
++                    #[cfg(not(feature = "backend-vulkan"))]
++                    {
++                        seed = seed_color_load(state, host, task_id, att.texture_ref, gva, mw, mh);
++                    }
+                     if seed.is_none() {
+                         crate::observe::fail(format!(
+                             "color LOAD seed miss ref={} {}x{} fmt={:#x} gva={:#x} (archive: still encode)",
+@@ -4790,6 +4840,25 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
+                         ));
+                     }
+                 }
++                colors.push(ColorRtRequest {
++                    slot,
++                    texture_ref: target_ref,
++                    mapping_id,
++                    target_gva: gva,
++                    row_stride: bpr,
++                    width: mw,
++                    height: mh,
++                    format: mfmt,
++                    sample_count: attachment_sample_count,
++                    load_action,
++                    store_action: att.store_action,
++                    clear_color,
++                    target_seed_rgba: seed,
++                    target_seed_layout: seed_layout,
++                    multisample_source_ref,
++                    memoryless,
++                });
++                continue;
+             }
+         }
+         colors.push(ColorRtRequest {
+@@ -4806,6 +4875,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
+             store_action: att.store_action,
+             clear_color,
+             target_seed_rgba: seed,
++            target_seed_layout: None,
+             multisample_source_ref,
+             memoryless,
+         });
+@@ -5046,6 +5116,76 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
+     )
+ }
+ 
++#[cfg(feature = "backend-vulkan")]
++#[allow(
++    clippy::too_many_arguments,
++    reason = "the archive writer mirrors the target GVA and native row geometry"
++)]
++pub(crate) fn write_gva_native_within<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    task_id: u32,
++    gva: u64,
++    width: u32,
++    height: u32,
++    bpr: u32,
++    format: u16,
++    native: &[u8],
++    allowed: crate::runtime::gva_view::WindowPages<'_>,
++) -> Result<(), crate::runtime::host::MemError> {
++    use crate::runtime::host::MemError;
++    if gva == 0 || width == 0 || height == 0 || bpr == 0 {
++        return Err(MemError::BadArgs);
++    }
++    let Some(tight) = pixel_format::tight_row_bytes(width, format) else {
++        return Err(MemError::BadArgs);
++    };
++    if bpr < tight {
++        return Err(MemError::BadArgs);
++    }
++    let tight_usize = tight as usize;
++    let need = tight_usize.saturating_mul(height as usize);
++    if native.len() < need {
++        return Err(MemError::BadArgs);
++    }
++    let span = (height as u64).saturating_mul(bpr as u64);
++    if let Some(span_map) =
++        crate::runtime::gva_view::map_fresh_span_within(state, host, task_id, gva, span, allowed)
++    {
++        let (base, avail) = (span_map.ptr, span_map.avail);
++        let mut res = Ok(());
++        for y in 0..height as usize {
++            let src = &native[y * tight_usize..(y + 1) * tight_usize];
++            let off = y.saturating_mul(bpr as usize);
++            if off + tight_usize > avail {
++                res = Err(MemError::RunOutOfRange);
++                break;
++            }
++            unsafe {
++                std::ptr::copy_nonoverlapping(src.as_ptr(), base.add(off), tight_usize);
++            }
++        }
++        crate::runtime::gva_view::unmap_fresh_span(host, span_map);
++        return res;
++    }
++    for y in 0..height as usize {
++        let src = &native[y * tight_usize..(y + 1) * tight_usize];
++        let row_gva = gva.saturating_add((y as u64).saturating_mul(bpr as u64));
++        if let Err(err) = crate::runtime::gva_view::write_span_within(
++            state, host, task_id, row_gva, src, allowed,
++        ) {
++            let reason = crate::observe::Decline::slug(&err);
++            crate::observe::fail(format!(
++                "gva_write fail reason={reason} task={task_id} gva={row_gva:#x} span={span:#x} \
++                 row={y} rowlen={:#x} (native multi)",
++                src.len()
++            ));
++            return Err(err);
++        }
++    }
++    Ok(())
++}
++
+ /// Land a solid colour into a GVA render target.
+ ///
+ /// One tight RGBA8 row is built and handed to the same writer every full-image
+@@ -5648,6 +5788,46 @@ fn seed_color_load<M: HostMemory + HostOps>(
+     Some(rgba)
+ }
+ 
++/// [`seed_color_load`] for the Vulkan backend, keeping wide / half-float /
++/// ten-bit / integer guest texels native instead of clamping through the 8-bit
++/// `surface_cache` or RGBA8 row converter.
++#[cfg(feature = "backend-vulkan")]
++#[allow(clippy::too_many_arguments)]
++pub(crate) fn seed_color_load_native<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    task_id: u32,
++    texture_ref: u32,
++    target_gva: u64,
++    width: u32,
++    height: u32,
++    target_format: u16,
++) -> Option<(Vec<u8>, TexelLayout)> {
++    let want_native = pixel_format::store_texel_order(target_format)
++        .is_some_and(|layout| !layout.is_four_byte_color());
++    if want_native {
++        let native = NativeUploads {
++            bgra8: false,
++            float16: true,
++            ten_bit: true,
++            unorm16: true,
++            integer_and_float32: true,
++        };
++        if let Some((bytes, fmt)) = load_sampled_rgba_static(
++            state,
++            host,
++            task_id,
++            texture_ref,
++            native,
++            crate::runtime::render_writeback::SettleSite::LinearTextureSeed,
++        ) {
++            return Some((bytes, fmt.layout()));
++        }
++    }
++    seed_color_load(state, host, task_id, texture_ref, target_gva, width, height)
++        .map(|rgba| (rgba, TexelLayout::Rgba8))
++}
++
+ /// Resolve sampled texture RGBA without requiring Metal feature (color LOAD seed path).
+ ///
+ /// Type-8 views with a non-identity swizzle are rejected here: RT materialization does not
+@@ -5663,9 +5843,8 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
+ ) -> Option<(Vec<u8>, SampledByteFormat)> {
+     // Opcode-9 buffer-backed texture (type-8): sample the source buffer directly.
+     if let Some(bt) = buffer_texture_descriptor(state, host, task_id, texture_ref, None) {
+-        let source = bt.desc.pixel_format;
+-        return load_buffer_texture_rgba(state, host, task_id, texture_ref, &bt)
+-            .map(|(_, _, r)| (r, SampledByteFormat::from_source(TexelLayout::Rgba8, source)));
++        return load_buffer_texture_sampled(state, host, task_id, texture_ref, &bt, native)
++            .map(|(_, _, r, fmt)| (r, fmt));
+     }
+     // Type-11 path via resolve.
+     if let Some(mid) = objects::resolve_type11_ref(state, host, task_id, texture_ref) {
+@@ -5746,23 +5925,107 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
+     state: &mut DeviceState,
+     host: &mut M,
+     mid: u32,
+-) -> Option<(std::sync::Arc<Vec<u8>>, LinearSampleIdentity)> {
+-    let (w, h) = {
++    native_uploads: NativeUploads,
++) -> Option<(
++    std::sync::Arc<Vec<u8>>,
++    LinearSampleIdentity,
++    crate::contract::pixel_format::TexelLayout,
++)> {
++    let (w, h, declared_fmt) = {
+         let m = state.mappings.get(&mid)?;
+         if !m.has_geom || m.width == 0 || m.height == 0 {
+             return None;
+         }
+-        (m.width, m.height)
++        (
++            m.width,
++            m.height,
++            crate::runtime::mapping_write::mapping_store_format(m),
++        )
+     };
++    let identity_key = (1u64 << 63) | (1u64 << 62) | mid as u64;
++    let key = (mid, w, h);
++    if let Some(native_layout) = linear_native_upload_format(declared_fmt, native_uploads)
++        .filter(|layout| !layout.is_four_byte_color())
++    {
++        if crate::runtime::mapper::ensure_resolved_for_scanout(state, host, mid) {
++            let window = state
++                .mappings
++                .get(&mid)
++                .and_then(|m| crate::runtime::mapping_write::type11_sample_window(m, w, h, declared_fmt));
++            if let Some((base_off, surface_bpr, span_end)) = window {
++                let bpp = native_layout.bytes_per_texel();
++                let tight = w.checked_mul(bpp)?;
++                let span = host_alloc_len((tight as u64).checked_mul(h as u64)?)?;
++                if span > 0 {
++                    let mut scratch = std::mem::take(&mut state.type11_memo_scratch);
++                    prepare_memo_scratch(&mut scratch, span, span);
++                    if crate::runtime::mapping_write::read_rect_raw_at(
++                        state,
++                        host,
++                        mid,
++                        crate::runtime::mapping_write::SurfaceWindow {
++                            base_off,
++                            bpr: surface_bpr,
++                            span_end,
++                            bpp,
++                        },
++                        crate::runtime::mapping_write::Rect {
++                            origin_x: 0,
++                            origin_y: 0,
++                            width: w,
++                            height: h,
++                        },
++                        &mut scratch,
++                        tight,
++                    ) {
++                        if let Some(m) = state.type11_memo.get_touch(&key) {
++                            if m.layout == native_layout && m.native == scratch {
++                                let rgba = m.rgba.clone();
++                                let generation = m.generation;
++                                state.type11_memo_scratch = scratch;
++                                return Some((
++                                    rgba,
++                                    LinearSampleIdentity {
++                                        key: identity_key,
++                                        generation,
++                                    },
++                                    native_layout,
++                                ));
++                            }
++                        }
++                        let payload = std::sync::Arc::new(scratch.clone());
++                        let generation = state.next_sampled_content_generation();
++                        let entry_bytes = scratch.len() + payload.len();
++                        state.type11_memo.insert(
++                            key,
++                            crate::model::GuestLinearMemo {
++                                native: scratch,
++                                rgba: payload.clone(),
++                                layout: native_layout,
++                                generation,
++                            },
++                            entry_bytes,
++                        );
++                        return Some((
++                            payload,
++                            LinearSampleIdentity {
++                                key: identity_key,
++                                generation,
++                            },
++                            native_layout,
++                        ));
++                    }
++                    state.type11_memo_scratch = scratch;
++                }
++            }
++        }
++    }
+     let sample_fmt = effective_view_sample_format(MTL_FORMAT_BGRA8_UNORM, None)?;
+     let stride = w.saturating_mul(RGBA8_BPP);
+     let span = host_alloc_len((stride as u64).checked_mul(h as u64)?)?;
+     if span == 0 {
+         return None;
+     }
+-    // Coherence re-read: land any resident-authoritative writeback and read the
+-    // current native BGRA (read_mapping_bgra8 runs ensure_resolved_for_scanout +
+-    // flush internally). Reuse the scratch so a memo hit costs no allocation.
+     let mut scratch = std::mem::take(&mut state.type11_memo_scratch);
+     prepare_memo_scratch(
+         &mut scratch,
+@@ -5775,15 +6038,8 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
+         state.type11_memo_scratch = scratch;
+         return None;
+     }
+-    // Identity key namespace: bits 63+62 mark type-11 memo content, distinct from
+-    // raw-GVA keys (bit 63 clear) and type-5 view keys (bit 63 set, bit 62 clear).
+-    // Every producer draws its generation from
+-    // `DeviceState::next_sampled_content_generation`, so a (key, generation)
+-    // pair is unique device-wide and content can never alias on a collision.
+-    let identity_key = (1u64 << 63) | (1u64 << 62) | mid as u64;
+-    let key = (mid, w, h);
+     if let Some(m) = state.type11_memo.get_touch(&key) {
+-        if m.native == scratch {
++        if m.layout == crate::contract::pixel_format::TexelLayout::Rgba8 && m.native == scratch {
+             let rgba = m.rgba.clone();
+             let generation = m.generation;
+             state.type11_memo_scratch = scratch;
+@@ -5793,10 +6049,10 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
+                     key: identity_key,
+                     generation,
+                 },
++                crate::contract::pixel_format::TexelLayout::Rgba8,
+             ));
+         }
+     }
+-    // First sight or the native bytes changed: convert BGRA→RGBA fresh.
+     let mut rgba = vec![0u8; span];
+     let converted = (0..h as usize).all(|y| {
+         let off = y * (stride as usize);
+@@ -5819,9 +6075,6 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
+         crate::model::GuestLinearMemo {
+             native: scratch,
+             rgba: rgba.clone(),
+-            // This rail converts every format to RGBA8 unconditionally — the
+-            // loop above is `convert_row_to_rgba8` with no native arm — so the
+-            // layout is fixed rather than chosen.
+             layout: crate::contract::pixel_format::TexelLayout::Rgba8,
+             generation,
+         },
+@@ -5833,6 +6086,7 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
+             key: identity_key,
+             generation,
+         },
++        crate::contract::pixel_format::TexelLayout::Rgba8,
+     ))
+ }
+ 
+diff --git a/crates/reims-vgpu/src/runtime/draw/tests.rs b/crates/reims-vgpu/src/runtime/draw/tests.rs
+index b8154730f..de08e9f55 100644
+--- a/crates/reims-vgpu/src/runtime/draw/tests.rs
++++ b/crates/reims-vgpu/src/runtime/draw/tests.rs
+@@ -6141,6 +6141,7 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
+         store_action: MTL_STORE_ACTION_STORE,
+         clear_color: [0.0; 4],
+         target_seed_rgba: None,
++        target_seed_layout: None,
+         multisample_source_ref: 0,
+         memoryless: false,
+     };
+@@ -6349,6 +6350,7 @@ fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
+         store_action: MTL_STORE_ACTION_STORE,
+         clear_color: [0.0; 4],
+         target_seed_rgba: None,
++        target_seed_layout: None,
+         multisample_source_ref: 0,
+         memoryless: false,
+     };
+diff --git a/crates/reims-vgpu/src/runtime/draw/texture_view.rs b/crates/reims-vgpu/src/runtime/draw/texture_view.rs
+index f3f6abeaa..b704c3bb5 100644
+--- a/crates/reims-vgpu/src/runtime/draw/texture_view.rs
++++ b/crates/reims-vgpu/src/runtime/draw/texture_view.rs
+@@ -702,6 +702,10 @@ pub(crate) struct NativeUploads {
+     /// only exact path, for `float16`'s reason: the CPU arm keeps eight of each
+     /// channel's ten bits.
+     pub ten_bit: bool,
++    /// Upload guest 16-bit normalized colour (`RGBA16Unorm`) natively.
++    pub unorm16: bool,
++    /// Upload guest integer and float32 layouts (`Rg16Uint`, `Rg32Float`, `R32Float`) natively.
++    pub integer_and_float32: bool,
+ }
+ 
+ impl NativeUploads {
+@@ -711,6 +715,8 @@ impl NativeUploads {
+         bgra8: false,
+         float16: false,
+         ten_bit: false,
++        unorm16: false,
++        integer_and_float32: false,
+     };
+ 
+     /// Native BGRA8 only — the answer this parameter carried when it was a
+@@ -726,6 +732,8 @@ impl NativeUploads {
+         bgra8: true,
+         float16: false,
+         ten_bit: false,
++        unorm16: false,
++        integer_and_float32: false,
+     };
+ 
+     /// Every native layout the loaders can produce.
+@@ -739,6 +747,8 @@ impl NativeUploads {
+         bgra8: true,
+         float16: true,
+         ten_bit: true,
++        unorm16: true,
++        integer_and_float32: true,
+     };
+ }
+ 
+@@ -768,6 +778,11 @@ pub(crate) fn linear_native_upload_format(
+         SampledClass::Bgra8Unorm if native.bgra8 => TexelLayout::Bgra8,
+         SampledClass::Rgba16Float if native.float16 => TexelLayout::Rgba16Float,
+         SampledClass::Rg16Float if native.float16 => TexelLayout::Rg16Float,
++        SampledClass::R16Float if native.float16 => TexelLayout::R16Float,
++        SampledClass::Rgba16Unorm if native.unorm16 => TexelLayout::Rgba16Unorm,
++        SampledClass::Rg16Uint if native.integer_and_float32 => TexelLayout::Rg16Uint,
++        SampledClass::Rg32Float if native.integer_and_float32 => TexelLayout::Rg32Float,
++        SampledClass::R32Float if native.integer_and_float32 => TexelLayout::R32Float,
+         SampledClass::Rgb10a2Unorm if native.ten_bit => TexelLayout::Rgb10a2Unorm,
+         SampledClass::Bgr10a2Unorm if native.ten_bit => TexelLayout::Bgr10a2Unorm,
+         _ => return None,
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index cc7c73bf2..de7318df6 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -257,6 +257,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
+     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Prep);
+     // metal2vulkan path: load MTLB → AIR → SPIR-V → internal Vulkan engine offscreen.
+     let mut draw_rgba: Option<Vec<u8>> = None;
++    let mut draw_native: Option<(Vec<u8>, crate::contract::pixel_format::TexelLayout)> = None;
+     // Physical order of `draw_rgba`. A type-11 composite Store renders into a
+     // BGRA `Surface` resident, so its readback is already in guest scanout
+     // order; the pooled and GVA targets stay RGBA. Carried instead of assumed —
+@@ -274,8 +275,13 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
+     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
+         req.chain_resident_established = false;
+         match try_metal2vulkan_draw(state, host, req, writeback_guest) {
+-            Ok(M2vDrawSpan::Pixels { bytes, bgra }) => {
++            Ok(M2vDrawSpan::Pixels {
++                bytes,
++                bgra,
++                native,
++            }) => {
+                 draw_rgba = Some(bytes);
++                draw_native = native;
+                 draw_bgra = bgra;
+                 crate::observe::line(format!(
+                     "linux_m2v_draw ok pipe={} {}x{} vtx={}",
+@@ -313,6 +319,20 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
+                     // run exactly as it does for a Store that never skipped its
+                     // readback. `read_resident_chain` fail-logs a lost resident.
+                     note_type11_store_route("gva_store_sync");
++                    if let Some(expected_layout) = req
++                        .colors
++                        .first()
++                        .and_then(|c0| pixel_format::store_texel_order(c0.format))
++                        .filter(|layout| !layout.is_four_byte_color())
++                    {
++                        if let Ok(rb) =
++                            crate::backend::vulkan::engine::read_target_native(&identity)
++                        {
++                            if rb.layout == expected_layout {
++                                draw_native = Some((rb.pixels, rb.layout));
++                            }
++                        }
++                    }
+                     draw_rgba = read_resident_chain(req, &identity);
+                     crate::observe::line(format!(
+                         "linux_m2v_draw ok resident_gva_store pipe={} {}x{} gva={:#x} rgba={}",
+@@ -370,6 +390,22 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
+                         // readback the rail exists to avoid, which is the point —
+                         // the fallback is a cost, never a lost frame.
+                         note_type11_store_route("surface_resident_sync");
++                        if let Some(expected_layout) = req
++                            .colors
++                            .first()
++                            .and_then(|c0| state.mappings.get(&c0.mapping_id))
++                            .map(mapping_write::mapping_store_format)
++                            .and_then(pixel_format::store_texel_order)
++                            .filter(|layout| !layout.is_four_byte_color())
++                        {
++                            if let Ok(rb) =
++                                crate::backend::vulkan::engine::read_target_native(&identity)
++                            {
++                                if rb.layout == expected_layout {
++                                    draw_native = Some((rb.pixels, rb.layout));
++                                }
++                            }
++                        }
+                         draw_rgba = read_resident_chain(req, &identity);
+                         crate::observe::line(format!(
+                             "linux_m2v_draw ok resident_surface_store_sync_fallback pipe={} {}x{} mid={} rgba={}",
+@@ -507,28 +543,36 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
+                     // has to be written, because a record whose identity did not
+                     // resolve rendered into a pooled RGBA target.
+                     let mut bgra = rgba;
+-                    {
+-                        let _span = StoreCostSpan::new("t11_convert_us");
+-                        reorder_rb_in_place(&mut bgra, draw_bgra, true);
+-                    }
+-                    note_type11_store_route("cpu_portability");
+-                    // `write_bgra8`, not `write_rgba8_image_changed`: the frame is
+-                    // already in guest scanout order, and that entry point would
+-                    // have to exchange every row back to read it. Both share the
+-                    // same tail — residency-window invalidation,
+-                    // `mark_mapping_written`, and the `surface_cache` republish —
+-                    // so this is a substitution and not a narrowing. Its
+-                    // changed-span rung is not lost either: this call site has
+-                    // always passed `None` for the seed.
+-                    let ok = mapping_write::write_bgra8(
+-                        state,
+-                        host,
+-                        c0.mapping_id,
+-                        &bgra,
+-                        c0.width.saturating_mul(RGBA8_BPP),
+-                        c0.width,
+-                        c0.height,
+-                    );
++                    let native_ok = draw_native.as_ref().is_some_and(|(native_bytes, layout)| {
++                        mapping_write::write_native_uncached(
++                            state,
++                            host,
++                            c0.mapping_id,
++                            native_bytes,
++                            c0.width,
++                            c0.height,
++                            *layout,
++                        )
++                    });
++                    let ok = if native_ok {
++                        note_type11_store_route("cpu_portability");
++                        true
++                    } else {
++                        {
++                            let _span = StoreCostSpan::new("t11_convert_us");
++                            reorder_rb_in_place(&mut bgra, draw_bgra, true);
++                        }
++                        note_type11_store_route("cpu_portability");
++                        mapping_write::write_bgra8(
++                            state,
++                            host,
++                            c0.mapping_id,
++                            &bgra,
++                            c0.width.saturating_mul(RGBA8_BPP),
++                            c0.width,
++                            c0.height,
++                        )
++                    };
+                     // The synchronous route publishes through
+                     // `mark_mapping_written`, so the epoch it advanced to is
+                     // simply the mapping's current one — read immediately, for
+@@ -642,44 +686,72 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
+                 // above. `None` only when that walk could not name the span,
+                 // which is the pre-existing behaviour for a target this device
+                 // cannot resolve at all.
+-                let gva_ok = write_gva_rgba8_within(
+-                    state,
+-                    host,
+-                    req.task_id,
+-                    c0.target_gva,
+-                    c0.width,
+-                    c0.height,
+-                    c0.row_stride,
+-                    c0.format,
+-                    &rgba,
+-                    sync_store_pages.as_ref().map(|p| p.membership()),
+-                )
+-                .is_ok();
+-                // Discrete-GPU rail: type-2/3 encode into **texture_ref** + **GVA**
+-                // host caches (not surface_id mid map — list ids collide with
+-                // present mids;). Sample prefers GVA key then
+-                // texture_ref with live descriptor geom.
+-                if gva_ok {
+-                    let producer_object_type =
+-                        objects::lookup_list_entry(state, host, req.task_id, c0.texture_ref)
+-                            .map(|entry| entry.object_type)
+-                            .unwrap_or(0);
+-                    host_cache_store_gva_layer(
++                let native_written = if let Some((native_bytes, _layout)) = draw_native
++                    .as_ref()
++                    .filter(|(_, layout)| pixel_format::store_texel_order(c0.format) == Some(*layout))
++                {
++                    write_gva_native_within(
++                        state,
++                        host,
++                        req.task_id,
++                        c0.target_gva,
++                        c0.width,
++                        c0.height,
++                        c0.row_stride,
++                        c0.format,
++                        native_bytes,
++                        sync_store_pages.as_ref().map(|p| p.membership()),
++                    )
++                    .is_ok()
++                } else {
++                    false
++                };
++                let gva_ok = if native_written {
++                    if c0.target_gva != 0 {
++                        crate::runtime::surface_cache::evict_gva(state, c0.target_gva);
++                    }
++                    if c0.texture_ref != 0 {
++                        crate::runtime::surface_cache::evict_texture(
++                            state,
++                            req.task_id,
++                            c0.texture_ref,
++                        );
++                    }
++                    true
++                } else {
++                    let ok = write_gva_rgba8_within(
+                         state,
+                         host,
+                         req.task_id,
+-                        c0.texture_ref,
+-                        producer_object_type,
+                         c0.target_gva,
+                         c0.width,
+                         c0.height,
++                        c0.row_stride,
++                        c0.format,
+                         &rgba,
+-                        // Inside `if gva_ok`: this arm only runs when
+-                        // `write_gva_rgba8_within` landed the same bytes in the
+-                        // guest's pages, so they are re-derivable from there.
+-                        true,
+-                    );
+-                }
++                        sync_store_pages.as_ref().map(|p| p.membership()),
++                    )
++                    .is_ok();
++                    if ok {
++                        let producer_object_type =
++                            objects::lookup_list_entry(state, host, req.task_id, c0.texture_ref)
++                                .map(|entry| entry.object_type)
++                                .unwrap_or(0);
++                        host_cache_store_gva_layer(
++                            state,
++                            host,
++                            req.task_id,
++                            c0.texture_ref,
++                            producer_object_type,
++                            c0.target_gva,
++                            c0.width,
++                            c0.height,
++                            &rgba,
++                            true,
++                        );
++                    }
++                    ok
++                };
+                 let (rgb_nz, max_rgb) = rgb_stats(&rgba);
+                 // A Store that lands is expected control flow and belongs on
+                 // the census channel, not the failure one — "non-OFF lines are
+@@ -953,7 +1025,7 @@ pub(super) enum AttachmentAliasSample<'a> {
+     /// bytes rather than a decoded value: an sRGB attachment holds encoded ones,
+     /// and a bind that samples them linear hands the shader an undecoded value
+     /// the next attachment write then encodes a second time.
+-    Seed(&'a [u8], u16),
++    Seed(&'a [u8], SampledByteFormat),
+     /// Records 2+ of a resident GVA chain: the prior record's content lives
+     /// on the engine-resident target, not in a CPU seed. Bound as a resident
+     /// sampled source (the engine snapshots on self-alias).
+@@ -999,9 +1071,10 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
+         .filter(names_it)
+         .find(|color| color.slot == texture_index)
+         .or_else(|| req.colors.iter().find(names_it))?;
++    let seed_layout = color.target_seed_layout.unwrap_or(TexelLayout::Rgba8);
+     let need = (color.width as usize)
+         .checked_mul(color.height as usize)?
+-        .checked_mul(RGBA8_BPP as usize)?;
++        .checked_mul(seed_layout.bytes_per_texel() as usize)?;
+     match color.load_action {
+         MTL_LOAD_ACTION_CLEAR => Some((
+             color.width,
+@@ -1017,7 +1090,10 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
+                 return Some((
+                     color.width,
+                     color.height,
+-                    AttachmentAliasSample::Seed(seed, color.format),
++                    AttachmentAliasSample::Seed(
++                        seed,
++                        SampledByteFormat::from_source(seed_layout, color.format),
++                    ),
+                 ));
+             }
+             if req.chain_from_resident {
+@@ -1175,8 +1251,19 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
+         // The opcode-9 descriptor's own pixel format. The loader converts to
+         // RGBA8 order and decodes nothing, so the transfer function the guest
+         // declared is still the one these bytes carry.
+-        let source = bt.desc.pixel_format;
+-        let (w, h, rgba) = load_buffer_texture_rgba(state, host, task_id, texture_ref, &bt)?;
++        let source = if bt.desc.pixel_format != 0 {
++            bt.desc.pixel_format
++        } else {
++            MTL_FORMAT_BGRA8_UNORM
++        };
++        let (w, h, rgba, byte_format) = load_buffer_texture_sampled(
++            state,
++            host,
++            task_id,
++            texture_ref,
++            &bt,
++            native_uploads_for(source),
++        )?;
+         return Some((
+             w,
+             h,
+@@ -1184,7 +1271,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
+             SampledSourceRequest::Bytes(
+                 std::sync::Arc::new(rgba),
+                 None,
+-                SampledByteFormat::from_source(TexelLayout::Rgba8, source),
++                byte_format,
+                 crate::backend::vulkan::engine::SampledByteOrigin::BufferBackedTexture,
+             ),
+         ));
+@@ -1247,7 +1334,14 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
+                 }
+                 crate::runtime::drain::note_store_route("buftex_view");
+                 bt.desc.pixel_format = format;
+-                let (w, h, rgba) = load_buffer_texture_rgba(state, host, task_id, base, &bt)?;
++                let (w, h, rgba, byte_format) = load_buffer_texture_sampled(
++                    state,
++                    host,
++                    task_id,
++                    base,
++                    &bt,
++                    native_uploads_for(format),
++                )?;
+                 return Some((
+                     w,
+                     h,
+@@ -1255,7 +1349,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
+                     SampledSourceRequest::Bytes(
+                         std::sync::Arc::new(rgba),
+                         None,
+-                        SampledByteFormat::from_source(TexelLayout::Rgba8, format),
++                        byte_format,
+                         crate::backend::vulkan::engine::SampledByteOrigin::BufferBackedTexture,
+                     ),
+                 ));
+@@ -1790,7 +1884,9 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
+                 // returns a content identity so the engine skips re-hash+upload;
+                 // its census (T11Memo hit / T11Guest fill) is emitted internally.
+                 let memo_source = crate::runtime::draw::mapping_declared_format(state, mid, None);
+-                if let Some((rgba, identity)) = load_type11_rgba_memoized(state, host, mid) {
++                if let Some((rgba, identity, layout)) =
++                    load_type11_rgba_memoized(state, host, mid, native_uploads_for(memo_source))
++                {
+                     note_type11_sample_rung("t11rung_guest_memo", guest_write);
+                     return Some((
+                         w,
+@@ -1799,7 +1895,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
+                         SampledSourceRequest::Bytes(
+                             rgba,
+                             Some(identity),
+-                            SampledByteFormat::from_source(TexelLayout::Rgba8, memo_source),
++                            SampledByteFormat::from_source(layout, memo_source),
+                             crate::backend::vulkan::engine::SampledByteOrigin::SurfaceGuestFallback,
+                         ),
+                     ));
+@@ -2528,6 +2624,50 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
+     } else {
+         try_type11_target_guest_seed(state, host, mapping_id, w, h, target_format)
+             .map(|seed| (Type11LoadSeed::Guest(seed), Type11SeedRung::GuestPages))
++            .or_else(|| {
++                let target_layout = translate::pixel::texel_layout_of(target_format)
++                    .filter(|layout| !layout.is_four_byte_color())?;
++                if !mapper::ensure_resolved_for_scanout(state, host, mapping_id) {
++                    return None;
++                }
++                let (base_off, surface_bpr, span_end) = {
++                    let m = state.mappings.get(&mapping_id)?;
++                    let fmt = mapping_write::mapping_store_format(m);
++                    if pixel_format::store_texel_order(fmt) != Some(target_layout) {
++                        return None;
++                    }
++                    mapping_write::type11_sample_window(m, w, h, fmt)?
++                };
++                let bpp = target_layout.bytes_per_texel();
++                let tight = w.checked_mul(bpp)?;
++                let len = host_alloc_len((tight as u64).checked_mul(h as u64)?)?;
++                let mut native = vec![0u8; len];
++                if !mapping_write::read_rect_raw_at(
++                    state,
++                    host,
++                    mapping_id,
++                    mapping_write::SurfaceWindow {
++                        base_off,
++                        bpr: surface_bpr,
++                        span_end,
++                        bpp,
++                    },
++                    mapping_write::Rect {
++                        origin_x: 0,
++                        origin_y: 0,
++                        width: w,
++                        height: h,
++                    },
++                    &mut native,
++                    tight,
++                ) {
++                    return None;
++                }
++                Some((
++                    Type11LoadSeed::Host(std::sync::Arc::new(native), SeedOrder::Native(target_layout)),
++                    Type11SeedRung::GuestPages,
++                ))
++            })
+             .or_else(|| {
+                 load_type11_mapping_rgba(state, host, mapping_id, None)
+                     .map(|(_, _, r)| r)
+@@ -2705,12 +2845,27 @@ pub(super) fn load_type5_view_rgba<M: HostMemory + HostOps>(
+     // are named here rather than left to it.
+     // The layout is the view's own; the transfer function travels with it,
+     // because the default arm below converts to RGBA8 order and decodes nothing.
++    let native_uploads = native_uploads_for(view.pixel_format);
+     let byte_format = SampledByteFormat::from_source(
+         match view.pixel_format {
+             pixel_format::MTL_FORMAT_RG8_UNORM => TexelLayout::Rg8,
+             pixel_format::MTL_FORMAT_R16_UNORM => TexelLayout::R16Unorm,
+             pixel_format::MTL_FORMAT_RG16_UNORM => TexelLayout::Rg16Unorm,
++            pixel_format::MTL_FORMAT_RGBA16_UNORM if native_uploads.unorm16 => {
++                TexelLayout::Rgba16Unorm
++            }
++            pixel_format::MTL_FORMAT_RGBA16_FLOAT if native_uploads.float16 => {
++                TexelLayout::Rgba16Float
++            }
++            pixel_format::MTL_FORMAT_RG16_FLOAT if native_uploads.float16 => {
++                TexelLayout::Rg16Float
++            }
++            pixel_format::MTL_FORMAT_R16_FLOAT if native_uploads.float16 => {
++                TexelLayout::R16Float
++            }
+             pixel_format::MTL_FORMAT_RG16_UINT => TexelLayout::Rg16Uint,
++            pixel_format::MTL_FORMAT_RG32_FLOAT => TexelLayout::Rg32Float,
++            pixel_format::MTL_FORMAT_R32_FLOAT => TexelLayout::R32Float,
+             pixel_format::MTL_FORMAT_RGB10A2_UNORM => TexelLayout::Rgb10a2Unorm,
+             pixel_format::MTL_FORMAT_BGR10A2_UNORM => TexelLayout::Bgr10a2Unorm,
+             pixel_format::MTL_FORMAT_RG11B10_FLOAT => TexelLayout::Rg11b10Float,
+@@ -5131,33 +5286,31 @@ fn native_scratch_to_upload(
+ /// change the answer for — so keying on it is the same rule stated once, not a
+ /// fast path that could disagree with the slow one.
+ fn native_uploads_for(sample_format: u16) -> NativeUploads {
+-    if !pixel_format::narrows_to_unorm8(sample_format) {
++    if !pixel_format::narrows_to_unorm8(sample_format)
++        && !matches!(
++            sample_format,
++            pixel_format::MTL_FORMAT_R16_FLOAT
++                | pixel_format::MTL_FORMAT_RGBA16_UNORM
++                | pixel_format::MTL_FORMAT_RG16_UINT
++                | pixel_format::MTL_FORMAT_RG32_FLOAT
++                | pixel_format::MTL_FORMAT_R32_FLOAT
++        )
++    {
+         return NativeUploads::BGRA8;
+     }
+     native_uploads_asking_host()
+ }
+ 
+-/// The same answer for a caller that does not yet know the guest format.
+-///
+-/// The last-resort sampled rung resolves the format inside the loader, so it
+-/// cannot key the question the way the hot rung does — and it does not need to:
+-/// `settle_linear_texture_sampled` read **0** across a four-rail sweep, because
+-/// every rung above it serves. A lock on a path that does not run is not a cost.
+ fn native_uploads_asking_host() -> NativeUploads {
+     use crate::backend::vulkan::engine;
+     NativeUploads {
+-        // One flag for both half-float layouts, so the answer is the
+-        // conjunction: a host that filters one and not the other keeps neither
+-        // on the native rail. Nothing on record separates them — both carry
+-        // `SAMPLED_IMAGE_FILTER_LINEAR` by mandate — and a per-layout flag
+-        // would be two fields nobody could point at a host that needed them.
+         float16: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba16Float)
+-            && engine::supports_sampled_layout_linear_filter(TexelLayout::Rg16Float),
+-        // The same conjunction for the two ten-bit orders. Vulkan requires the
+-        // filter for `A2B10G10R10_UNORM_PACK32` and not for its sibling, so the
+-        // answer is asked rather than assumed.
++            && engine::supports_sampled_layout_linear_filter(TexelLayout::Rg16Float)
++            && engine::supports_sampled_layout_linear_filter(TexelLayout::R16Float),
+         ten_bit: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgb10a2Unorm)
+             && engine::supports_sampled_layout_linear_filter(TexelLayout::Bgr10a2Unorm),
++        unorm16: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba16Unorm),
++        integer_and_float32: true,
+         ..NativeUploads::BGRA8
+     }
+ }
+@@ -6171,7 +6324,11 @@ enum M2vDrawSpan {
+     /// writeback — all want guest scanout order, and a BGRA resident hands them
+     /// exactly that. Normalizing to RGBA here would restate a whole framebuffer
+     /// per Store purely to have the Store restate it back.
+-    Pixels { bytes: Vec<u8>, bgra: bool },
++    Pixels {
++        bytes: Vec<u8>,
++        bgra: bool,
++        native: Option<(Vec<u8>, crate::contract::pixel_format::TexelLayout)>,
++    },
+     /// Intermediate record of a resident render-pass chain: content stays on
+     /// the protocol-keyed engine target (no CPU pixels, no fence wait, no guest
+     /// Store this record). The final record reads back and performs the
+@@ -6743,8 +6900,25 @@ pub(super) fn honour_gva_load_elision<M: HostMemory + HostOps>(
+                      an undefined attachment)"
+                 ));
+             }
++            let target_fmt = req.colors.first().map(|c0| c0.format).unwrap_or(0);
++            let native_reseed = seed_color_load_native(
++                state,
++                host,
++                req.task_id,
++                tex_ref,
++                gva,
++                cw,
++                ch,
++                target_fmt,
++            );
+             if let Some(c0) = req.colors.first_mut() {
+-                c0.target_seed_rgba = seed;
++                if let Some((bytes, layout)) = native_reseed {
++                    c0.target_seed_rgba = Some(bytes);
++                    c0.target_seed_layout = (layout != TexelLayout::Rgba8).then_some(layout);
++                } else {
++                    c0.target_seed_rgba = seed;
++                    c0.target_seed_layout = None;
++                }
+             }
+             None
+         }
+@@ -7535,13 +7709,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+                                     crate::backend::vulkan::engine::SampledByteOrigin::AttachmentAlias,
+                                 ),
+                             ),
+-                            AttachmentAliasSample::Seed(seed, stored) => (
++                            AttachmentAliasSample::Seed(seed, byte_format) => (
+                                 aw,
+                                 ah,
+                                 SampledSourceRequest::Bytes(
+                                     std::sync::Arc::new(seed.to_vec()),
+                                     None,
+-                                    SampledByteFormat::from_source(TexelLayout::Rgba8, stored),
++                                    byte_format,
+                                     crate::backend::vulkan::engine::SampledByteOrigin::AttachmentAlias,
+                                 ),
+                             ),
+@@ -8264,10 +8438,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+                     let mut seed_door = "none";
+                     if let Some(seed) = c0.target_seed_rgba.as_ref() {
+                         seed_door = "color_seed";
+-                        if seed.len() == (w as usize) * (h as usize) * 4 {
+-                            // seed_color_load selected this by RT provenance.
+-                            // Black/transparent bytes are valid attachment data.
++                        let bpp = c0
++                            .target_seed_layout
++                            .map(|l| l.bytes_per_texel() as usize)
++                            .unwrap_or(4);
++                        if seed.len() == (w as usize) * (h as usize) * bpp {
+                             target_rgba8 = Some(std::sync::Arc::new(seed.clone()));
++                            if let Some(layout) = c0.target_seed_layout {
++                                seed_order =
++                                    crate::backend::vulkan::engine::SeedOrder::Native(layout);
++                            }
+                         }
+                     } else if c0.mapping_id != 0 {
+                         seed_door = "mapping";
+@@ -8580,14 +8760,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+                 }
+             }
+         }
+-        if gpu_only_content_allowed && store_is_store && writeback_guest {
++        if store_is_store && writeback_guest {
+             if let Some(identity) = gva_chain_identity(req) {
+-                // Only the eligibility call can still vary here: the enclosing
+-                // `&&` already established `store_is_store && writeback_guest`.
+-                // (The sibling rail above re-tests its pair for real, because
+-                // its outer condition is an `||`.)
+-                if gva_store_defer_eligible(req) {
+-                    resources.target_identity = Some(identity.clone());
++                resources.target_identity = Some(identity.clone());
++                if gpu_only_content_allowed && gva_store_defer_eligible(req) {
+                     resources.skip_readback = true;
+                     gva_resident_store = Some(identity);
+                 }
+@@ -9383,6 +9559,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+         Ok(M2vDrawSpan::Pixels {
+             bytes: pixels,
+             bgra: pixels_bgra,
++            native: out.native_pixels,
+         })
+     }
+ }
+diff --git a/crates/reims-vgpu/src/runtime/exec/mod.rs b/crates/reims-vgpu/src/runtime/exec/mod.rs
+index 8f6705265..e6ced75a6 100644
+--- a/crates/reims-vgpu/src/runtime/exec/mod.rs
++++ b/crates/reims-vgpu/src/runtime/exec/mod.rs
+@@ -3649,6 +3649,7 @@ fn finish_stream_draws<M: HostMemory + HostOps>(
+                         MultiDrawChainSource::Cpu => {
+                             if let Some(c0) = req.colors.first_mut() {
+                                 c0.target_seed_rgba = chain_rgba.take();
++                                c0.target_seed_layout = None;
+                             }
+                         }
+                         MultiDrawChainSource::Missing => {
+@@ -4040,6 +4041,7 @@ fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::Dra
+             store_action: c.store_action,
+             clear_color: c.clear_color,
+             target_seed_rgba: None,
++            target_seed_layout: None,
+             multisample_source_ref: c.multisample_source_ref,
+             memoryless: c.memoryless,
+         })
+diff --git a/crates/reims-vgpu/src/runtime/exec/tests.rs b/crates/reims-vgpu/src/runtime/exec/tests.rs
+index 2413a34f1..9b13b88ba 100644
+--- a/crates/reims-vgpu/src/runtime/exec/tests.rs
++++ b/crates/reims-vgpu/src/runtime/exec/tests.rs
+@@ -2282,6 +2282,7 @@ fn render_pass_template_reuses_attachment_without_load_seed() {
+             store_action: MTL_STORE_ACTION_STORE,
+             clear_color: [0.1, 0.2, 0.3, 1.0],
+             target_seed_rgba: Some(vec![0xbb; 16]),
++            target_seed_layout: None,
+             multisample_source_ref: 0,
+             memoryless: false,
+         }],
+diff --git a/crates/reims-vgpu/src/runtime/mapping_write/mod.rs b/crates/reims-vgpu/src/runtime/mapping_write/mod.rs
+index c5b8da11f..3eccaac12 100644
+--- a/crates/reims-vgpu/src/runtime/mapping_write/mod.rs
++++ b/crates/reims-vgpu/src/runtime/mapping_write/mod.rs
+@@ -623,6 +623,64 @@ pub fn write_bgra8_uncached<M: HostMemory + HostOps>(
+     )
+ }
+ 
++/// Write tight native texels into a type-11 mapping whose declared format
++/// matches `resident_layout` (e.g. `RGBA16Float`, `BGR10A2Unorm`, `RGB10A2Unorm`,
++/// `RG16Float`, `R16Float`, `RG16Uint`), invalidating the 8-bit `surface_cache`
++/// and stamping `guest_write_gen`.
++pub fn write_native_uncached<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    mapping_id: u32,
++    src: &[u8],
++    width: u32,
++    height: u32,
++    resident_layout: pixel_format::TexelLayout,
++) -> bool {
++    if !scanout_extent_ok(width, height) {
++        return false;
++    }
++    let (base_off, surface_bpr, span_end, bpp) = {
++        let Some(m) = state.mappings.get(&mapping_id) else {
++            return false;
++        };
++        if !m.mapped || m.page_entries.is_empty() {
++            return false;
++        }
++        let (mw, mh, format) = mapping_write_geometry(m, width, height);
++        if mw != width || mh != height {
++            return false;
++        }
++        if pixel_format::store_texel_order(format) != Some(resident_layout) {
++            return false;
++        }
++        let Some((base_off, bpr, span_end)) = type11_sample_window(m, mw, mh, format) else {
++            return false;
++        };
++        (base_off, bpr, span_end, resident_layout.bytes_per_texel())
++    };
++    let Some(src_stride) = width.checked_mul(bpp) else {
++        return false;
++    };
++    if !write_full_rect_raw_at(
++        state,
++        host,
++        mapping_id,
++        base_off,
++        surface_bpr,
++        span_end,
++        width,
++        height,
++        bpp,
++        src,
++        src_stride,
++    ) {
++        return false;
++    }
++    crate::runtime::surface_cache::forget(state, mapping_id);
++    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
++    true
++}
++
+ /// A check that stopped a resident's frame from reaching the guest's pages
+ /// without a host copy, so the flush owes the copying rail instead.
+ ///
+diff --git a/crates/reims-vgpu/src/runtime/render_writeback.rs b/crates/reims-vgpu/src/runtime/render_writeback.rs
+index d80c43c1e..00543e90c 100644
+--- a/crates/reims-vgpu/src/runtime/render_writeback.rs
++++ b/crates/reims-vgpu/src/runtime/render_writeback.rs
+@@ -945,6 +945,37 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
+         leased => {
+             drop(leased);
+             crate::runtime::drain::note_store_route("render_flush_copied");
++            let native_layout = state
++                .mappings
++                .get(&mapping_id)
++                .map(crate::runtime::mapping_write::mapping_store_format)
++                .and_then(crate::contract::pixel_format::store_texel_order)
++                .filter(|layout| !layout.is_four_byte_color());
++            if let Some(expected_layout) = native_layout {
++                if let Ok(rb) = crate::backend::vulkan::engine::read_target_native(identity) {
++                    if rb.layout == expected_layout {
++                        let len = rb.pixels.len();
++                        let ok = crate::runtime::mapping_write::write_native_uncached(
++                            state,
++                            host,
++                            mapping_id,
++                            &rb.pixels,
++                            width,
++                            height,
++                            rb.layout,
++                        );
++                        if ok {
++                            crate::runtime::drain::note_store_route("render_flush_copied_native");
++                            crate::runtime::drain::note_readback_phase(
++                                crate::runtime::drain::ReadbackPhase::Write,
++                                write_started.elapsed().as_micros() as u64,
++                            );
++                            finish(state, mapping_id, identity, len, started, false);
++                            return true;
++                        }
++                    }
++                }
++            }
+             match crate::backend::vulkan::engine::read_target(identity) {
+                 Ok(rb) => {
+                     // Shared rather than owned outright: the write's tail
+@@ -1289,6 +1320,37 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
+     // pass and not the no-op this comment used to claim. Both spellings of that
+     // declaration must reach the same answer; `ResidentReadSnapshot::bgra` is
+     // where they do, and where they did not.
++    if let Some(expected_layout) = crate::contract::pixel_format::store_texel_order(c0.format)
++        .filter(|layout| !layout.is_four_byte_color())
++    {
++        let rb = crate::backend::vulkan::engine::read_target_native(identity)
++            .map_err(|inner| GvaWritebackDecline::CopiedReadRefused { inner })?;
++        if rb.layout == expected_layout {
++            let Some(tight) = crate::contract::pixel_format::tight_row_bytes(c0.width, c0.format)
++            else {
++                return Err(GvaWritebackDecline::FormatNeedsConversion { format: c0.format });
++            };
++            let extent = u64::from(c0.height.saturating_sub(1)) * u64::from(c0.row_stride)
++                + u64::from(tight);
++            crate::runtime::draw::write_gva_native_within(
++                state,
++                host,
++                task_id,
++                c0.target_gva,
++                c0.width,
++                c0.height,
++                c0.row_stride,
++                c0.format,
++                &rb.pixels,
++                Some(pages.membership()),
++            )
++            .map_err(|err| GvaWritebackDecline::CopiedWriteRefused { err })?;
++            forget_gva_host_copies(state, task_id, c0.target_gva, texture_ref);
++            crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
++            crate::runtime::drain::note_store_route("gva_flush_copied_native");
++            return Ok(extent);
++        }
++    }
+     let rgba = crate::backend::vulkan::engine::read_target(identity)
+         .map_err(|inner| GvaWritebackDecline::CopiedReadRefused { inner })?
+         .into_rgba8();
+-- 
+2.43.0
+

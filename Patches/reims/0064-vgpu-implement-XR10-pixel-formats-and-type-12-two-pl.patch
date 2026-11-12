@@ -1,0 +1,1822 @@
+From 347d81724c74ebcf7dfeaaeac26dc23b96da75b9 Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Thu, 12 Nov 2026 04:05:16 +0800
+Subject: [PATCH 64/68] vgpu: implement XR10 pixel formats and type-12
+ two-plane alpha
+
+---
+ .../src/backend/vulkan/translate/pixel.rs     |  56 ++
+ .../reims-vgpu/src/contract/pixel_format.rs   | 486 +++++++++++++++++-
+ .../src/runtime/decode/resource/mod.rs        |  71 ++-
+ crates/reims-vgpu/src/runtime/draw/mod.rs     | 250 ++++++++-
+ crates/reims-vgpu/src/runtime/draw/tests.rs   | 129 +++++
+ .../src/runtime/draw/texture_view.rs          | 116 +++++
+ crates/reims-vgpu/src/runtime/draw/vulkan.rs  | 304 +++++++++--
+ crates/reims-vgpu/src/runtime/heap_query.rs   |  21 +
+ 8 files changed, 1364 insertions(+), 69 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/backend/vulkan/translate/pixel.rs b/crates/reims-vgpu/src/backend/vulkan/translate/pixel.rs
+index 3f6f5f1d2..39f520136 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/translate/pixel.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/translate/pixel.rs
+@@ -164,6 +164,13 @@ pub fn translate(mtl: u16) -> Result<PixelFormat, TranslateReason> {
+         p::MTL_FORMAT_RGBA16_UNORM => linear(vk::Format::R16G16B16A16_UNORM, 8),
+         p::MTL_FORMAT_RGBA16_UINT => linear(vk::Format::R16G16B16A16_UINT, 8),
+         p::MTL_FORMAT_RGBA16_FLOAT => linear(vk::Format::R16G16B16A16_SFLOAT, 8),
++        p::MTL_FORMAT_RGB10A8_2P_XR10
++        | p::MTL_FORMAT_RGB10A8_2P_XR10_SRGB
++        | p::MTL_FORMAT_BGR10_XR
++        | p::MTL_FORMAT_BGR10_XR_SRGB => linear(vk::Format::R16G16B16A16_SFLOAT, 4),
++        p::MTL_FORMAT_BGRA10_XR | p::MTL_FORMAT_BGRA10_XR_SRGB => {
++            linear(vk::Format::R16G16B16A16_SFLOAT, 8)
++        }
+         p::MTL_FORMAT_RGBA32_UINT => linear(vk::Format::R32G32B32A32_UINT, 16),
+         p::MTL_FORMAT_RGBA32_FLOAT => linear(vk::Format::R32G32B32A32_SFLOAT, 16),
+         p::MTL_FORMAT_DEPTH16_UNORM => linear(vk::Format::D16_UNORM, 2),
+@@ -215,6 +222,13 @@ pub fn sampled_pixels(
+     mtl: u16,
+ ) -> Result<(TexelLayout, Option<TranslateReason>, SwizzlePlan), TranslateReason> {
+     let f = translate(mtl)?;
++    // XR10 guest memory stores 10-bit fixed-point (plus a separate Plane 1 alpha
++    // on 550/551), never raw IEEE binary16 texels; decline raw guest-RAM import
++    // so sampled loads decode into `Rgba16Float` on the CPU upload rail while
++    // GPU-resident targets still sample `R16G16B16A16_SFLOAT` directly.
++    if pixel_format::is_xr10(mtl) {
++        return Err(TranslateReason::NoSampledLayout(mtl));
++    }
+     // A format whose Metal channels do not sit identically on its Vulkan
+     // channels needs a component mapping on the view to sample correctly.
+     let layout = match f.linear_vk {
+@@ -1335,6 +1349,42 @@ mod tests {
+             4,
+             TransferFunction::Linear,
+         ),
++        (
++            p::MTL_FORMAT_RGB10A8_2P_XR10,
++            vk::Format::R16G16B16A16_SFLOAT,
++            4,
++            TransferFunction::Linear,
++        ),
++        (
++            p::MTL_FORMAT_RGB10A8_2P_XR10_SRGB,
++            vk::Format::R16G16B16A16_SFLOAT,
++            4,
++            TransferFunction::Linear,
++        ),
++        (
++            p::MTL_FORMAT_BGRA10_XR,
++            vk::Format::R16G16B16A16_SFLOAT,
++            8,
++            TransferFunction::Linear,
++        ),
++        (
++            p::MTL_FORMAT_BGRA10_XR_SRGB,
++            vk::Format::R16G16B16A16_SFLOAT,
++            8,
++            TransferFunction::Linear,
++        ),
++        (
++            p::MTL_FORMAT_BGR10_XR,
++            vk::Format::R16G16B16A16_SFLOAT,
++            4,
++            TransferFunction::Linear,
++        ),
++        (
++            p::MTL_FORMAT_BGR10_XR_SRGB,
++            vk::Format::R16G16B16A16_SFLOAT,
++            4,
++            TransferFunction::Linear,
++        ),
+     ];
+ 
+     /// The table is total over the contract: every defined value maps, with the
+@@ -2003,6 +2053,12 @@ mod tests {
+                 // half-float primary was not.
+                 p::MTL_FORMAT_RGBA16_UNORM,
+                 p::MTL_FORMAT_RGBA16_FLOAT,
++                p::MTL_FORMAT_RGB10A8_2P_XR10,
++                p::MTL_FORMAT_RGB10A8_2P_XR10_SRGB,
++                p::MTL_FORMAT_BGRA10_XR,
++                p::MTL_FORMAT_BGRA10_XR_SRGB,
++                p::MTL_FORMAT_BGR10_XR,
++                p::MTL_FORMAT_BGR10_XR_SRGB,
+             ]
+         );
+     }
+diff --git a/crates/reims-vgpu/src/contract/pixel_format.rs b/crates/reims-vgpu/src/contract/pixel_format.rs
+index 82258b599..8a08314fe 100644
+--- a/crates/reims-vgpu/src/contract/pixel_format.rs
++++ b/crates/reims-vgpu/src/contract/pixel_format.rs
+@@ -86,20 +86,59 @@ pub const MTL_FORMAT_RGBA8_UNORM_SRGB: u16 = 0x47;
+ pub const MTL_FORMAT_RGBA8_UINT: u16 = 0x49;
+ pub const MTL_FORMAT_RGBA8_SINT: u16 = 0x4a;
+ pub const MTL_FORMAT_BGRA8_UNORM: u16 = 0x50;
+-/// A private format macOS 27 declares its Setup Assistant icon, panel and
+-/// memoryless textures in, and asks heap placement for. Four bytes a texel; it
+-/// is only ever rendered and sampled on the GPU, so it is stored as BGRA8.
+-pub const MTL_FORMAT_PRIVATE_550: u16 = 550;
+-
+-/// The format a texture declared in `raw` is stored and drawn in. The identity
+-/// for every format but [`MTL_FORMAT_PRIVATE_550`]; every wire decode passes
+-/// its pixel format through here, so no table below needs to name 550.
++/// Apple Silicon extended-range (XR10) pixel formats (`MTLPixelFormat.h` 550..=555).
++///
++/// `550` (`RGB10A8_2p_XR10`, FourCC `'b3a8'` / `'&b38'`) and `551` (its mirrored-sRGB
++/// sibling) store a 32-bit `BGR10_XR` Plane 0 (`4` Bpp: `b10 | (g10 << 10) | (r10 << 20)`)
++/// paired with an 8-bit `R8Unorm` alpha Plane 1 (`1` Bpp) carried in the second
++/// level-0 layout record of an [`OBJECT_TYPE_TWIN_LAYOUT_TEXTURE`] (`type-12`)
++/// descriptor. `552`/`553` (`BGRA10_XR`) store four 16-bit words `[B, G, R, A]`
++/// with each 10-bit XR code in bits `[6..15]`. `554`/`555` (`BGR10_XR`) store the
++/// single-plane 32-bit `b10 | (g10 << 10) | (r10 << 20)` word with opaque alpha.
++///
++/// On the GPU, all six render and sample as `VK_FORMAT_R16G16B16A16_SFLOAT` so
++/// negative and `> 1.0` extended-range channels survive without `[0, 1]` clamping.
++pub const MTL_FORMAT_RGB10A8_2P_XR10: u16 = 550;
++pub const MTL_FORMAT_RGB10A8_2P_XR10_SRGB: u16 = 551;
++pub const MTL_FORMAT_BGRA10_XR: u16 = 552;
++pub const MTL_FORMAT_BGRA10_XR_SRGB: u16 = 553;
++pub const MTL_FORMAT_BGR10_XR: u16 = 554;
++pub const MTL_FORMAT_BGR10_XR_SRGB: u16 = 555;
++
++/// Identity wire-format pass-through. Kept so wire decoders continue to funnel
++/// raw `u16` pixel formats through one contract entry point.
+ pub fn stored_format(raw: u16) -> u16 {
+-    if raw == MTL_FORMAT_PRIVATE_550 {
+-        MTL_FORMAT_BGRA8_UNORM
+-    } else {
+-        raw
+-    }
++    raw
++}
++
++pub fn is_xr10(format: u16) -> bool {
++    matches!(
++        format,
++        MTL_FORMAT_RGB10A8_2P_XR10
++            | MTL_FORMAT_RGB10A8_2P_XR10_SRGB
++            | MTL_FORMAT_BGRA10_XR
++            | MTL_FORMAT_BGRA10_XR_SRGB
++            | MTL_FORMAT_BGR10_XR
++            | MTL_FORMAT_BGR10_XR_SRGB
++    )
++}
++
++pub fn is_two_plane_xr10(format: u16) -> bool {
++    matches!(
++        format,
++        MTL_FORMAT_RGB10A8_2P_XR10 | MTL_FORMAT_RGB10A8_2P_XR10_SRGB
++    )
++}
++
++pub fn alpha_plane_bytes_per_pixel(format: u16) -> Option<u32> {
++    is_two_plane_xr10(format).then_some(R8_BPP)
++}
++
++fn is_xr10_srgb(format: u16) -> bool {
++    matches!(
++        format,
++        MTL_FORMAT_RGB10A8_2P_XR10_SRGB | MTL_FORMAT_BGRA10_XR_SRGB | MTL_FORMAT_BGR10_XR_SRGB
++    )
+ }
+ pub const MTL_FORMAT_BGRA8_UNORM_SRGB: u16 = 0x51;
+ /// `MTLPixelFormatRGB10A2Unorm`. Ten bits per colour channel and two of alpha,
+@@ -795,6 +834,10 @@ pub fn bytes_per_pixel(format: u16) -> Option<u32> {
+         | MTL_FORMAT_RGB10A2_UINT
+         | MTL_FORMAT_RG11B10_FLOAT
+         | MTL_FORMAT_BGR10A2_UNORM
++        | MTL_FORMAT_RGB10A8_2P_XR10
++        | MTL_FORMAT_RGB10A8_2P_XR10_SRGB
++        | MTL_FORMAT_BGR10_XR
++        | MTL_FORMAT_BGR10_XR_SRGB
+         | MTL_FORMAT_DEPTH32_FLOAT
+         | MTL_FORMAT_DEPTH24_UNORM_STENCIL8
+         | MTL_FORMAT_X24_STENCIL8 => RGBA8_BPP,
+@@ -804,7 +847,9 @@ pub fn bytes_per_pixel(format: u16) -> Option<u32> {
+         MTL_FORMAT_RGBA16_UNORM
+         | MTL_FORMAT_RGBA16_UINT
+         | MTL_FORMAT_RGBA16_FLOAT
+-        | MTL_FORMAT_RG32_FLOAT => RGBA16_BPP,
++        | MTL_FORMAT_RG32_FLOAT
++        | MTL_FORMAT_BGRA10_XR
++        | MTL_FORMAT_BGRA10_XR_SRGB => RGBA16_BPP,
+         MTL_FORMAT_RGBA32_UINT | MTL_FORMAT_RGBA32_FLOAT => RGBA32_BPP,
+         _ => return None,
+     })
+@@ -1312,7 +1357,14 @@ pub fn render_target_bpp(format: u16) -> Option<u32> {
+     Some(match format {
+         MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => RGBA8_BPP,
+         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => BGRA8_BPP,
+-        MTL_FORMAT_RGBA16_FLOAT | MTL_FORMAT_RGBA16_UNORM => RGBA16F_BPP,
++        MTL_FORMAT_RGBA16_FLOAT
++        | MTL_FORMAT_RGBA16_UNORM
++        | MTL_FORMAT_RGB10A8_2P_XR10
++        | MTL_FORMAT_RGB10A8_2P_XR10_SRGB
++        | MTL_FORMAT_BGRA10_XR
++        | MTL_FORMAT_BGRA10_XR_SRGB
++        | MTL_FORMAT_BGR10_XR
++        | MTL_FORMAT_BGR10_XR_SRGB => RGBA16F_BPP,
+         MTL_FORMAT_RG16_FLOAT => RG16F_BPP,
+         MTL_FORMAT_RG16_UINT => RG16_BPP,
+         MTL_FORMAT_R16_FLOAT => R16F_BPP,
+@@ -1731,6 +1783,9 @@ pub fn encode_solid_native_row(
+     if pixels == 0 {
+         return true;
+     }
++    if is_xr10(format) {
++        return encode_solid_xr10_plane0_row(format, pixels, clear, dst);
++    }
+     if let Some(layout) = store_texel_order(format) {
+         if let Some(bytes) = solid_native_texels(pixels, 1, layout, clear) {
+             if dst.len() < bytes.len() {
+@@ -1744,6 +1799,315 @@ pub fn encode_solid_native_row(
+     convert_rgba8_to_row(format, &rgba, pixels, dst)
+ }
+ 
++fn srgb_to_linear_mirrored(v: f32) -> f32 {
++    let a = v.abs();
++    let lin = if a <= 0.04045 {
++        a / 12.92
++    } else {
++        ((a + 0.055) / 1.055).powf(2.4)
++    };
++    v.copysign(lin)
++}
++
++fn linear_to_srgb_mirrored(v: f32) -> f32 {
++    let a = v.abs();
++    let enc = if a <= 0.0031308 {
++        a * 12.92
++    } else {
++        1.055 * a.powf(1.0 / 2.4) - 0.055
++    };
++    v.copysign(enc)
++}
++
++#[inline]
++pub fn xr10_code_to_float(code: u32, srgb: bool) -> f32 {
++    let v = ((code & 0x3ff) as f32 - 384.0) / 510.0;
++    if srgb { srgb_to_linear_mirrored(v) } else { v }
++}
++
++#[inline]
++pub fn float_to_xr10_code(val: f32, srgb: bool) -> u32 {
++    if val.is_nan() {
++        return 384;
++    }
++    if val == f32::NEG_INFINITY {
++        return 0;
++    }
++    if val == f32::INFINITY {
++        return 1023;
++    }
++    let v = if srgb { linear_to_srgb_mirrored(val) } else { val };
++    (v * 510.0 + 384.0).round().clamp(0.0, 1023.0) as u32
++}
++
++#[inline]
++fn f32_to_unorm8(val: f32) -> u8 {
++    if !matches!(val.partial_cmp(&0.0), Some(std::cmp::Ordering::Greater)) {
++        UNORM8_MIN
++    } else if val >= 1.0 {
++        UNORM8_MAX
++    } else {
++        (val * 255.0 + 0.5) as u8
++    }
++}
++
++fn encode_xr10_texel_from_f32(format: u16, rgba: [f32; 4], dst: &mut [u8]) -> Option<Option<u8>> {
++    let srgb = is_xr10_srgb(format);
++    let r10 = float_to_xr10_code(rgba[COMPONENT_R], srgb);
++    let g10 = float_to_xr10_code(rgba[COMPONENT_G], srgb);
++    let b10 = float_to_xr10_code(rgba[COMPONENT_B], srgb);
++    match format {
++        MTL_FORMAT_RGB10A8_2P_XR10 | MTL_FORMAT_RGB10A8_2P_XR10_SRGB => {
++            if dst.len() < 4 {
++                return None;
++            }
++            let word = b10 | (g10 << 10) | (r10 << 20);
++            dst[..4].copy_from_slice(&word.to_le_bytes());
++            Some(Some(f32_to_unorm8(rgba[COMPONENT_A])))
++        }
++        MTL_FORMAT_BGR10_XR | MTL_FORMAT_BGR10_XR_SRGB => {
++            if dst.len() < 4 {
++                return None;
++            }
++            let word = b10 | (g10 << 10) | (r10 << 20);
++            dst[..4].copy_from_slice(&word.to_le_bytes());
++            Some(None)
++        }
++        MTL_FORMAT_BGRA10_XR | MTL_FORMAT_BGRA10_XR_SRGB => {
++            if dst.len() < 8 {
++                return None;
++            }
++            let a10 = float_to_xr10_code(rgba[COMPONENT_A], false);
++            st16(&mut dst[0..2], (b10 as u16) << 6);
++            st16(&mut dst[2..4], (g10 as u16) << 6);
++            st16(&mut dst[4..6], (r10 as u16) << 6);
++            st16(&mut dst[6..8], (a10 as u16) << 6);
++            Some(None)
++        }
++        _ => None,
++    }
++}
++
++fn decode_xr10_texel_to_f32(format: u16, src: &[u8], alpha_byte: Option<u8>) -> Option<[f32; 4]> {
++    let srgb = is_xr10_srgb(format);
++    match format {
++        MTL_FORMAT_RGB10A8_2P_XR10 | MTL_FORMAT_RGB10A8_2P_XR10_SRGB => {
++            if src.len() < 4 {
++                return None;
++            }
++            let word = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
++            let b = xr10_code_to_float(word & 0x3ff, srgb);
++            let g = xr10_code_to_float((word >> 10) & 0x3ff, srgb);
++            let r = xr10_code_to_float((word >> 20) & 0x3ff, srgb);
++            let a = alpha_byte.map_or(1.0, |v| f32::from(v) / 255.0);
++            Some([r, g, b, a])
++        }
++        MTL_FORMAT_BGR10_XR | MTL_FORMAT_BGR10_XR_SRGB => {
++            if src.len() < 4 {
++                return None;
++            }
++            let word = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
++            let b = xr10_code_to_float(word & 0x3ff, srgb);
++            let g = xr10_code_to_float((word >> 10) & 0x3ff, srgb);
++            let r = xr10_code_to_float((word >> 20) & 0x3ff, srgb);
++            Some([r, g, b, 1.0])
++        }
++        MTL_FORMAT_BGRA10_XR | MTL_FORMAT_BGRA10_XR_SRGB => {
++            if src.len() < 8 {
++                return None;
++            }
++            let b = xr10_code_to_float(u32::from(ld16(&src[0..2]) >> 6), srgb);
++            let g = xr10_code_to_float(u32::from(ld16(&src[2..4]) >> 6), srgb);
++            let r = xr10_code_to_float(u32::from(ld16(&src[4..6]) >> 6), srgb);
++            let a = xr10_code_to_float(u32::from(ld16(&src[6..8]) >> 6), false);
++            Some([r, g, b, a])
++        }
++        _ => None,
++    }
++}
++
++fn encode_solid_xr10_plane0_row(
++    format: u16,
++    pixels: u32,
++    clear: &[f64; 4],
++    dst: &mut [u8],
++) -> bool {
++    let Some(bpp) = bytes_per_pixel(format).map(|b| b as usize) else {
++        return false;
++    };
++    let Some(need) = (pixels as usize).checked_mul(bpp) else {
++        return false;
++    };
++    if dst.len() < need {
++        return false;
++    }
++    let rgba = [
++        clear[COMPONENT_R] as f32,
++        clear[COMPONENT_G] as f32,
++        clear[COMPONENT_B] as f32,
++        clear[COMPONENT_A] as f32,
++    ];
++    let mut pat = [0u8; 8];
++    if encode_xr10_texel_from_f32(format, rgba, &mut pat[..bpp]).is_none() {
++        return false;
++    }
++    for chunk in dst[..need].chunks_exact_mut(bpp) {
++        chunk.copy_from_slice(&pat[..bpp]);
++    }
++    true
++}
++
++/// Encode one row (`pixels` texels) of `Rgba16Float` (`f16x4`) into an XR10
++/// Plane 0 row and, for two-plane `550`/`551`, an optional Plane 1 `R8Unorm`
++/// alpha row, preserving extended-range channels without `[0, 1]` clamping.
++pub fn encode_xr10_row_from_rgba16f(
++    format: u16,
++    pixels: u32,
++    src_rgba16f: &[u8],
++    dst_plane0: &mut [u8],
++    mut dst_plane1: Option<&mut [u8]>,
++) -> bool {
++    if !is_xr10(format) {
++        return false;
++    }
++    if pixels == 0 {
++        return true;
++    }
++    let Some(bpp) = bytes_per_pixel(format).map(|b| b as usize) else {
++        return false;
++    };
++    let px = pixels as usize;
++    let Some(src_len) = px.checked_mul(RGBA16F_BPP as usize) else {
++        return false;
++    };
++    let Some(p0_len) = px.checked_mul(bpp) else {
++        return false;
++    };
++    if src_rgba16f.len() < src_len || dst_plane0.len() < p0_len {
++        return false;
++    }
++    if let Some(p1) = dst_plane1.as_deref() {
++        if p1.len() < px {
++            return false;
++        }
++    }
++    for i in 0..px {
++        let s = i * RGBA16F_BPP as usize;
++        let rgba = [
++            f16_to_f32(ld16(&src_rgba16f[s..s + 2])),
++            f16_to_f32(ld16(&src_rgba16f[s + 2..s + 4])),
++            f16_to_f32(ld16(&src_rgba16f[s + 4..s + 6])),
++            f16_to_f32(ld16(&src_rgba16f[s + 6..s + 8])),
++        ];
++        let d = i * bpp;
++        let Some(alpha) = encode_xr10_texel_from_f32(format, rgba, &mut dst_plane0[d..d + bpp])
++        else {
++            return false;
++        };
++        if let (Some(a8), Some(p1)) = (alpha, dst_plane1.as_deref_mut()) {
++            p1[i] = a8;
++        }
++    }
++    true
++}
++
++/// Decode one row (`pixels` texels) of an XR10 Plane 0 (+ optional Plane 1
++/// alpha) source into `Rgba16Float` (`f16x4`), keeping full extended range.
++pub fn decode_xr10_row_to_rgba16f(
++    format: u16,
++    pixels: u32,
++    src_plane0: &[u8],
++    src_plane1: Option<&[u8]>,
++    dst_rgba16f: &mut [u8],
++) -> bool {
++    if !is_xr10(format) {
++        return false;
++    }
++    if pixels == 0 {
++        return true;
++    }
++    let Some(bpp) = bytes_per_pixel(format).map(|b| b as usize) else {
++        return false;
++    };
++    let px = pixels as usize;
++    let Some(p0_len) = px.checked_mul(bpp) else {
++        return false;
++    };
++    let Some(dst_len) = px.checked_mul(RGBA16F_BPP as usize) else {
++        return false;
++    };
++    if src_plane0.len() < p0_len || dst_rgba16f.len() < dst_len {
++        return false;
++    }
++    if let Some(p1) = src_plane1 {
++        if p1.len() < px {
++            return false;
++        }
++    }
++    for i in 0..px {
++        let s = i * bpp;
++        let a_byte = src_plane1.map(|p1| p1[i]);
++        let Some(rgba) = decode_xr10_texel_to_f32(format, &src_plane0[s..s + bpp], a_byte) else {
++            return false;
++        };
++        let d = i * RGBA16F_BPP as usize;
++        st16(&mut dst_rgba16f[d..d + 2], f32_to_f16(rgba[COMPONENT_R]));
++        st16(&mut dst_rgba16f[d + 2..d + 4], f32_to_f16(rgba[COMPONENT_G]));
++        st16(&mut dst_rgba16f[d + 4..d + 6], f32_to_f16(rgba[COMPONENT_B]));
++        st16(&mut dst_rgba16f[d + 6..d + 8], f32_to_f16(rgba[COMPONENT_A]));
++    }
++    true
++}
++
++/// Decode one row (`pixels` texels) of an XR10 Plane 0 (+ optional Plane 1
++/// alpha) source into `RGBA8` (`[0, 1]` clamped), for callers without half-float
++/// sampled upload support.
++pub fn decode_xr10_row_to_rgba8(
++    format: u16,
++    pixels: u32,
++    src_plane0: &[u8],
++    src_plane1: Option<&[u8]>,
++    dst_rgba8: &mut [u8],
++) -> bool {
++    if !is_xr10(format) {
++        return false;
++    }
++    if pixels == 0 {
++        return true;
++    }
++    let Some(bpp) = bytes_per_pixel(format).map(|b| b as usize) else {
++        return false;
++    };
++    let px = pixels as usize;
++    let Some(p0_len) = px.checked_mul(bpp) else {
++        return false;
++    };
++    let Some(dst_len) = px.checked_mul(RGBA8_BPP as usize) else {
++        return false;
++    };
++    if src_plane0.len() < p0_len || dst_rgba8.len() < dst_len {
++        return false;
++    }
++    if let Some(p1) = src_plane1 {
++        if p1.len() < px {
++            return false;
++        }
++    }
++    for i in 0..px {
++        let s = i * bpp;
++        let a_byte = src_plane1.map(|p1| p1[i]);
++        let Some(rgba) = decode_xr10_texel_to_f32(format, &src_plane0[s..s + bpp], a_byte) else {
++            return false;
++        };
++        let d = i * RGBA8_BPP as usize;
++        dst_rgba8[d + COMPONENT_R] = f32_to_unorm8(rgba[COMPONENT_R]);
++        dst_rgba8[d + COMPONENT_G] = f32_to_unorm8(rgba[COMPONENT_G]);
++        dst_rgba8[d + COMPONENT_B] = f32_to_unorm8(rgba[COMPONENT_B]);
++        dst_rgba8[d + COMPONENT_A] = f32_to_unorm8(rgba[COMPONENT_A]);
++    }
++    true
++}
++
+ /// The clear colour as one unorm8 RGBA texel.
+ fn unorm8_rgba(clear: &[f64; 4]) -> [u8; 4] {
+     [
+@@ -2348,6 +2712,18 @@ pub fn texel_to_rgba8(format: u16, src: &[u8]) -> Option<[u8; 4]> {
+             let order = TenBitOrder::of_format(format)?;
+             rgba = order.word_to_rgba8(u32::from_le_bytes([src[0], src[1], src[2], src[3]]));
+         }
++        MTL_FORMAT_RGB10A8_2P_XR10
++        | MTL_FORMAT_RGB10A8_2P_XR10_SRGB
++        | MTL_FORMAT_BGRA10_XR
++        | MTL_FORMAT_BGRA10_XR_SRGB
++        | MTL_FORMAT_BGR10_XR
++        | MTL_FORMAT_BGR10_XR_SRGB => {
++            let decoded = decode_xr10_texel_to_f32(format, src, None)?;
++            rgba[COMPONENT_R] = f32_to_unorm8(decoded[COMPONENT_R]);
++            rgba[COMPONENT_G] = f32_to_unorm8(decoded[COMPONENT_G]);
++            rgba[COMPONENT_B] = f32_to_unorm8(decoded[COMPONENT_B]);
++            rgba[COMPONENT_A] = f32_to_unorm8(decoded[COMPONENT_A]);
++        }
+         _ => return None,
+     }
+     Some(rgba)
+@@ -2424,6 +2800,20 @@ pub fn rgba8_to_texel(format: u16, rgba: [u8; 4], dst: &mut [u8]) -> bool {
+             };
+             dst[..4].copy_from_slice(&order.rgba8_to_word(rgba).to_le_bytes());
+         }
++        MTL_FORMAT_RGB10A8_2P_XR10
++        | MTL_FORMAT_RGB10A8_2P_XR10_SRGB
++        | MTL_FORMAT_BGRA10_XR
++        | MTL_FORMAT_BGRA10_XR_SRGB
++        | MTL_FORMAT_BGR10_XR
++        | MTL_FORMAT_BGR10_XR_SRGB => {
++            let rgba_f = [
++                f32::from(rgba[COMPONENT_R]) / 255.0,
++                f32::from(rgba[COMPONENT_G]) / 255.0,
++                f32::from(rgba[COMPONENT_B]) / 255.0,
++                f32::from(rgba[COMPONENT_A]) / 255.0,
++            ];
++            return encode_xr10_texel_from_f32(format, rgba_f, dst).is_some();
++        }
+         _ => return false,
+     }
+     true
+@@ -2480,6 +2870,12 @@ pub fn narrows_to_unorm8(format: u16) -> bool {
+             | MTL_FORMAT_RGBA32_FLOAT
+             | MTL_FORMAT_RGB10A2_UNORM
+             | MTL_FORMAT_BGR10A2_UNORM
++            | MTL_FORMAT_RGB10A8_2P_XR10
++            | MTL_FORMAT_RGB10A8_2P_XR10_SRGB
++            | MTL_FORMAT_BGRA10_XR
++            | MTL_FORMAT_BGRA10_XR_SRGB
++            | MTL_FORMAT_BGR10_XR
++            | MTL_FORMAT_BGR10_XR_SRGB
+     )
+ }
+ 
+@@ -4219,6 +4615,66 @@ mod tests {
+             assert_eq!(&back[..], *p);
+         }
+     }
++
++    #[test]
++    fn xr10_codec_preserves_sdr_bytes_extended_range_and_two_plane_alpha() {
++        assert_eq!(float_to_xr10_code(0.0, false), 384);
++        assert_eq!(float_to_xr10_code(1.0, false), 894);
++        assert!((xr10_code_to_float(384, false) - 0.0).abs() < 1e-6);
++        assert!((xr10_code_to_float(894, false) - 1.0).abs() < 1e-6);
++
++        // Every 8-bit SDR value maps to `384 + 2 * b` with zero rounding loss.
++        for b in 0u8..=255 {
++            let rgba = [b, 255 - b, b.wrapping_mul(3), 180];
++            let mut p0 = [0u8; 4];
++            assert!(rgba8_to_texel(MTL_FORMAT_RGB10A8_2P_XR10, rgba, &mut p0));
++            let got = texel_to_rgba8(MTL_FORMAT_RGB10A8_2P_XR10, &p0).unwrap();
++            assert_eq!(&got[..3], &rgba[..3], "byte {b}");
++            assert_eq!(got[3], 255);
++        }
++
++        // Extended-range negative + HDR (> 1.0) values + separate Plane 1 alpha.
++        let pixels = [
++            [-0.5f32, 0.0, 1.2, 0.25],
++            [1.15, -0.25, 0.5, 0.75],
++            [0.0, 0.0, 0.0, 0.0],
++        ];
++        let mut src_f16 = Vec::with_capacity(pixels.len() * 8);
++        for px in pixels {
++            for c in px {
++                src_f16.extend_from_slice(&f32_to_f16(c).to_le_bytes());
++            }
++        }
++        let mut plane0 = vec![0u8; pixels.len() * 4];
++        let mut plane1 = vec![0u8; pixels.len()];
++        assert!(encode_xr10_row_from_rgba16f(
++            MTL_FORMAT_RGB10A8_2P_XR10,
++            pixels.len() as u32,
++            &src_f16,
++            &mut plane0,
++            Some(&mut plane1),
++        ));
++        assert_eq!(plane1, vec![64, 191, 0]);
++        let mut dst_f16 = vec![0u8; pixels.len() * 8];
++        assert!(decode_xr10_row_to_rgba16f(
++            MTL_FORMAT_RGB10A8_2P_XR10,
++            pixels.len() as u32,
++            &plane0,
++            Some(&plane1),
++            &mut dst_f16,
++        ));
++        for (i, want) in pixels.iter().enumerate() {
++            let base = i * 8;
++            for c in 0..4 {
++                let got = f16_to_f32(ld16(&dst_f16[base + c * 2..base + c * 2 + 2]));
++                assert!(
++                    (got - want[c]).abs() < 0.005,
++                    "pixel {i} chan {c}: got {got}, want {}",
++                    want[c]
++                );
++            }
++        }
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/reims-vgpu/src/runtime/decode/resource/mod.rs b/crates/reims-vgpu/src/runtime/decode/resource/mod.rs
+index 23a6e8793..0cce7fd3f 100644
+--- a/crates/reims-vgpu/src/runtime/decode/resource/mod.rs
++++ b/crates/reims-vgpu/src/runtime/decode/resource/mod.rs
+@@ -428,6 +428,8 @@ pub struct TextureDescriptor {
+     pub pixel_format: u16,
+     /// Per-mip layouts (index 0 = L0). Empty if geometry incomplete.
+     pub levels: Vec<TextureLevelLayout>,
++    /// Optional Plane 1 (alpha) layout decoded from [`OBJECT_TYPE_TWIN_LAYOUT_TEXTURE`].
++    pub alpha_plane: Option<TextureLevelLayout>,
+ }
+ 
+ impl TextureDescriptor {
+@@ -513,6 +515,23 @@ impl TextureDescriptor {
+         }
+         Some((base.checked_add(layout.offset)?, layout))
+     }
++
++    /// Guest VA and layout of Plane 1 (8-bit alpha) on a two-plane type-12
++    /// texture, when the descriptor carried one.
++    pub fn alpha_plane_gva(&self, page_shift: u32) -> Option<(u64, &TextureLevelLayout)> {
++        let base = self.allocation_base_gva(page_shift)?;
++        let layout = self.alpha_plane.as_ref()?;
++        if layout.width == 0 || layout.height == 0 || layout.row_stride == 0 {
++            return None;
++        }
++        if self.allocation_size != 0
++            && (layout.offset >= self.allocation_size
++                || self.allocation_size - layout.offset < layout.row_stride)
++        {
++            return None;
++        }
++        Some((base.checked_add(layout.offset)?, layout))
++    }
+ }
+ 
+ /// Texture descriptor field offsets (geometry prefix + format trailer).
+@@ -1764,13 +1783,18 @@ pub struct ListObjectEntry {
+     pub twin_layout: bool,
+ }
+ 
+-/// Give a type-12 descriptor type 2's shape: drop the second copy of its
+-/// level-0 layout. The format is read where type 2's is.
++const TWIN_ALPHA_PLANE_MAGIC: [u8; 8] = *b"TWINPLN1";
++
++/// Give a type-12 descriptor type 2's shape while preserving its Plane 1
++/// level-0 layout in a self-identifying trailer for [`decode_texture_descriptor`].
+ pub fn reshape_twin_layout_descriptor(bytes: &mut Vec<u8>) -> bool {
+     if bytes.len() < TEXTURE_DESC_PIXEL_FORMAT + 2 + TWIN_LAYOUT_COPY.len() {
+         return false;
+     }
++    let plane1 = bytes[TWIN_LAYOUT_COPY].to_vec();
+     bytes.drain(TWIN_LAYOUT_COPY);
++    bytes.extend_from_slice(&TWIN_ALPHA_PLANE_MAGIC);
++    bytes.extend_from_slice(&plane1);
+     true
+ }
+ 
+@@ -1853,6 +1877,20 @@ pub fn decode_memoryless_texture_descriptor(
+ }
+ 
+ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, DecodeStatus> {
++    let trailer_len = TWIN_ALPHA_PLANE_MAGIC.len() + TWIN_LAYOUT_COPY.len();
++    let (bytes, twin_plane1) = if bytes.len() >= TEXTURE_DESC_GEOMETRY_LEN + trailer_len {
++        let split = bytes.len() - trailer_len;
++        if bytes[split..split + TWIN_ALPHA_PLANE_MAGIC.len()] == TWIN_ALPHA_PLANE_MAGIC {
++            (
++                &bytes[..split],
++                Some(&bytes[split + TWIN_ALPHA_PLANE_MAGIC.len()..]),
++            )
++        } else {
++            (bytes, None)
++        }
++    } else {
++        (bytes, None)
++    };
+     if bytes.len() < TEXTURE_DESC_GEOMETRY_LEN {
+         return Err(DecodeStatus::ErrShort("res_texture_desc_short"));
+     }
+@@ -2002,6 +2040,35 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Deco
+             bytes.len()
+         ));
+     }
++    if let Some(p1) = twin_plane1 {
++        let off_rel = TEXTURE_DESC_DATA_OFFSET - TEXTURE_DESC_MIPMAP_LEVEL_COUNT;
++        let used_rel = TEXTURE_DESC_USED_SIZE - TEXTURE_DESC_MIPMAP_LEVEL_COUNT;
++        let bpr_rel = TEXTURE_DESC_ROW_STRIDE - TEXTURE_DESC_MIPMAP_LEVEL_COUNT;
++        let w_rel = TEXTURE_DESC_WIDTH - TEXTURE_DESC_MIPMAP_LEVEL_COUNT;
++        let h_rel = TEXTURE_DESC_HEIGHT - TEXTURE_DESC_MIPMAP_LEVEL_COUNT;
++        let d_rel = TEXTURE_DESC_DEPTH - TEXTURE_DESC_MIPMAP_LEVEL_COUNT;
++        let offset = u64::from(ld32(&p1[off_rel..]));
++        let used_size = u64::from(ld32(&p1[used_rel..]));
++        let row_stride = u64::from(ld32(&p1[bpr_rel..]));
++        let width = ld32(&p1[w_rel..]);
++        let height = ld32(&p1[h_rel..]);
++        let depth = ld32(&p1[d_rel..]).max(1);
++        let size = if used_size != 0 {
++            used_size
++        } else {
++            row_stride.saturating_mul(u64::from(height))
++        };
++        if width != 0 && height != 0 && row_stride != 0 {
++            out.alpha_plane = Some(TextureLevelLayout {
++                offset,
++                size,
++                row_stride,
++                width,
++                height,
++                depth,
++            });
++        }
++    }
+     Ok(out)
+ }
+ 
+diff --git a/crates/reims-vgpu/src/runtime/draw/mod.rs b/crates/reims-vgpu/src/runtime/draw/mod.rs
+index c94e9ced7..e1f7bdd55 100644
+--- a/crates/reims-vgpu/src/runtime/draw/mod.rs
++++ b/crates/reims-vgpu/src/runtime/draw/mod.rs
+@@ -5004,6 +5004,77 @@ pub(crate) fn write_gva_rgba8<M: HostMemory + HostOps>(
+ /// closed on its own terms, and refusing on an empty capture would drop live
+ /// Stores whenever the capture failed for an unrelated reason. If that counter
+ /// stays at zero it can be tightened with evidence.
++#[allow(
++    clippy::too_many_arguments,
++    reason = "matches resolved colour target fields without widening ColorRtRequest"
++)]
++pub(crate) fn resolve_alpha_plane_for_target<M: HostMemory>(
++    state: &DeviceState,
++    host: &M,
++    task_id: u32,
++    texture_ref: u32,
++    target_gva: u64,
++    width: u32,
++    height: u32,
++    format: u16,
++) -> Option<(u64, u32)> {
++    if !pixel_format::is_two_plane_xr10(format)
++        || texture_ref == 0
++        || target_gva == 0
++        || width == 0
++        || height == 0
++    {
++        return None;
++    }
++    let mut cur = texture_ref;
++    for _ in 0..MAX_TEXTURE_VIEW_CHAIN {
++        let entry = objects::lookup_list_entry(state, host, task_id, cur)?;
++        if entry.object_type != OBJECT_TYPE_TEXTURE_VIEW {
++            break;
++        }
++        let (_, desc) =
++            objects::resolve_descriptor(state, host, task_id, cur, &[OBJECT_TYPE_TEXTURE_VIEW])
++                .ok()?;
++        let view = crate::runtime::decode::resource::decode_texture_view_descriptor(&desc).ok()?;
++        if view.carries_range() && (view.level_base != 0 || view.slice_base != 0) {
++            return None;
++        }
++        if view.base_texture_ref == 0 || view.base_texture_ref == cur {
++            return None;
++        }
++        cur = view.base_texture_ref;
++    }
++    let (_, desc_bytes) = objects::resolve_descriptor(
++        state,
++        host,
++        task_id,
++        cur,
++        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT],
++    )
++    .ok()?;
++    let tex = decode_texture_descriptor(&desc_bytes).ok()?;
++    let (p0_gva, _) = tex.level_gva(0, state.page_shift)?;
++    if p0_gva != target_gva {
++        return None;
++    }
++    let (alpha_gva, alpha) = tex.alpha_plane_gva(state.page_shift)?;
++    if alpha_gva == 0
++        || alpha.width != width
++        || alpha.height != height
++        || alpha.row_stride < u64::from(width)
++        || alpha.row_stride > u64::from(u32::MAX)
++    {
++        return None;
++    }
++    if tex.allocation_size != 0 {
++        let end = alpha.offset.saturating_add(alpha.slice_read_span(width)?);
++        if end > tex.allocation_size {
++            return None;
++        }
++    }
++    Some((alpha_gva, alpha.row_stride as u32))
++}
++
+ pub(crate) fn sync_store_target_pages<M: HostMemory>(
+     state: &DeviceState,
+     host: &M,
+@@ -5030,12 +5101,30 @@ pub(crate) fn sync_store_target_pages<M: HostMemory>(
+         crate::runtime::drain::note_store_route("sync_store_unbounded");
+         return None;
+     }
++    let mut set: std::collections::HashSet<u64> = ordered.iter().copied().collect();
++    if let Some((alpha_gva, alpha_bpr)) = resolve_alpha_plane_for_target(
++        state,
++        host,
++        task_id,
++        c.texture_ref,
++        c.target_gva,
++        c.width,
++        c.height,
++        c.format,
++    ) {
++        if let Some(alpha_span) = (alpha_bpr as u64).checked_mul(c.height as u64) {
++            set.extend(crate::runtime::gva_mem::task_gva_page_gpas(
++                host,
++                &state.tasks,
++                task_id,
++                alpha_gva,
++                alpha_span,
++                state.page_shift,
++            ));
++        }
++    }
+     crate::runtime::drain::note_store_route("sync_store_bound");
+-    Some(StoreTargetPages {
+-        set: ordered.iter().copied().collect(),
+-        ordered,
+-        span,
+-    })
++    Some(StoreTargetPages { set, ordered, span })
+ }
+ 
+ /// The guest pages a synchronous GVA render Store may write, from one walk
+@@ -5210,6 +5299,148 @@ pub(crate) fn write_gva_native_within<M: HostMemory + HostOps>(
+     Ok(())
+ }
+ 
++#[cfg(feature = "backend-vulkan")]
++#[allow(
++    clippy::too_many_arguments,
++    reason = "mirrors the target GVA, optional Plane 1 alpha GVA, and row geometry"
++)]
++pub(crate) fn write_gva_xr10_from_rgba16f_within<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    task_id: u32,
++    gva: u64,
++    width: u32,
++    height: u32,
++    bpr: u32,
++    format: u16,
++    alpha_plane: Option<(u64, u32)>,
++    rgba16f: &[u8],
++    allowed: crate::runtime::gva_view::WindowPages<'_>,
++) -> Result<(), crate::runtime::host::MemError> {
++    use crate::runtime::host::MemError;
++    if gva == 0 || width == 0 || height == 0 || bpr == 0 || !pixel_format::is_xr10(format) {
++        return Err(MemError::BadArgs);
++    }
++    let Some(tight) = pixel_format::tight_row_bytes(width, format) else {
++        return Err(MemError::BadArgs);
++    };
++    if bpr < tight {
++        return Err(MemError::BadArgs);
++    }
++    if let Some((agva, abpr)) = alpha_plane {
++        if agva == 0 || abpr < width {
++            return Err(MemError::BadArgs);
++        }
++    }
++    let src_row_bytes = (width as usize)
++        .checked_mul(pixel_format::RGBA16F_BPP as usize)
++        .ok_or(MemError::BadArgs)?;
++    let need = src_row_bytes
++        .checked_mul(height as usize)
++        .ok_or(MemError::BadArgs)?;
++    if rgba16f.len() < need {
++        return Err(MemError::BadArgs);
++    }
++    let mut row_p0 = vec![0u8; tight as usize];
++    let mut row_p1 = alpha_plane.map(|_| vec![0u8; width as usize]);
++    for y in 0..height as usize {
++        let src = &rgba16f[y * src_row_bytes..(y + 1) * src_row_bytes];
++        if !pixel_format::encode_xr10_row_from_rgba16f(
++            format,
++            width,
++            src,
++            &mut row_p0,
++            row_p1.as_deref_mut(),
++        ) {
++            return Err(MemError::BadArgs);
++        }
++        let p0_row_gva = gva.saturating_add((y as u64).saturating_mul(bpr as u64));
++        crate::runtime::gva_view::write_span_within(
++            state, host, task_id, p0_row_gva, &row_p0, allowed,
++        )?;
++        if let (Some((agva, abpr)), Some(p1)) = (alpha_plane, row_p1.as_deref()) {
++            let p1_row_gva = agva.saturating_add((y as u64).saturating_mul(abpr as u64));
++            crate::runtime::gva_view::write_span_within(
++                state, host, task_id, p1_row_gva, p1, allowed,
++            )?;
++        }
++    }
++    Ok(())
++}
++
++#[cfg(feature = "backend-vulkan")]
++#[allow(
++    clippy::too_many_arguments,
++    reason = "mirrors Plane 1 alpha GVA and row geometry"
++)]
++pub(crate) fn write_gva_xr10_alpha_from_rgba8_within<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    task_id: u32,
++    alpha_gva: u64,
++    width: u32,
++    height: u32,
++    alpha_bpr: u32,
++    rgba: &[u8],
++    allowed: crate::runtime::gva_view::WindowPages<'_>,
++) -> Result<(), crate::runtime::host::MemError> {
++    use crate::runtime::host::MemError;
++    if alpha_gva == 0 || width == 0 || height == 0 || alpha_bpr < width {
++        return Err(MemError::BadArgs);
++    }
++    let src_row_bytes = (width as usize)
++        .checked_mul(RGBA8_BPP as usize)
++        .ok_or(MemError::BadArgs)?;
++    let need = src_row_bytes
++        .checked_mul(height as usize)
++        .ok_or(MemError::BadArgs)?;
++    if rgba.len() < need {
++        return Err(MemError::BadArgs);
++    }
++    let mut row_p1 = vec![0u8; width as usize];
++    for y in 0..height as usize {
++        let src = &rgba[y * src_row_bytes..(y + 1) * src_row_bytes];
++        for (x, dst) in row_p1.iter_mut().enumerate() {
++            *dst = src[x * 4 + 3];
++        }
++        let p1_row_gva = alpha_gva.saturating_add((y as u64).saturating_mul(alpha_bpr as u64));
++        crate::runtime::gva_view::write_span_within(
++            state, host, task_id, p1_row_gva, &row_p1, allowed,
++        )?;
++    }
++    Ok(())
++}
++
++#[cfg(feature = "backend-vulkan")]
++#[allow(
++    clippy::too_many_arguments,
++    reason = "mirrors Plane 1 alpha GVA and row geometry"
++)]
++pub(crate) fn write_gva_solid_alpha_plane_within<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    task_id: u32,
++    alpha_gva: u64,
++    width: u32,
++    height: u32,
++    alpha_bpr: u32,
++    clear_alpha: f64,
++    allowed: crate::runtime::gva_view::WindowPages<'_>,
++) -> Result<(), crate::runtime::host::MemError> {
++    use crate::runtime::host::MemError;
++    if alpha_gva == 0 || width == 0 || height == 0 || alpha_bpr < width {
++        return Err(MemError::BadArgs);
++    }
++    let row_p1 = vec![pixel_format::f64_to_unorm8(clear_alpha); width as usize];
++    for y in 0..height as usize {
++        let p1_row_gva = alpha_gva.saturating_add((y as u64).saturating_mul(alpha_bpr as u64));
++        crate::runtime::gva_view::write_span_within(
++            state, host, task_id, p1_row_gva, &row_p1, allowed,
++        )?;
++    }
++    Ok(())
++}
++
+ /// Land a solid colour into a GVA render target.
+ ///
+ /// One tight RGBA8 row is built and handed to the same writer every full-image
+@@ -5226,9 +5457,7 @@ pub(crate) fn write_gva_native_within<M: HostMemory + HostOps>(
+     clippy::too_many_arguments,
+     reason = "the same target GVA and native row geometry every GVA writer takes"
+ )]
+-// The CLEAR seed at the head of a draw chain is the only caller, and it is the
+-// Vulkan rail's; the Metal rail seeds through its own encoder.
+-#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
++#[allow(dead_code)]
+ pub(crate) fn write_gva_solid8<M: HostMemory + HostOps>(
+     state: &mut DeviceState,
+     host: &mut M,
+@@ -5881,8 +6110,9 @@ pub(crate) fn seed_color_load_native<M: HostMemory + HostOps>(
+     height: u32,
+     target_format: u16,
+ ) -> Option<(Vec<u8>, TexelLayout)> {
+-    let want_native = pixel_format::store_texel_order(target_format)
+-        .is_some_and(|layout| !layout.is_four_byte_color());
++    let want_native = pixel_format::is_xr10(target_format)
++        || pixel_format::store_texel_order(target_format)
++            .is_some_and(|layout| !layout.is_four_byte_color());
+     if want_native {
+         let native = NativeUploads {
+             bgra8: false,
+diff --git a/crates/reims-vgpu/src/runtime/draw/tests.rs b/crates/reims-vgpu/src/runtime/draw/tests.rs
+index 96d25a0a4..e355f6127 100644
+--- a/crates/reims-vgpu/src/runtime/draw/tests.rs
++++ b/crates/reims-vgpu/src/runtime/draw/tests.rs
+@@ -6957,6 +6957,7 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
+             height,
+             depth: 1,
+         }],
++        alpha_plane: None,
+     };
+     let gva = tex
+         .level_gva(0, state.page_shift)
+@@ -7444,3 +7445,131 @@ fn a_dontcare_colour_attachment_is_still_served_its_prior_contents() {
+         "an explicit provenance seed still excludes the resident candidate"
+     );
+ }
++
++#[cfg(feature = "backend-vulkan")]
++#[test]
++fn type12_xr10_two_plane_store_and_sample_roundtrip() {
++    use crate::contract::endian::{st16, st32, st64};
++    use crate::contract::pass_action::MTL_STORE_ACTION_STORE;
++    use crate::contract::pixel_format::{
++        f16_to_f32, f32_to_f16, TexelLayout, MTL_FORMAT_RGB10A8_2P_XR10,
++    };
++    use crate::runtime::decode::resource::{
++        list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TWIN_LAYOUT_TEXTURE,
++        TEXTURE_DESC_BYTES_PER_ELEMENT, TEXTURE_DESC_DATA_OFFSET, TEXTURE_DESC_DEPTH,
++        TEXTURE_DESC_HEIGHT, TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT,
++        TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
++    };
++
++    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
++    let mut host = FakeHost::new();
++    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
++    assert!(state.set_object_list(1, 0, 256));
++
++    // Place a 2x1 type-12 RGB10A8_2p_XR10 texture at base page 2 (0x8000):
++    // Plane 0 @ +0x0000 (stride 64), Plane 1 @ +0x4000 (page 3 = 0xc000, stride 64).
++    let mut desc = vec![0u8; 176];
++    st64(&mut desc[0..], 0x8000);
++    st32(&mut desc[8..], 2); // handle = page 2 -> base GVA 0x8000
++    st16(&mut desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 1);
++    st32(&mut desc[TEXTURE_DESC_DATA_OFFSET..], 0);
++    desc[TEXTURE_DESC_BYTES_PER_ELEMENT] = 4;
++    st32(&mut desc[TEXTURE_DESC_USED_SIZE..], 64);
++    st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], 64);
++    st32(&mut desc[TEXTURE_DESC_WIDTH..], 2);
++    st32(&mut desc[TEXTURE_DESC_HEIGHT..], 1);
++    st32(&mut desc[TEXTURE_DESC_DEPTH..], 1);
++    // Plane 1 block at 0x48..0x84 (60 bytes mirroring 0x0c..0x48).
++    let p1 = 0x48usize;
++    st16(&mut desc[p1..], 1);
++    st32(&mut desc[p1 + (TEXTURE_DESC_DATA_OFFSET - TEXTURE_DESC_MIPMAP_LEVEL_COUNT)..], 0x4000);
++    desc[p1 + (TEXTURE_DESC_BYTES_PER_ELEMENT - TEXTURE_DESC_MIPMAP_LEVEL_COUNT)] = 1;
++    st32(&mut desc[p1 + (TEXTURE_DESC_USED_SIZE - TEXTURE_DESC_MIPMAP_LEVEL_COUNT)..], 64);
++    st32(&mut desc[p1 + (TEXTURE_DESC_ROW_STRIDE - TEXTURE_DESC_MIPMAP_LEVEL_COUNT)..], 64);
++    st32(&mut desc[p1 + (TEXTURE_DESC_WIDTH - TEXTURE_DESC_MIPMAP_LEVEL_COUNT)..], 2);
++    st32(&mut desc[p1 + (TEXTURE_DESC_HEIGHT - TEXTURE_DESC_MIPMAP_LEVEL_COUNT)..], 1);
++    st32(&mut desc[p1 + (TEXTURE_DESC_DEPTH - TEXTURE_DESC_MIPMAP_LEVEL_COUNT)..], 1);
++    st16(&mut desc[TEXTURE_DESC_PIXEL_FORMAT + 60..], MTL_FORMAT_RGB10A8_2P_XR10);
++
++    let desc_gva = 0x400u64;
++    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
++    let entry_off = list_object_entry_offset(7, 256).unwrap();
++    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
++    st32(
++        &mut entry[0..],
++        u32::from(OBJECT_TYPE_TWIN_LAYOUT_TEXTURE) | ((desc.len() as u32) << 8),
++    );
++    entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
++    write_task_gva_arm64e(&mut host, &state.tasks[1], entry_off, &entry);
++
++    let alpha = resolve_alpha_plane_for_target(
++        &state,
++        &host,
++        1,
++        7,
++        0x8000,
++        2,
++        1,
++        MTL_FORMAT_RGB10A8_2P_XR10,
++    );
++    assert_eq!(alpha, Some((0xc000, 64)));
++
++    let c0 = ColorRtRequest {
++        texture_ref: 7,
++        target_gva: 0x8000,
++        row_stride: 64,
++        width: 2,
++        height: 1,
++        format: MTL_FORMAT_RGB10A8_2P_XR10,
++        store_action: MTL_STORE_ACTION_STORE,
++        ..Default::default()
++    };
++    let pages = sync_store_target_pages(&state, &host, 1, &c0).expect("store pages");
++    assert!(
++        pages.ordered_complete(0x8000, 1 << PAGE_SHIFT_ARM64E).is_some(),
++        "Plane 1 membership must not perturb Plane 0 ordered_complete"
++    );
++
++    // Pixel 0: extended-range [1.25, -0.25, 0.5, 0.5]; Pixel 1: transparent [0.0, 0.0, 0.0, 0.0].
++    let px0 = [1.25f32, -0.25, 0.5, 0.5];
++    let px1 = [0.0f32, 0.0, 0.0, 0.0];
++    let mut rgba16f = Vec::with_capacity(16);
++    for ch in px0.into_iter().chain(px1) {
++        rgba16f.extend_from_slice(&f32_to_f16(ch).to_le_bytes());
++    }
++    write_gva_xr10_from_rgba16f_within(
++        &mut state,
++        &mut host,
++        1,
++        0x8000,
++        2,
++        1,
++        64,
++        MTL_FORMAT_RGB10A8_2P_XR10,
++        alpha,
++        &rgba16f,
++        Some(pages.membership()),
++    )
++    .expect("two-plane XR10 store within armed Plane 0 + Plane 1 pages");
++
++    let (loaded, fmt) = load_linear_texture_host(
++        &mut state,
++        &mut host,
++        1,
++        7,
++        0,
++        None,
++        NativeUploads::ALL,
++        crate::runtime::render_writeback::SettleSite::LinearTextureSampled,
++    )
++    .expect("two-plane XR10 sampled load");
++    assert_eq!(fmt.layout(), TexelLayout::Rgba16Float);
++    let read_f32 = |off: usize| -> f32 {
++        f16_to_f32(u16::from_le_bytes([loaded[off], loaded[off + 1]]))
++    };
++    assert!((read_f32(0) - 1.25).abs() < 0.004);
++    assert!((read_f32(2) - (-0.25)).abs() < 0.004);
++    assert!((read_f32(4) - 0.5).abs() < 0.004);
++    assert!((read_f32(6) - (128.0 / 255.0)).abs() < 0.004);
++    assert!((read_f32(14) - 0.0).abs() < 1e-4, "Plane 1 zero alpha must survive");
++}
+diff --git a/crates/reims-vgpu/src/runtime/draw/texture_view.rs b/crates/reims-vgpu/src/runtime/draw/texture_view.rs
+index 5a6363131..bd6b0bdff 100644
+--- a/crates/reims-vgpu/src/runtime/draw/texture_view.rs
++++ b/crates/reims-vgpu/src/runtime/draw/texture_view.rs
+@@ -879,6 +879,122 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
+     crate::runtime::writeback_debt::settle_for_texture(
+         state, host, task_id, texture_ref, gva, span, site,
+     );
++    if pixel_format::is_xr10(sample_fmt) {
++        let alpha_plane = (level == 0 && pixel_format::is_two_plane_xr10(sample_fmt))
++            .then(|| tex.alpha_plane_gva(state.page_shift))
++            .flatten();
++        if let Some((alpha_gva, alpha_layout)) = alpha_plane {
++            if alpha_gva == 0
++                || alpha_layout.width != w
++                || alpha_layout.height != h
++                || alpha_layout.planes() != planes
++                || alpha_layout.row_stride > u64::from(u32::MAX)
++            {
++                return Err(R::SizeOverflow);
++            }
++            if alpha_layout.row_stride < u64::from(w) {
++                return Err(R::RowStrideBelowTight {
++                    stride: alpha_layout.row_stride,
++                    tight: w,
++                });
++            }
++            let alpha_span = alpha_layout.slice_read_span(w).ok_or(R::SizeOverflow)?;
++            let alpha_end = alpha_layout.offset.saturating_add(alpha_span);
++            if tex.allocation_size != 0 && alpha_end > tex.allocation_size {
++                return Err(R::SpanExceedsAllocation {
++                    end: alpha_end,
++                    allocation: tex.allocation_size,
++                });
++            }
++            crate::runtime::writeback_debt::settle_for_texture(
++                state,
++                host,
++                task_id,
++                texture_ref,
++                alpha_gva,
++                alpha_span,
++                site,
++            );
++        }
++        let (out_layout, out_bpp) = if native.float16 {
++            (TexelLayout::Rgba16Float, pixel_format::RGBA16F_BPP as usize)
++        } else {
++            (TexelLayout::Rgba8, RGBA8_BPP as usize)
++        };
++        let rows = (h as usize)
++            .checked_mul(planes as usize)
++            .ok_or(R::SizeOverflow)?;
++        let out_row = (w as usize).checked_mul(out_bpp).ok_or(R::SizeOverflow)?;
++        let out_len = out_row.checked_mul(rows).ok_or(R::SizeOverflow)?;
++        let mut out = vec![0u8; out_len];
++        let mut row_p0 = vec![0u8; tight as usize];
++        let mut row_p1 = alpha_plane.map(|_| vec![0u8; w as usize]);
++        for row_index in 0..rows {
++            let p0_gva = (row_index as u64)
++                .checked_mul(bpr)
++                .and_then(|off| gva.checked_add(off))
++                .ok_or(R::SizeOverflow)?;
++            gva_mem::read_task_gva_by_id(
++                host,
++                &state.tasks,
++                task_id,
++                p0_gva,
++                &mut row_p0,
++                state.page_shift,
++            )
++            .map_err(|_| {
++                if bpr_u32 == tight {
++                    R::TightImageUnreadable
++                } else {
++                    R::PaddedRowUnreadable {
++                        row: u32::try_from(row_index).unwrap_or(u32::MAX),
++                    }
++                }
++            })?;
++            if let (Some((alpha_gva, alpha_layout)), Some(p1)) =
++                (alpha_plane, row_p1.as_deref_mut())
++            {
++                let p1_gva = (row_index as u64)
++                    .checked_mul(alpha_layout.row_stride)
++                    .and_then(|off| alpha_gva.checked_add(off))
++                    .ok_or(R::SizeOverflow)?;
++                gva_mem::read_task_gva_by_id(
++                    host,
++                    &state.tasks,
++                    task_id,
++                    p1_gva,
++                    p1,
++                    state.page_shift,
++                )
++                .map_err(|_| R::PaddedRowUnreadable {
++                    row: u32::try_from(row_index).unwrap_or(u32::MAX),
++                })?;
++            }
++            let dst = &mut out[row_index * out_row..(row_index + 1) * out_row];
++            let ok = if native.float16 {
++                pixel_format::decode_xr10_row_to_rgba16f(
++                    sample_fmt,
++                    w,
++                    &row_p0,
++                    row_p1.as_deref(),
++                    dst,
++                )
++            } else {
++                crate::runtime::draw::note_sampled_narrowing(site.route(), 0, sample_fmt, w, h);
++                pixel_format::decode_xr10_row_to_rgba8(
++                    sample_fmt,
++                    w,
++                    &row_p0,
++                    row_p1.as_deref(),
++                    dst,
++                )
++            };
++            if !ok {
++                return Err(R::RowConvertUnsupported { format: sample_fmt });
++            }
++        }
++        return Ok((out, SampledByteFormat::from_source(out_layout, sample_fmt)));
++    }
+     // Tight display textures are the common compositor source. Read the whole
+     // image with one task-root/cache lifetime: the row loop below otherwise
+     // rebuilds the GVA walker cache once per row (1,080 times for the live
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index a7c245603..588eab2d1 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -225,12 +225,14 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
+                     // run exactly as it does for a Store that never skipped its
+                     // readback. `read_resident_chain` fail-logs a lost resident.
+                     note_type11_store_route("gva_store_sync");
+-                    if let Some(expected_layout) = req
+-                        .colors
+-                        .first()
+-                        .and_then(|c0| pixel_format::store_texel_order(c0.format))
+-                        .filter(|layout| !layout.is_four_byte_color())
+-                    {
++                    if let Some(expected_layout) = req.colors.first().and_then(|c0| {
++                        if pixel_format::is_xr10(c0.format) {
++                            Some(TexelLayout::Rgba16Float)
++                        } else {
++                            pixel_format::store_texel_order(c0.format)
++                                .filter(|layout| !layout.is_four_byte_color())
++                        }
++                    }) {
+                         if let Ok(rb) =
+                             crate::backend::vulkan::engine::read_target_native(&identity)
+                         {
+@@ -595,7 +597,37 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
+                 // above. `None` only when that walk could not name the span,
+                 // which is the pre-existing behaviour for a target this device
+                 // cannot resolve at all.
+-                let native_written = if let Some((native_bytes, _layout)) = draw_native
++                let alpha_plane = super::resolve_alpha_plane_for_target(
++                    state,
++                    host,
++                    req.task_id,
++                    c0.texture_ref,
++                    c0.target_gva,
++                    c0.width,
++                    c0.height,
++                    c0.format,
++                );
++                let allowed_pages = sync_store_pages.as_ref().map(|p| p.membership());
++                let native_written = if pixel_format::is_xr10(c0.format) {
++                    if let Some((native_bytes, TexelLayout::Rgba16Float)) = draw_native.as_ref() {
++                        super::write_gva_xr10_from_rgba16f_within(
++                            state,
++                            host,
++                            req.task_id,
++                            c0.target_gva,
++                            c0.width,
++                            c0.height,
++                            c0.row_stride,
++                            c0.format,
++                            alpha_plane,
++                            native_bytes,
++                            allowed_pages,
++                        )
++                        .is_ok()
++                    } else {
++                        false
++                    }
++                } else if let Some((native_bytes, _layout)) = draw_native
+                     .as_ref()
+                     .filter(|(_, layout)| pixel_format::store_texel_order(c0.format) == Some(*layout))
+                 {
+@@ -609,7 +641,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
+                         c0.row_stride,
+                         c0.format,
+                         native_bytes,
+-                        sync_store_pages.as_ref().map(|p| p.membership()),
++                        allowed_pages,
+                     )
+                     .is_ok()
+                 } else {
+@@ -628,7 +660,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
+                     }
+                     true
+                 } else {
+-                    let ok = write_gva_rgba8_within(
++                    let mut ok = write_gva_rgba8_within(
+                         state,
+                         host,
+                         req.task_id,
+@@ -638,26 +670,55 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
+                         c0.row_stride,
+                         c0.format,
+                         &rgba,
+-                        sync_store_pages.as_ref().map(|p| p.membership()),
++                        allowed_pages,
+                     )
+                     .is_ok();
+                     if ok {
+-                        let producer_object_type =
+-                            objects::lookup_list_entry(state, host, req.task_id, c0.texture_ref)
+-                                .map(|entry| entry.object_type)
+-                                .unwrap_or(0);
+-                        host_cache_store_gva_layer(
+-                            state,
+-                            host,
+-                            req.task_id,
+-                            c0.texture_ref,
+-                            producer_object_type,
+-                            c0.target_gva,
+-                            c0.width,
+-                            c0.height,
+-                            &rgba,
+-                            true,
+-                        );
++                        if let Some((alpha_gva, alpha_bpr)) = alpha_plane {
++                            ok = super::write_gva_xr10_alpha_from_rgba8_within(
++                                state,
++                                host,
++                                req.task_id,
++                                alpha_gva,
++                                c0.width,
++                                c0.height,
++                                alpha_bpr,
++                                &rgba,
++                                allowed_pages,
++                            )
++                            .is_ok();
++                        }
++                    }
++                    if ok {
++                        if pixel_format::is_xr10(c0.format) {
++                            if c0.target_gva != 0 {
++                                crate::runtime::surface_cache::evict_gva(state, c0.target_gva);
++                            }
++                            if c0.texture_ref != 0 {
++                                crate::runtime::surface_cache::evict_texture(
++                                    state,
++                                    req.task_id,
++                                    c0.texture_ref,
++                                );
++                            }
++                        } else {
++                            let producer_object_type =
++                                objects::lookup_list_entry(state, host, req.task_id, c0.texture_ref)
++                                    .map(|entry| entry.object_type)
++                                    .unwrap_or(0);
++                            host_cache_store_gva_layer(
++                                state,
++                                host,
++                                req.task_id,
++                                c0.texture_ref,
++                                producer_object_type,
++                                c0.target_gva,
++                                c0.width,
++                                c0.height,
++                                &rgba,
++                                true,
++                            );
++                        }
+                     }
+                     ok
+                 };
+@@ -750,7 +811,22 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
+                 let _span = StoreCostSpan::new("clear_seed_gva_us");
+                 crate::runtime::drain::note_store_route("clear_seed_gva");
+                 crate::runtime::drain::note_store_route_n("clear_seed_gva_kb", seed_kb);
+-                super::write_gva_solid_native_within(
++                let allowed_pages = if i == 0 {
++                    sync_store_pages.as_ref().map(|p| p.membership())
++                } else {
++                    None
++                };
++                let alpha_plane = super::resolve_alpha_plane_for_target(
++                    state,
++                    host,
++                    req.task_id,
++                    c.texture_ref,
++                    c.target_gva,
++                    c.width,
++                    c.height,
++                    c.format,
++                );
++                let mut p0_ok = super::write_gva_solid_native_within(
+                     state,
+                     host,
+                     req.task_id,
+@@ -760,13 +836,26 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
+                     c.row_stride,
+                     c.format,
+                     &c.clear_color,
+-                    if i == 0 {
+-                        sync_store_pages.as_ref().map(|p| p.membership())
+-                    } else {
+-                        None
+-                    },
++                    allowed_pages,
+                 )
+-                .is_ok()
++                .is_ok();
++                if p0_ok {
++                    if let Some((alpha_gva, alpha_bpr)) = alpha_plane {
++                        p0_ok = super::write_gva_solid_alpha_plane_within(
++                            state,
++                            host,
++                            req.task_id,
++                            alpha_gva,
++                            c.width,
++                            c.height,
++                            alpha_bpr,
++                            c.clear_color[3],
++                            allowed_pages,
++                        )
++                        .is_ok();
++                    }
++                }
++                p0_ok
+             } else if c.mapping_id != 0 {
+                 let _span = StoreCostSpan::new("clear_seed_t11_us");
+                 crate::runtime::drain::note_store_route("clear_seed_t11");
+@@ -5270,6 +5359,7 @@ pub(super) fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
+ /// dressed as a decline.
+ fn native_scratch_to_upload(
+     scratch: &[u8],
++    alpha_plane: Option<(&[u8], u64)>,
+     w: u32,
+     h: u32,
+     planes: u32,
+@@ -5279,6 +5369,47 @@ fn native_scratch_to_upload(
+ ) -> Option<(Vec<u8>, TexelLayout)> {
+     let native = native_uploads_for(sample_fmt);
+     let bpr = bpr as usize;
++    if pixel_format::is_xr10(sample_fmt) {
++        let (out_layout, out_bpp) = if native.float16 {
++            (TexelLayout::Rgba16Float, pixel_format::RGBA16F_BPP as usize)
++        } else {
++            (TexelLayout::Rgba8, RGBA8_BPP as usize)
++        };
++        let out_row = (w as usize).checked_mul(out_bpp)?;
++        let rows = (h as usize).checked_mul(planes as usize)?;
++        let mut out = vec![0u8; out_row.checked_mul(rows)?];
++        let trow = tight as usize;
++        if !native.float16 {
++            crate::runtime::draw::note_sampled_narrowing(
++                "linear_memo_narrowed",
++                0,
++                sample_fmt,
++                w,
++                h,
++            );
++        }
++        for row_index in 0..rows {
++            let src = row_index.checked_mul(bpr)?;
++            let src_p0 = scratch.get(src..src + trow)?;
++            let src_p1 = match alpha_plane {
++                Some((p1_bytes, abpr)) => {
++                    let asrc = row_index.checked_mul(abpr as usize)?;
++                    Some(p1_bytes.get(asrc..asrc + w as usize)?)
++                }
++                None => None,
++            };
++            let dst = &mut out[row_index * out_row..(row_index + 1) * out_row];
++            let ok = if native.float16 {
++                pixel_format::decode_xr10_row_to_rgba16f(sample_fmt, w, src_p0, src_p1, dst)
++            } else {
++                pixel_format::decode_xr10_row_to_rgba8(sample_fmt, w, src_p0, src_p1, dst)
++            };
++            if !ok {
++                return None;
++            }
++        }
++        return Some((out, out_layout));
++    }
+     if let Some(fmt) = linear_native_upload_format(sample_fmt, native)
+         .filter(|fmt| tight == (w as u64).saturating_mul(fmt.bytes_per_texel() as u64))
+     {
+@@ -5434,10 +5565,38 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
+     // and served by the general loader below, which uses the tighter rule. That
+     // is a slower path, not lost work.
+     let span = bpr.checked_mul(h as u64)?.checked_mul(u64::from(planes))?;
+-    let native_len = host_alloc_len(span)?;
++    let p0_len = host_alloc_len(span)?;
+     if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
+         return None;
+     }
++    let alpha_plane = if pixel_format::is_two_plane_xr10(sample_fmt) {
++        if let Some((alpha_gva, alpha_layout)) = tex.alpha_plane_gva(state.page_shift) {
++            if alpha_gva == 0
++                || alpha_layout.width != w
++                || alpha_layout.height != h
++                || alpha_layout.planes() != planes
++                || alpha_layout.row_stride < u64::from(w)
++            {
++                return None;
++            }
++            let alpha_span = alpha_layout
++                .row_stride
++                .checked_mul(h as u64)?
++                .checked_mul(u64::from(planes))?;
++            if tex.allocation_size != 0
++                && alpha_layout.offset.saturating_add(alpha_span) > tex.allocation_size
++            {
++                return None;
++            }
++            Some((alpha_gva, alpha_layout.row_stride, alpha_span))
++        } else {
++            None
++        }
++    } else {
++        None
++    };
++    let total_span = span.checked_add(alpha_plane.map_or(0, |(_, _, s)| s))?;
++    let native_len = host_alloc_len(total_span)?;
+     // Same coherence rule as the general loader: land any resident-authoritative
+     // writeback *aliasing the sampled span* before reading it — and only then.
+     //
+@@ -5462,20 +5621,45 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
+         span,
+         crate::runtime::render_writeback::SettleSite::LinearMemoRead,
+     );
++    if let Some((alpha_gva, _, alpha_span)) = alpha_plane {
++        crate::runtime::writeback_debt::settle_for_texture(
++            state,
++            host,
++            task_id,
++            texture_ref,
++            alpha_gva,
++            alpha_span,
++            crate::runtime::render_writeback::SettleSite::LinearMemoRead,
++        );
++    }
+     let mut scratch = std::mem::take(&mut state.guest_linear_scratch);
+     scratch.resize(native_len, 0);
+-    let read = gva_mem::read_task_gva_by_id(
++    let read_p0 = gva_mem::read_task_gva_by_id(
+         host,
+         &state.tasks,
+         task_id,
+         gva,
+-        &mut scratch,
++        &mut scratch[..p0_len],
+         state.page_shift,
+     );
+-    if read.is_err() {
++    if read_p0.is_err() {
+         state.guest_linear_scratch = scratch;
+         return None;
+     }
++    if let Some((alpha_gva, _, _)) = alpha_plane {
++        let read_p1 = gva_mem::read_task_gva_by_id(
++            host,
++            &state.tasks,
++            task_id,
++            alpha_gva,
++            &mut scratch[p0_len..native_len],
++            state.page_shift,
++        );
++        if read_p1.is_err() {
++            state.guest_linear_scratch = scratch;
++            return None;
++        }
++    }
+     let key = (task_id, gva, w, h, planes, sample_fmt);
+     // Three-way, because "the memo did not answer" has two causes that want
+     // opposite fixes and a hit/miss pair cannot tell them apart.
+@@ -5537,9 +5721,17 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
+         ));
+     }
+     // First sight or native bytes changed: convert fresh, new generation.
+-    let Some((rgba, fmt)) =
+-        native_scratch_to_upload(&scratch, w, h, planes, bpr, sample_fmt, tight)
+-    else {
++    let alpha_slice = alpha_plane.map(|(_, abpr, _)| (&scratch[p0_len..native_len], abpr));
++    let Some((rgba, fmt)) = native_scratch_to_upload(
++        &scratch[..p0_len],
++        alpha_slice,
++        w,
++        h,
++        planes,
++        bpr,
++        sample_fmt,
++        tight,
++    ) else {
+         state.guest_linear_scratch = scratch;
+         return None;
+     };
+@@ -9913,7 +10105,17 @@ pub fn apply_gva_clear<M: HostMemory + HostOps>(
+         c0.texture_ref,
+         c0.target_gva,
+     );
+-    super::write_gva_solid_native_within(
++    let alpha_plane = super::resolve_alpha_plane_for_target(
++        state,
++        host,
++        task_id,
++        c0.texture_ref,
++        c0.target_gva,
++        c0.width,
++        c0.height,
++        c0.format,
++    );
++    let mut ok = super::write_gva_solid_native_within(
+         state,
+         host,
+         task_id,
+@@ -9925,7 +10127,24 @@ pub fn apply_gva_clear<M: HostMemory + HostOps>(
+         clear_color,
+         None,
+     )
+-    .is_ok()
++    .is_ok();
++    if ok {
++        if let Some((alpha_gva, alpha_bpr)) = alpha_plane {
++            ok = super::write_gva_solid_alpha_plane_within(
++                state,
++                host,
++                task_id,
++                alpha_gva,
++                c0.width,
++                c0.height,
++                alpha_bpr,
++                clear_color[3],
++                None,
++            )
++            .is_ok();
++        }
++    }
++    ok
+ }
+ 
+ pub(crate) fn retain_heap_target(
+@@ -11176,6 +11395,7 @@ fn gva_store_defer_eligible(req: &DrawEncodeRequest) -> bool {
+         || c0.texture_ref == 0
+         || req.gva_alloc_gen == 0
+         || c0.buffer_backed
++        || pixel_format::is_xr10(c0.format)
+     {
+         return false;
+     }
+diff --git a/crates/reims-vgpu/src/runtime/heap_query.rs b/crates/reims-vgpu/src/runtime/heap_query.rs
+index dc3c5d806..b676b7ec9 100644
+--- a/crates/reims-vgpu/src/runtime/heap_query.rs
++++ b/crates/reims-vgpu/src/runtime/heap_query.rs
+@@ -338,6 +338,7 @@ pub fn query_size_and_align(desc: &TextureDescriptor) -> Result<SizeAndAlign, Qu
+     }
+     let bpp = crate::contract::pixel_format::bytes_per_pixel(desc.pixel_format)
+         .ok_or(QueryError::UnknownPixelFormat)?;
++    let alpha_bpp = crate::contract::pixel_format::alpha_plane_bytes_per_pixel(desc.pixel_format);
+     let layers = u64::from(desc.array_length.max(1)) * faces * u64::from(desc.sample_count.max(1));
+     let mut size = 0u64;
+     for level in 0..u32::from(desc.mipmap_level_count.max(1)).min(32) {
+@@ -357,6 +358,19 @@ pub fn query_size_and_align(desc: &TextureDescriptor) -> Result<SizeAndAlign, Qu
+         size = size
+             .checked_add(level_size)
+             .ok_or(QueryError::ZeroRequirement)?;
++        if let Some(alpha_bpp) = alpha_bpp {
++            let alpha_row =
++                (extent(desc.width) * u64::from(alpha_bpp)).div_ceil(ROW_ALIGN) * ROW_ALIGN;
++            let alpha_level_size = alpha_row
++                .checked_mul(extent(desc.height))
++                .and_then(|n| n.checked_mul(depth))
++                .and_then(|n| n.checked_mul(layers))
++                .map(|n| n.div_ceil(PAGE) * PAGE)
++                .ok_or(QueryError::ZeroRequirement)?;
++            size = size
++                .checked_add(alpha_level_size)
++                .ok_or(QueryError::ZeroRequirement)?;
++        }
+     }
+     if size == 0 {
+         return Err(QueryError::ZeroRequirement);
+@@ -519,6 +533,13 @@ mod tests {
+         // Six faces: 30 720 bytes at level 0 and 7 680 at level 1.
+         desc.texture_type = 5;
+         assert_eq!(query_size_and_align(&desc).unwrap().size, 3 * 16384);
++        // Two-plane `RGB10A8_2P_XR10` (`550`) reserves a page-aligned Plane 1
++        // alpha allocation alongside Plane 0 so adjacent heap textures cannot
++        // overlap Plane 1.
++        desc.texture_type = 2;
++        desc.mipmap_level_count = 1;
++        desc.pixel_format = crate::contract::pixel_format::MTL_FORMAT_RGB10A8_2P_XR10;
++        assert_eq!(query_size_and_align(&desc).unwrap().size, 2 * 16384);
+     }
+ 
+     #[cfg(target_os = "macos")]
+-- 
+2.43.0
+

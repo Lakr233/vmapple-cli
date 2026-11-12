@@ -1,0 +1,866 @@
+From 47cb7f46ee6b275a8f1b009346953ee24e2459d4 Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Wed, 11 Nov 2026 17:10:12 +0800
+Subject: [PATCH 52/68] vgpu: preserve clip masks, guest-read icons, view
+ glyphs and cross-slot attachment aliases
+
+---
+ .../src/runtime/decode/resource/mod.rs        |   3 +
+ crates/reims-vgpu/src/runtime/drain/mod.rs    |   8 +
+ crates/reims-vgpu/src/runtime/draw/mod.rs     |  30 ++-
+ crates/reims-vgpu/src/runtime/draw/tests.rs   |  69 +++++-
+ crates/reims-vgpu/src/runtime/draw/vulkan.rs  | 227 +++++++++++-------
+ .../src/runtime/exec/continuation.rs          |  13 +-
+ crates/reims-vgpu/src/runtime/exec/mod.rs     |  55 +++--
+ .../src/runtime/pipeline_resolve.rs           |  59 ++++-
+ .../src/runtime/render_writeback.rs           |   1 +
+ .../src/runtime/resource_validity.rs          |  41 ++++
+ 10 files changed, 383 insertions(+), 123 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/decode/resource/mod.rs b/crates/reims-vgpu/src/runtime/decode/resource/mod.rs
+index 033299f4f..9a58860e1 100644
+--- a/crates/reims-vgpu/src/runtime/decode/resource/mod.rs
++++ b/crates/reims-vgpu/src/runtime/decode/resource/mod.rs
+@@ -632,6 +632,9 @@ impl Default for ColorWriteMask {
+ }
+ 
+ impl ColorWriteMask {
++    pub const NONE: Self = Self { bits: 0 };
++    pub const ALL: Self = Self { bits: MTL_COLOR_WRITE_MASK_ALL };
++
+     /// `None` for a value outside `MTLColorWriteMask`'s four bits — see
+     /// [`ColorWriteMaskOutOfRange`], which is what the decoder reports for it.
+     pub fn new(bits: u32) -> Option<Self> {
+diff --git a/crates/reims-vgpu/src/runtime/drain/mod.rs b/crates/reims-vgpu/src/runtime/drain/mod.rs
+index 2d843cefa..2fdc48c7f 100644
+--- a/crates/reims-vgpu/src/runtime/drain/mod.rs
++++ b/crates/reims-vgpu/src/runtime/drain/mod.rs
+@@ -4202,6 +4202,14 @@ fn apply_map_family<H: HostMemory + HostOps>(
+                     if outcome.missed {
+                         miss = miss.saturating_add(1);
+                     }
++                    if outcome.guest_read_requested {
++                        crate::runtime::resource_validity::deliver_for_guest_read(
++                            state,
++                            host,
++                            cmd.task_id,
++                            rec.object_id,
++                        );
++                    }
+                 }
+                 // One counter here, two on the exec side: `pageBacking`
+                 // names mapping ids, so a record this device holds no
+diff --git a/crates/reims-vgpu/src/runtime/draw/mod.rs b/crates/reims-vgpu/src/runtime/draw/mod.rs
+index 9a80beaa7..a16672ef9 100644
+--- a/crates/reims-vgpu/src/runtime/draw/mod.rs
++++ b/crates/reims-vgpu/src/runtime/draw/mod.rs
+@@ -1438,7 +1438,7 @@ pub(crate) fn load_render_mtlb_pair<M: HostMemory + HostOps>(
+     host: &M,
+     task_id: u32,
+     pipeline_ref: u32,
+-) -> Result<(Vec<u8>, Vec<u8>), DrawPreparationDecline> {
++) -> Result<(Vec<u8>, Option<Vec<u8>>), DrawPreparationDecline> {
+     let pd = load_render_pipeline(state, host, task_id, pipeline_ref).ok_or(
+         DrawPreparationDecline::PipelineMissing {
+             task_id,
+@@ -1451,17 +1451,23 @@ pub(crate) fn load_render_mtlb_pair<M: HostMemory + HostOps>(
+             function_ref: pd.vertex_func_ref,
+         },
+     )?;
+-    let f_mtlb = load_mtlb(
+-        state,
+-        host,
+-        task_id,
+-        pd.fragment_func_ref,
+-        AirLoadRail::Draw,
+-    )
+-    .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
+-        task_id,
+-        function_ref: pd.fragment_func_ref,
+-    })?;
++    let f_mtlb = if pd.fragment_func_ref == 0 {
++        None
++    } else {
++        Some(
++            load_mtlb(
++                state,
++                host,
++                task_id,
++                pd.fragment_func_ref,
++                AirLoadRail::Draw,
++            )
++            .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
++                task_id,
++                function_ref: pd.fragment_func_ref,
++            })?,
++        )
++    };
+     Ok((v_mtlb, f_mtlb))
+ }
+ 
+diff --git a/crates/reims-vgpu/src/runtime/draw/tests.rs b/crates/reims-vgpu/src/runtime/draw/tests.rs
+index 57fc19bf0..b8154730f 100644
+--- a/crates/reims-vgpu/src/runtime/draw/tests.rs
++++ b/crates/reims-vgpu/src/runtime/draw/tests.rs
+@@ -1817,25 +1817,71 @@ fn attachment_alias_resident_chain_selection() {
+         ..Default::default()
+     });
+     assert_eq!(
+-        fragment_attachment_alias_sample(&req, 0, 42),
++        fragment_attachment_alias_sample(&req, 0, 42, None),
+         None,
+         "unarmed LOAD without seed must not alias"
+     );
+     req.chain_from_resident = true;
+     assert_eq!(
+-        fragment_attachment_alias_sample(&req, 0, 42),
+-        Some((8, 8, AttachmentAliasSample::ResidentChain)),
++        fragment_attachment_alias_sample(&req, 0, 42, None),
++        Some((8, 8, AttachmentAliasSample::ResidentChain { slot: 0 })),
+         "armed chain aliases from the resident target"
+     );
+     // CPU seed still wins when present (record after a non-resident hop).
+     let seed = vec![0u8; 8 * 8 * 4];
+     req.colors[0].target_seed_rgba = Some(seed);
+     assert!(matches!(
+-        fragment_attachment_alias_sample(&req, 0, 42),
++        fragment_attachment_alias_sample(&req, 0, 42, None),
+         Some((8, 8, AttachmentAliasSample::Seed(_, _)))
+     ));
+ }
+ 
++#[cfg(feature = "backend-vulkan")]
++#[test]
++fn a_pass_reads_its_own_attachments_through_any_texture_index() {
++    let attachment = |slot, texture_ref, target_gva| ColorRtRequest {
++        slot,
++        texture_ref,
++        mapping_id: 0,
++        target_gva,
++        width: 128,
++        height: 128,
++        load_action: MTL_LOAD_ACTION_LOAD,
++        ..Default::default()
++    };
++    let mut req = DrawEncodeRequest::default();
++    req.colors.push(attachment(0, 19, 0x26_8000));
++    req.colors.push(attachment(1, 20, 0x28_8000));
++    req.chain_from_resident = true;
++
++    assert_eq!(
++        fragment_attachment_alias_sample(&req, 0, 20, None),
++        Some((128, 128, AttachmentAliasSample::ResidentChain { slot: 1 }))
++    );
++    assert_eq!(
++        fragment_attachment_alias_sample(&req, 1, 19, None),
++        Some((128, 128, AttachmentAliasSample::ResidentChain { slot: 0 }))
++    );
++    assert_eq!(fragment_attachment_alias_sample(&req, 2, 21, None), None);
++
++    let mut mip = DrawEncodeRequest::default();
++    mip.colors.push(ColorRtRequest {
++        slot: 0,
++        texture_ref: 19,
++        mapping_id: 0,
++        target_gva: 0x4290000,
++        width: 32,
++        height: 32,
++        load_action: MTL_LOAD_ACTION_CLEAR,
++        ..Default::default()
++    });
++    assert_eq!(
++        fragment_attachment_alias_sample(&mip, 0, 19, Some(0x428c000)),
++        None
++    );
++    assert!(fragment_attachment_alias_sample(&mip, 0, 19, Some(0x4290000)).is_some());
++}
++
+ /// Vulkan-arm only: `AttachmentAliasSample` and its resolver are
+ /// `backend-vulkan` items.
+ #[cfg(feature = "backend-vulkan")]
+@@ -1862,24 +1908,27 @@ fn gva_attachment_alias_samples_the_in_process_chain() {
+     };
+ 
+     let (width, height, sample) =
+-        fragment_attachment_alias_sample(&req, 0, texture_ref).expect("GVA alias");
++        fragment_attachment_alias_sample(&req, 0, texture_ref, None).expect("GVA alias");
+     assert_eq!((width, height), (2, 1));
+     let AttachmentAliasSample::Seed(actual, _) = sample else {
+         panic!("Load alias must use the chained seed");
+     };
+     assert_eq!(actual, seed);
+-    assert!(fragment_attachment_alias_sample(&req, 1, texture_ref).is_none());
+-    assert!(fragment_attachment_alias_sample(&req, 0, texture_ref + 1).is_none());
++    assert!(matches!(
++        fragment_attachment_alias_sample(&req, 1, texture_ref, None),
++        Some((2, 1, AttachmentAliasSample::Seed(..)))
++    ));
++    assert!(fragment_attachment_alias_sample(&req, 0, texture_ref + 1, None).is_none());
+ 
+     req.colors[0].mapping_id = 9;
+-    assert!(fragment_attachment_alias_sample(&req, 0, texture_ref).is_none());
++    assert!(fragment_attachment_alias_sample(&req, 0, texture_ref, None).is_none());
+     req.colors[0].mapping_id = 0;
+     req.colors[0].load_action = MTL_LOAD_ACTION_DONT_CARE;
+-    assert!(fragment_attachment_alias_sample(&req, 0, texture_ref).is_none());
++    assert!(fragment_attachment_alias_sample(&req, 0, texture_ref, None).is_none());
+     req.colors[0].load_action = MTL_LOAD_ACTION_CLEAR;
+     req.colors[0].clear_color = [0.25, 0.5, 0.75, 1.0];
+     assert_eq!(
+-        fragment_attachment_alias_sample(&req, 0, texture_ref),
++        fragment_attachment_alias_sample(&req, 0, texture_ref, None),
+         Some((2, 1, AttachmentAliasSample::Clear([0.25, 0.5, 0.75, 1.0])))
+     );
+ }
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index 1f000f5ce..cc7c73bf2 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -957,20 +957,48 @@ pub(super) enum AttachmentAliasSample<'a> {
+     /// Records 2+ of a resident GVA chain: the prior record's content lives
+     /// on the engine-resident target, not in a CPU seed. Bound as a resident
+     /// sampled source (the engine snapshots on self-alias).
+-    ResidentChain,
++    ResidentChain { slot: u32 },
++}
++
++fn sampled_base_level_gva<M: HostMemory + HostOps>(
++    state: &DeviceState,
++    host: &M,
++    task_id: u32,
++    texture_ref: u32,
++) -> Option<u64> {
++    use crate::runtime::decode::resource::{
++        OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
++    };
++    let (_entry, desc) = objects::resolve_descriptor(
++        state,
++        host,
++        task_id,
++        texture_ref,
++        &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT],
++    )
++    .ok()?;
++    let tex = decode_texture_descriptor(&desc).ok()?;
++    tex.level_gva(0, state.page_shift).map(|(gva, _)| gva)
+ }
+ 
+ pub(super) fn fragment_attachment_alias_sample<'a>(
+     req: &'a DrawEncodeRequest,
+     texture_index: u32,
+     texture_ref: u32,
++    sampled_gva: Option<u64>,
+ ) -> Option<(u32, u32, AttachmentAliasSample<'a>)> {
+-    let color = req.colors.iter().find(|color| {
+-        color.slot == texture_index
+-            && color.texture_ref == texture_ref
++    let names_it = |color: &&ColorRtRequest| {
++        color.texture_ref == texture_ref
+             && color.mapping_id == 0
+             && color.target_gva != 0
+-    })?;
++            && sampled_gva.is_none_or(|gva| gva == color.target_gva)
++    };
++    let color = req
++        .colors
++        .iter()
++        .filter(names_it)
++        .find(|color| color.slot == texture_index)
++        .or_else(|| req.colors.iter().find(names_it))?;
+     let need = (color.width as usize)
+         .checked_mul(color.height as usize)?
+         .checked_mul(RGBA8_BPP as usize)?;
+@@ -996,7 +1024,7 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
+                 return Some((
+                     color.width,
+                     color.height,
+-                    AttachmentAliasSample::ResidentChain,
++                    AttachmentAliasSample::ResidentChain { slot: color.slot },
+                 ));
+             }
+             None
+@@ -1877,10 +1905,22 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
+         native_uploads_asking_host(),
+         crate::runtime::render_writeback::SettleSite::LinearTextureSampled,
+     )?;
+-    let (_entry, desc) = sampled_texture_descriptor(state, host, task_id, texture_ref)?;
+-    let tex = decode_texture_descriptor(&desc).ok()?;
+-    let (w, h) = tex.extent()?;
+-    let planes = tex.levels.first()?.planes();
++    let (w, h, planes) = match texture_view::resolve_texture_view(state, host, task_id, texture_ref)
++    {
++        Some(view) => {
++            let (_entry, desc) =
++                sampled_texture_descriptor(state, host, task_id, view.base_texture_ref)?;
++            let tex = decode_texture_descriptor(&desc).ok()?;
++            let (_gva, layout) = tex.level_gva(view.level, state.page_shift)?;
++            (layout.width, layout.height, layout.planes())
++        }
++        None => {
++            let (_entry, desc) = sampled_texture_descriptor(state, host, task_id, texture_ref)?;
++            let tex = decode_texture_descriptor(&desc).ok()?;
++            let (w, h) = tex.extent()?;
++            (w, h, tex.levels.first()?.planes())
++        }
++    };
+     let need = (w as usize)
+         .saturating_mul(h as usize)
+         .saturating_mul(planes as usize)
+@@ -6322,6 +6362,67 @@ fn note_type11_store_route(route: &'static str) {
+     clippy::too_many_arguments,
+     reason = "every argument is a distinct wire-derived input to the attachment set"
+ )]
++pub(super) fn secondary_target_identity<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    task_id: u32,
++    c: &ColorRtRequest,
++    format: ash::vk::Format,
++) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
++    use crate::backend::vulkan::engine::TargetIdentity;
++    if c.target_gva != 0 {
++        Some(TargetIdentity::Gva {
++            gva: c.target_gva,
++            width: c.width,
++            height: c.height,
++            generation: if c.texture_ref != 0 {
++                crate::runtime::writeback_debt::gva_resource_generation(
++                    state,
++                    host,
++                    crate::runtime::writeback_debt::GvaResourceKey {
++                        task_id,
++                        texture_ref: c.texture_ref,
++                    },
++                    c.target_gva,
++                    u64::from(c.row_stride).saturating_mul(u64::from(c.height)),
++                )
++            } else {
++                gva_span_alloc_generation(
++                    state,
++                    host,
++                    task_id,
++                    c.target_gva,
++                    c.row_stride,
++                    c.height,
++                )
++            },
++            format,
++        })
++    } else if c.mapping_id != 0 {
++        Some(crate::runtime::present_identity::surface_identity(
++            state,
++            c.mapping_id,
++            c.width,
++            c.height,
++        ))
++    } else if let Some(&base) = (c.mapping_id == 0 && !c.memoryless)
++        .then(|| state.heap_texture_targets.get(&(task_id, c.texture_ref)))
++        .flatten()
++    {
++        Some(heap_target_identity(base, c.width, c.height))
++    } else if c.memoryless {
++        Some(TargetIdentity::Texture {
++            ref_: c.texture_ref,
++            width: c.width,
++            height: c.height,
++            generation: 0,
++            stencil: false,
++        })
++    } else {
++        None
++    }
++}
++
+ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
+     state: &mut DeviceState,
+     host: &mut M,
+@@ -6336,7 +6437,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
+     Vec<crate::backend::vulkan::engine::SecondaryColorTarget>,
+     crate::runtime::census::present_proxy::SecondaryMrtRefusal,
+ > {
+-    use crate::backend::vulkan::engine::{SecondaryColorTarget, TargetIdentity};
++    use crate::backend::vulkan::engine::SecondaryColorTarget;
+     use crate::runtime::census::present_proxy::SecondaryMrtRefusal;
+     if colors.len() <= 1 {
+         return Ok(Vec::new());
+@@ -6402,64 +6503,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
+         // Without one this attachment is keyed on `(gva, width, height)` alone
+         // and two guest allocations reusing that address at that geometry share
+         // one GPU image — the wrong-content class `74748d2` closed for color0.
+-        let identity = if c.target_gva != 0 {
+-            TargetIdentity::Gva {
+-                gva: c.target_gva,
+-                width: c.width,
+-                height: c.height,
+-                generation: if c.texture_ref != 0 {
+-                    crate::runtime::writeback_debt::gva_resource_generation(
+-                        state,
+-                        host,
+-                        crate::runtime::writeback_debt::GvaResourceKey {
+-                            task_id,
+-                            texture_ref: c.texture_ref,
+-                        },
+-                        c.target_gva,
+-                        u64::from(c.row_stride).saturating_mul(u64::from(c.height)),
+-                    )
+-                } else {
+-                    gva_span_alloc_generation(
+-                        state,
+-                        host,
+-                        task_id,
+-                        c.target_gva,
+-                        c.row_stride,
+-                        c.height,
+-                    )
+-                },
+-                // The format this attachment's image is actually created with,
+-                // not a re-derivation of it. `registry_ensure_attachment` takes
+-                // `format` — resolved just above by `color_attachment` — so
+-                // answering the key from anything else lets the identity claim
+-                // one format while the image holds another. It did: a
+-                // `R16G16_SFLOAT` secondary is admitted by `color_attachment`
+-                // and got an identity saying eight-bit RGBA.
+-                format,
+-            }
+-        } else if c.mapping_id != 0 {
+-            crate::runtime::present_identity::surface_identity(
+-                state,
+-                c.mapping_id,
+-                c.width,
+-                c.height,
+-            )
+-        } else if let Some(&base) = (c.mapping_id == 0 && !c.memoryless)
+-            .then(|| state.heap_texture_targets.get(&(task_id, c.texture_ref)))
+-            .flatten()
+-        {
+-            heap_target_identity(base, c.width, c.height)
+-        } else if c.memoryless {
+-            // No guest destination to follow, so the texture ref names it, as
+-            // it names a depth attachment. Its content never outlives the pass.
+-            TargetIdentity::Texture {
+-                ref_: c.texture_ref,
+-                width: c.width,
+-                height: c.height,
+-                generation: 0,
+-                stencil: false,
+-            }
+-        } else {
++        let Some(identity) = secondary_target_identity(state, host, task_id, c, format) else {
+             crate::runtime::census::present_proxy::note_secondary_mrt_drop(
+                 crate::runtime::census::present_proxy::MrtDrop::NoIdentity,
+                 c.width,
+@@ -7470,8 +7514,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+                     let alias_span = crate::runtime::sampled_phase::Span::open(
+                         crate::runtime::sampled_phase::Part::ResolveAlias,
+                     );
++                    let sampled_gva = (frag_stage
++                        && req.colors.iter().any(|c| c.texture_ref == texture_ref))
++                    .then(|| sampled_base_level_gva(state, host, req.task_id, texture_ref))
++                    .flatten();
+                     let attachment_alias = frag_stage
+-                        .then(|| fragment_attachment_alias_sample(req, index, texture_ref))
++                        .then(|| {
++                            fragment_attachment_alias_sample(req, index, texture_ref, sampled_gva)
++                        })
+                         .flatten();
+                     if let Some((aw, ah, alias)) = attachment_alias {
+                         match alias {
+@@ -7495,8 +7545,29 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+                                     crate::backend::vulkan::engine::SampledByteOrigin::AttachmentAlias,
+                                 ),
+                             ),
+-                            AttachmentAliasSample::ResidentChain => {
+-                                let identity = render_chain_identity(state, req).ok_or({
++                            AttachmentAliasSample::ResidentChain { slot } => {
++                                let color = req.colors.iter().find(|color| {
++                                    color.slot == slot && color.texture_ref == texture_ref
++                                });
++                                let attachment_format = color.and_then(|color| {
++                                    translate::pixel::color_attachment(color.format)
++                                        .ok()
++                                        .map(|resolved| resolved.0)
++                                });
++                                let identity = if slot == 0 {
++                                    render_chain_identity(state, req)
++                                } else {
++                                    color.zip(attachment_format).and_then(|(color, format)| {
++                                        secondary_target_identity(
++                                            state,
++                                            host,
++                                            req.task_id,
++                                            color,
++                                            format,
++                                        )
++                                    })
++                                }
++                                .ok_or({
+                                     DrawError::DrawPreparation(
+                                         DrawPreparationDecline::AttachmentAliasIdentityMissing {
+                                             index,
+@@ -7509,17 +7580,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+                                     identity.height(),
+                                     SampledSourceRequest::Target(
+                                         identity.clone(),
+-                                        req.colors
+-                                            .iter()
+-                                            .find(|color| {
+-                                                color.slot == index
+-                                                    && color.texture_ref == texture_ref
+-                                            })
+-                                            .and_then(|color| {
+-                                                translate::pixel::color_attachment(color.format)
+-                                                    .ok()
+-                                                    .map(|resolved| resolved.0)
+-                                            })
++                                        attachment_format
+                                             .unwrap_or_else(|| identity.resident_format()),
+                                     ),
+                                 )
+diff --git a/crates/reims-vgpu/src/runtime/exec/continuation.rs b/crates/reims-vgpu/src/runtime/exec/continuation.rs
+index 46dc8b896..149e3ffa0 100644
+--- a/crates/reims-vgpu/src/runtime/exec/continuation.rs
++++ b/crates/reims-vgpu/src/runtime/exec/continuation.rs
+@@ -45,6 +45,7 @@ pub(crate) struct ExecContinuation {
+     task_id: u32,
+     payload: Vec<u8>,
+     streams: Vec<Vec<u8>>,
++    guest_reads: Vec<u32>,
+     next_stream: usize,
+     acc: StreamAccum,
+     cursor: ChainCursor,
+@@ -114,12 +115,14 @@ impl ExecContinuations {
+ 
+ /// Keep `stop`'s packet at its channel head, to continue where it stopped.
+ #[cfg(feature = "backend-vulkan")]
++#[allow(clippy::too_many_arguments)]
+ pub(super) fn park(
+     state: &mut crate::model::DeviceState,
+     slot: ExecSlot,
+     payload: &[u8],
+     task_id: u32,
+     streams: Vec<Vec<u8>>,
++    guest_reads: Vec<u32>,
+     stop: super::StreamStop,
+     out: &mut ExecResult,
+ ) {
+@@ -137,6 +140,7 @@ pub(super) fn park(
+             task_id,
+             payload: payload.to_vec(),
+             streams,
++            guest_reads,
+             next_stream: stream,
+             acc,
+             cursor: suspension.cursor,
+@@ -205,6 +209,7 @@ pub(super) fn resume<M: crate::runtime::host::HostMemory + crate::runtime::host:
+     let ExecContinuation {
+         task_id,
+         streams,
++        guest_reads,
+         next_stream,
+         acc,
+         mut cursor,
+@@ -226,7 +231,13 @@ pub(super) fn resume<M: crate::runtime::host::HostMemory + crate::runtime::host:
+         &mut measured_ns,
+     );
+     if let Some(stop) = stopped {
+-        park(state, slot, payload, task_id, streams, stop, &mut out);
++        park(state, slot, payload, task_id, streams, guest_reads, stop, &mut out);
++    } else {
++        for object_id in guest_reads {
++            crate::runtime::resource_validity::deliver_for_guest_read(
++                state, host, task_id, object_id,
++            );
++        }
+     }
+     super::note_exec_header(started, measured_ns);
+     out.total_us = super::elapsed_us(started);
+diff --git a/crates/reims-vgpu/src/runtime/exec/mod.rs b/crates/reims-vgpu/src/runtime/exec/mod.rs
+index b1ba06626..8f6705265 100644
+--- a/crates/reims-vgpu/src/runtime/exec/mod.rs
++++ b/crates/reims-vgpu/src/runtime/exec/mod.rs
+@@ -771,15 +771,28 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
+     // pixels the guest has since overwritten has to go now — landing it later
+     // would replace the guest's own bytes with a frame the guest has declared
+     // stale.
+-    consume_resource_table(state, task_id, &resource_descs);
++    let guest_reads = consume_resource_table(state, task_id, &resource_descs);
+ 
+     let stopped = run_streams(state, host, task_id, &streams, 0, None, &mut out, &mut measured_ns);
+     #[cfg(feature = "backend-vulkan")]
+     if let Some(stop) = stopped {
+-        continuation::park(state, slot, payload, task_id, streams, stop, &mut out);
++        continuation::park(state, slot, payload, task_id, streams, guest_reads, stop, &mut out);
++    } else {
++        for object_id in guest_reads {
++            crate::runtime::resource_validity::deliver_for_guest_read(
++                state, host, task_id, object_id,
++            );
++        }
+     }
+     #[cfg(not(feature = "backend-vulkan"))]
+-    let _ = stopped;
++    {
++        let _ = stopped;
++        for object_id in guest_reads {
++            crate::runtime::resource_validity::deliver_for_guest_read(
++                state, host, task_id, object_id,
++            );
++        }
++    }
+     note_exec_header(exec_started, measured_ns);
+     out.total_us = elapsed_us(exec_started);
+     out
+@@ -912,8 +925,13 @@ fn note_exec_header(exec_started: std::time::Instant, measured_ns: u64) {
+ ///
+ /// The census that measured it is gone; a correlation with no counter-examples
+ /// over 19 135 trials is a finding, not a thing to keep re-deriving per frame.
+-fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecResourceDesc]) {
++fn consume_resource_table(
++    state: &mut DeviceState,
++    task_id: u32,
++    descs: &[ExecResourceDesc],
++) -> Vec<u32> {
+     use crate::runtime::resource_validity::{apply, ValiditySite};
++    let mut guest_reads = Vec::new();
+     let mut no_surface = 0u32;
+     let mut unknown = 0u32;
+     for d in descs {
+@@ -925,6 +943,9 @@ fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecRe
+                 .fail_once(0);
+         }
+         let outcome = apply(state, task_id, d.object_id, d.ops, ValiditySite::ExecTable);
++        if outcome.guest_read_requested {
++            guest_reads.push(d.object_id);
++        }
+         if !outcome.missed {
+             continue;
+         }
+@@ -938,6 +959,7 @@ fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecRe
+     // opcode in the device and a per-record line would bury the fail view.
+     crate::runtime::drain::note_store_route_n("validity_no_surface", no_surface as u64);
+     crate::runtime::drain::note_store_route_n("validity_unknown_object", unknown as u64);
++    guest_reads
+ }
+ 
+ /// The one part of an `EXEC_INDIRECT2` resource-table record this device cannot
+@@ -1011,10 +1033,11 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
+         // A container whose AIR will not extract is the same "deterministic
+         // missing plan input" as one that would not load: normal execution
+         // reports it precisely, and there is no asynchronous work to await.
+-        let (Ok(v_air), Ok(f_air)) = (
+-            crate::runtime::mtlb::extract_air(&v_mtlb),
+-            crate::runtime::mtlb::extract_air(&f_mtlb),
+-        ) else {
++        let f_air = f_mtlb
++            .as_deref()
++            .map(crate::runtime::mtlb::extract_air)
++            .transpose();
++        let (Ok(v_air), Ok(f_air)) = (crate::runtime::mtlb::extract_air(&v_mtlb), f_air) else {
+             continue;
+         };
+         let cache_started = std::time::Instant::now();
+@@ -1025,12 +1048,14 @@ fn preflight_render_translations<M: HostMemory + HostOps>(
+         ) {
+             pending = true;
+         }
+-        if !crate::runtime::m2v_cache::ensure_cached_async(
+-            f_air,
+-            metal2vulkan::passes::Stage::Fragment,
+-            pipeline_ref,
+-        ) {
+-            pending = true;
++        if let Some(f_air) = f_air {
++            if !crate::runtime::m2v_cache::ensure_cached_async(
++                f_air,
++                metal2vulkan::passes::Stage::Fragment,
++                pipeline_ref,
++            ) {
++                pending = true;
++            }
+         }
+         note_preflight_part(PreflightPart::Cache, cache_started.elapsed().as_nanos() as u64);
+     }
+@@ -4545,7 +4570,7 @@ pub(crate) fn test_run_and_park<M: HostMemory + HostOps>(
+             acc,
+             suspension,
+         };
+-        continuation::park(state, slot, payload, task_id, streams, stop, &mut out);
++        continuation::park(state, slot, payload, task_id, streams, Vec::new(), stop, &mut out);
+     }
+     out
+ }
+diff --git a/crates/reims-vgpu/src/runtime/pipeline_resolve.rs b/crates/reims-vgpu/src/runtime/pipeline_resolve.rs
+index cdc63184e..8e2b2edfc 100644
+--- a/crates/reims-vgpu/src/runtime/pipeline_resolve.rs
++++ b/crates/reims-vgpu/src/runtime/pipeline_resolve.rs
+@@ -344,17 +344,30 @@ pub fn attachment_sample_count<M: HostMemory + HostOps>(
+ /// This is the only place a draw's pipeline resolution can fail, and each of its
+ /// seven refusals keeps the `DrawPreparationDecline` variant it always had — the
+ /// memo in front of it neither adds a failure nor renames one.
++/// Apply Metal's meaning of `fragmentFunction == nil` to a decoded descriptor,
++/// and say whether it applied.
++pub(crate) fn settle_absent_fragment(desc: &mut RenderPipelineDescriptor) -> bool {
++    if desc.fragment_func_ref != 0 {
++        return false;
++    }
++    for attachment in &mut desc.color_attachments {
++        attachment.write_mask = crate::runtime::decode::resource::ColorWriteMask::NONE;
++    }
++    true
++}
++
+ fn resolve_uncached<M: HostMemory + HostOps>(
+     state: &DeviceState,
+     host: &M,
+     task_id: u32,
+     pipeline_ref: u32,
+ ) -> Result<ResolvedRenderPipeline, DrawPreparationDecline> {
+-    let desc = crate::runtime::draw::load_render_pipeline(state, host, task_id, pipeline_ref)
++    let mut desc = crate::runtime::draw::load_render_pipeline(state, host, task_id, pipeline_ref)
+         .ok_or(DrawPreparationDecline::PipelineMissing {
+             task_id,
+             pipeline_ref,
+         })?;
++    let fragment_absent = settle_absent_fragment(&mut desc);
+     // The same three sub-phases the call site used to open around this work,
+     // moved in with it. They are inert outside a live `ChainTimer`, so the two
+     // non-draw callers of the loaders below are unaffected — and on the draw
+@@ -373,7 +386,7 @@ fn resolve_uncached<M: HostMemory + HostOps>(
+         task_id,
+         function_ref: desc.vertex_func_ref,
+     })?;
+-    let f_mtlb = if desc.fragment_func_ref == 0 {
++    let f_mtlb = if fragment_absent {
+         None
+     } else {
+         Some(
+@@ -653,6 +666,48 @@ mod tests {
+     /// A pipeline with no vertex block answers "no" to both questions rather
+     /// than panicking on an empty search, which is the shape every fullscreen
+     /// pass that builds its vertices in the shader takes.
++    #[test]
++    fn an_absent_fragment_function_turns_color_writes_off_and_nothing_else() {
++        use crate::runtime::decode::resource::{ColorWriteMask, PipelineColorAttachment};
++
++        let attachments = vec![
++            PipelineColorAttachment {
++                slot: 0,
++                write_mask: ColorWriteMask::ALL,
++                ..Default::default()
++            },
++            PipelineColorAttachment {
++                slot: 1,
++                write_mask: ColorWriteMask::ALL,
++                ..Default::default()
++            },
++        ];
++        let mut maskless = RenderPipelineDescriptor {
++            vertex_func_ref: 7,
++            fragment_func_ref: 0,
++            color_attachments: attachments.clone(),
++            ..Default::default()
++        };
++        assert!(settle_absent_fragment(&mut maskless));
++        assert!(
++            maskless
++                .color_attachments
++                .iter()
++                .all(|a| a.write_mask == ColorWriteMask::NONE)
++        );
++        assert_eq!(maskless.vertex_func_ref, 7);
++
++        let mut drawing = RenderPipelineDescriptor {
++            vertex_func_ref: 7,
++            fragment_func_ref: 9,
++            color_attachments: attachments,
++            ..Default::default()
++        };
++        let before = drawing.clone();
++        assert!(!settle_absent_fragment(&mut drawing));
++        assert_eq!(drawing, before);
++    }
++
+     #[test]
+     fn an_empty_attribute_list_names_nothing() {
+         let plan = VertexBindPlan::build(&RenderPipelineDescriptor::default());
+diff --git a/crates/reims-vgpu/src/runtime/render_writeback.rs b/crates/reims-vgpu/src/runtime/render_writeback.rs
+index c4b88916c..d80c43c1e 100644
+--- a/crates/reims-vgpu/src/runtime/render_writeback.rs
++++ b/crates/reims-vgpu/src/runtime/render_writeback.rs
+@@ -700,6 +700,7 @@ settle_sites! {
+     /// `surface_quarantine::quarantine_collision` — both colliding mappings'
+     /// pages, before anything is decided about them.
+     Quarantine => "settle_quarantine",
++    GuestReadRequest => "settle_guest_read_request",
+ }
+ 
+ /// Block until every guest-page write this device has submitted has executed.
+diff --git a/crates/reims-vgpu/src/runtime/resource_validity.rs b/crates/reims-vgpu/src/runtime/resource_validity.rs
+index 7a567b01d..331f404de 100644
+--- a/crates/reims-vgpu/src/runtime/resource_validity.rs
++++ b/crates/reims-vgpu/src/runtime/resource_validity.rs
+@@ -48,6 +48,7 @@
+ 
+ use crate::model::{DeviceState, ResourceValidity};
+ use crate::runtime::decode::fifo::InvalidateValidityOps;
++use crate::runtime::host::{HostMemory, HostOps};
+ 
+ /// Which producer delivered a quad. Only used to name the counters, so an arm
+ /// can tell an exec-table statement from an invalidate-command one.
+@@ -73,6 +74,43 @@ pub struct ValidityOutcome {
+     pub bumped: u32,
+     /// The record named no mapping this device holds.
+     pub missed: bool,
++    /// The record cleared the guest's copy (byte +6): the guest is about to
++    /// read this object's pages, so any frame this device owes them must land
++    /// first.
++    pub guest_read_requested: bool,
++}
++
++/// Land every frame this device owes `object_id`'s guest pages, because the
++/// guest has said it is about to read them.
++pub fn deliver_for_guest_read<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    task_id: u32,
++    object_id: u32,
++) {
++    let owed_gva =
++        state
++            .pending_writebacks
++            .has_gva(crate::runtime::writeback_debt::GvaResourceKey {
++                task_id,
++                texture_ref: object_id,
++            });
++    let mappings: Vec<u32> = state
++        .mappings_named_by(task_id, object_id)
++        .iter()
++        .filter(|&id| state.pending_writebacks.get(id).is_some())
++        .collect();
++    if !owed_gva && mappings.is_empty() {
++        return;
++    }
++    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, object_id);
++    for mapping_id in mappings {
++        crate::runtime::writeback_debt::pay_for_mapping(state, host, mapping_id);
++    }
++    crate::runtime::render_writeback::settle_guest_writes(
++        crate::runtime::render_writeback::SettleSite::GuestReadRequest,
++    );
++    crate::runtime::drain::note_store_route("validity_guest_read_delivered");
+ }
+ 
+ /// Apply one record's quad to whatever mapping state the object id names.
+@@ -127,6 +165,9 @@ pub fn apply(
+         m.validity = next_validity(m.validity, ops);
+     }
+     out.missed = !hit;
++    if ops.clear_guest_valid != 0 {
++        out.guest_read_requested = true;
++    }
+     if ops.clear_host_valid != 0 {
+         // The statement this device used to decode and drop. A buffer has no
+         // mapping, so the loop above skipped it and the guest's account of its
+-- 
+2.43.0
+
