@@ -1,0 +1,136 @@
+From 325252a4656f727a7a82f9a6cccacf6cb8263599 Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Fri, 13 Nov 2026 04:26:24 +0800
+Subject: [PATCH 70/70] vgpu: load depth and stencil in later records of one
+ render encoder
+
+Component: runtime exec, the multi-draw chain of one Metal render encoder
+(all pathways that encode a record as its own Vulkan render pass).
+
+Each record after the first already had its colour load actions forced to
+Load, because Metal applies the pass load action once when the encoder
+begins. Depth and stencil kept the pass's own action. That meant a Clear ran
+again before every record, so a later draw tested against a cleared buffer.
+
+RenderBox on 26 and 27 draws an icon shape with depth writes on, then fills
+outside it with a full-target quad behind a GreaterEqual test. With depth
+cleared again, that quad passed everywhere and erased the shape, and
+iconservicesagent logged "Flattened representation is seemingly a fully
+transparent image". The Dock and Spotlight then showed the generic
+placeholder for Finder, Messages, Notes, Reminders, Music, App Store,
+Terminal and others. The engine already honours a depth Load against a
+resident that holds content (registry_mark_depth_ready), so the runtime
+only has to ask for it.
+
+The colour loop and the two new cases are one function, load_prior_record,
+with a unit test.
+
+Verified:
+- cargo test -p reims-vgpu --no-default-features
+  --features backend-vulkan,host-window -- --test-threads=1: 2344 lib tests
+  (including the new one) and every integration test pass.
+- clippy -D warnings: 65 diagnostics with and without this change on rustc
+  1.99.1. None of them are new.
+- Live on arm64 Linux (NVIDIA GB10), macOS 27.2 guest. I cleared the
+  iconservicesagent, iconservices.store and dock.iconcache caches and
+  restarted Dock and the icon agents. Every Dock icon then drew correctly,
+  and no icon render left an all-zero store. Before the change 8 Dock icons
+  were placeholders. About This Mac also drew its text on first open; before,
+  the text only appeared after a click.
+
+Not verified: the backend-metal and x86 clippy arms, and other macOS
+versions at the time of this commit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/reims-vgpu/src/runtime/exec/mod.rs   | 28 ++++++++++++++++++---
+ crates/reims-vgpu/src/runtime/exec/tests.rs | 23 +++++++++++++++++
+ 2 files changed, 47 insertions(+), 4 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/exec/mod.rs b/crates/reims-vgpu/src/runtime/exec/mod.rs
+index d423c0da0..51ff1cac7 100644
+--- a/crates/reims-vgpu/src/runtime/exec/mod.rs
++++ b/crates/reims-vgpu/src/runtime/exec/mod.rs
+@@ -3636,14 +3636,12 @@ fn finish_stream_draws<M: HostMemory + HostOps>(
+                     .map(|c| c.mapping_id != 0)
+                     .unwrap_or(false);
+                 // Records 2+ of a chain composite over the prior record: force
+-                // loadAction=Load on every color. Leaving the pass action alone
++                // loadAction=Load on every attachment. Leaving the pass action alone
+                 // on a type-11 target let a CLEAR re-run before each record,
+                 // wiping the full composite drawn by record 1 (live poison=1:
+                 // mid peak 10.9M native → 2.5M after later records).
+                 if di > 0 {
+-                    for c in &mut req.colors {
+-                        c.load_action = MTL_LOAD_ACTION_LOAD;
+-                    }
++                    load_prior_record(&mut req);
+                     // Chain from the engine resident when available; otherwise
+                     // seed from the prior encode output (archive "thread each
+                     // record's output as next initial content"). MoltenVK's
+@@ -4031,6 +4029,28 @@ fn render_pass_chain_position(index: usize, len: usize) -> (bool, bool) {
+     (index > 0, index + 1 < len)
+ }
+ 
++/// Make a record after the first in one Metal render encoder continue from the
++/// attachments the records before it left.
++///
++/// Each record is its own Vulkan render pass, so the pass's load action, which
++/// Metal applies once when the encoder begins, has to become `Load` for every
++/// attachment of every later record — depth and stencil as much as colour. A
++/// depth buffer cleared again lets a later draw pass a test the first draw was
++/// meant to make it fail: RenderBox on 26 and 27 draws a shape, then fills
++/// outside it with a full-target quad behind a `GreaterEqual` depth test, and a
++/// re-cleared buffer let that quad erase the shape.
++fn load_prior_record(req: &mut draw::DrawEncodeRequest) {
++    for c in &mut req.colors {
++        c.load_action = MTL_LOAD_ACTION_LOAD;
++    }
++    if let Some(depth) = req.depth_attach.as_mut() {
++        depth.load_action = MTL_LOAD_ACTION_LOAD;
++    }
++    if let Some(stencil) = req.stencil_attach.as_mut() {
++        stencil.load_action = MTL_LOAD_ACTION_LOAD;
++    }
++}
++
+ fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::DrawEncodeRequest {
+     let colors = first
+         .colors
+diff --git a/crates/reims-vgpu/src/runtime/exec/tests.rs b/crates/reims-vgpu/src/runtime/exec/tests.rs
+index 26f2deb52..f6e52e8d3 100644
+--- a/crates/reims-vgpu/src/runtime/exec/tests.rs
++++ b/crates/reims-vgpu/src/runtime/exec/tests.rs
+@@ -31,6 +31,29 @@ fn render_pass_chain_edges_follow_the_decoded_encoder() {
+     assert_eq!(render_pass_chain_position(2, 3), (true, false));
+ }
+ 
++#[test]
++fn a_later_record_loads_depth_and_stencil_as_well_as_colour() {
++    let mut req = draw::DrawEncodeRequest {
++        colors: vec![draw::ColorRtRequest {
++            load_action: MTL_LOAD_ACTION_CLEAR,
++            ..Default::default()
++        }],
++        depth_attach: Some(DepthAttachment {
++            load_action: MTL_LOAD_ACTION_CLEAR,
++            ..Default::default()
++        }),
++        stencil_attach: Some(StencilAttachment {
++            load_action: MTL_LOAD_ACTION_CLEAR,
++            ..Default::default()
++        }),
++        ..Default::default()
++    };
++    load_prior_record(&mut req);
++    assert_eq!(req.colors[0].load_action, MTL_LOAD_ACTION_LOAD);
++    assert_eq!(req.depth_attach.map(|d| d.load_action), Some(MTL_LOAD_ACTION_LOAD));
++    assert_eq!(req.stencil_attach.map(|s| s.load_action), Some(MTL_LOAD_ACTION_LOAD));
++}
++
+ /// The abandon line must say how much guest work it dropped.
+ ///
+ /// This break was silent, and the counter that would have caught it
+-- 
+2.43.0
+

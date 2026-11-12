@@ -5,7 +5,8 @@
 on the DGX on 2026-11-11 and 2026-11-12 against a 27.2 (26B123) disk, with
 `Patches/qemu` 0001–0017 and `Patches/metal2vulkan` 0001–0003. This note records
 what each group changes, what a guest showed with all of them, and what is still
-wrong on 27.2's Liquid Glass.
+wrong on 27.2's Liquid Glass. 0069–0070 came later on 2026-11-12; see
+[0069 and 0070](#0069-and-0070) at the end.
 
 ## The Patches
 
@@ -113,3 +114,84 @@ Booted once each on 2026-11-12 with 0001–0068, cold:
 None was logged in, and none of their serial logs shows a panic. `stop` ended
 15.6.1 in Setup Assistant, but timed out at each of the three login windows; the
 login window's Shut Down button ended those guests instead.
+
+## 0069 and 0070
+
+Written and run on 2026-11-12 on the same 27.2 disk, then once on each other
+version. All 70 patches apply with `git am` on Reims `44127711`, and the result
+is the tree that was built and run.
+
+- 0069: a heap texture size query can name a task whose `DEFINE_TASK2` is still
+  queued on a child ring behind a held packet. The reply is now answered from
+  that queued definition instead of being declined (`cmd_task_dead`).
+- 0070: Reims runs each draw of a Metal render encoder as its own Vulkan render
+  pass. Every draw after the first already loaded its colour attachments.
+  Depth and stencil kept the encoder's load action, so a Clear ran again before
+  each draw.
+
+### The Dock's Grey Icons
+
+They were not an old cache. With every icon cache cleared and Dock and
+iconservicesagent restarted, the agent logged "Flattened representation is
+seemingly a fully transparent image" for the same icons. Each one ended in an
+all-zero store of its 104×104 or 106×106 render.
+
+A diagnostic build read back every target and secondary attachment after each
+draw, and every sampled resident when it was sampled. With that, the empty
+output was traced back draw by draw. The first wrong draw was a RenderBox fill:
+
+1. One draw writes the icon shape with depth on.
+2. The next draw covers the whole target with transparent colour behind a
+   `GreaterEqual` depth test, meant to fill only outside the shape.
+3. Because depth had been cleared again, the fill passed everywhere and erased
+   the shape. Everything that sampled it afterwards was empty.
+
+With 0070, after clearing the per-user `com.apple.iconservicesagent` and
+`com.apple.dock.iconcache` and the system `com.apple.iconservices.store`,
+every Dock icon drew. That includes Finder, Messages, FaceTime, Phone,
+Reminders, Notes, Music, App Store and Terminal. No icon render left an
+all-zero store. Clearing only some of these caches leaves placeholders that an
+older build already stored.
+
+Keynote, Numbers and Pages show a question mark. They are not installed on
+this disk.
+
+### First-Draw Text
+
+In one boot, the pipelines were already built by re-rendering every icon.
+"About This Mac" then drew its text on first open. After a cold boot it still
+opened without text the first time. That boot had no dropped packet and no
+long compile while the window opened, so the cause is still open.
+
+Separately, the uber fragment shader's pipelines take 7.7–8.8 s each for
+NVIDIA's driver to compile. A packet that waits on such a compile for 10 s,
+counting its translation, is replaced at the ring head and its later draws are
+lost (`exec_continuation_dropped`). This happened about once a boot. The
+following did not shorten the compile:
+
+- `VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT`
+- running `spirv-opt -O` on the module, which is 16% smaller afterwards
+
+### The Grey
+
+Still grey at 0070. Two more leads were checked and are not the cause:
+
+- The 512×704 texture the glass shader samples is a linear texture in guest
+  memory, never a render target while the window opens. Sampling it from guest
+  pages instead of the GPU-resident copy left the window just as grey.
+- The texture reference it uses does appear as a second colour attachment in
+  1920×1080 passes. Those passes run at another time, against a different
+  object that reuses the reference.
+
+### Other Versions at 0070
+
+Booted once each, cold, on 2026-11-12. Each reached the same screen as at 0068:
+
+- 26.6.2: the login window, grey.
+- 15.6.1: the language panel.
+- 14.6.1: the login window with its wallpaper and clock.
+- 13.6: the login window with its wallpaper and avatar.
+
+None of their serial logs shows a panic. 15.6.1 stopped with `stop`. For 26.6.2
+and 13.6, `stop` timed out and the login window's Shut Down button ended them.
+On 14.6.1 the button was pressed while `stop` was also running.

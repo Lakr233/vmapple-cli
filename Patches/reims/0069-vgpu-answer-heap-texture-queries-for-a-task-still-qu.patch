@@ -1,0 +1,217 @@
+From d5b692ee0b6cba8ea5dc4677c6f2ff2d74ce566e Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Fri, 13 Nov 2026 04:26:24 +0800
+Subject: [PATCH 69/70] vgpu: answer heap texture queries for a task still
+ queued on a child ring
+
+Component: runtime drain, heap texture size/align replies (all pathways).
+
+A heap texture size query can name a task whose DEFINE_TASK2 is still
+sitting on a child ring behind a held packet, which happens on 27.2 while
+channel 1 waits for a translation. The reply path looked the task up in the
+active table only, found nothing and declined (cmd_task_dead), so the guest
+got no size for that texture.
+
+reply_fence::find is now a wrapper over a generic scan, and a new
+reply_fence::queued lists the matching records on a ring.
+reply_heap_texture_size_and_align still answers through the active task when
+there is one. Otherwise it looks for the last queued DEFINE_TASK2 for that task
+id on child rings 1..MAX_CHANNELS, installs its entry for the length of the
+reply, then puts back whatever was there before. Each answer is logged as
+heap_texture_query queued_task.
+
+Verified:
+- cargo test -p reims-vgpu --no-default-features
+  --features backend-vulkan,host-window -- --test-threads=1: 2344 lib tests
+  and every integration test pass (llvm-dis on PATH).
+- clippy -D warnings on the same arm reports 65 diagnostics with and
+  without this change on rustc 1.99.1. All of them predate it (new lints
+  such as chunks_exact_to_as_chunks).
+- Live on arm64 Linux (NVIDIA GB10), macOS 27.2 guest: the queued_task
+  line appears and the queries it covers are answered.
+
+Not verified: the backend-metal and x86 clippy arms, and any visible change
+that can be put down to this commit alone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/reims-vgpu/src/runtime/drain/mod.rs   | 76 ++++++++++++++++++--
+ crates/reims-vgpu/src/runtime/reply_fence.rs | 53 ++++++++++++--
+ 2 files changed, 118 insertions(+), 11 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/drain/mod.rs b/crates/reims-vgpu/src/runtime/drain/mod.rs
+index 29072e837..3991cf518 100644
+--- a/crates/reims-vgpu/src/runtime/drain/mod.rs
++++ b/crates/reims-vgpu/src/runtime/drain/mod.rs
+@@ -2516,19 +2516,85 @@ fn reply_heap_texture_size_and_align<H: HostMemory + HostOps>(
+             return false;
+         }
+     };
+-    // A live slot or nothing. `resolved_task` is gone with the arm that made the
+-    // two differ: the only slot this can act on is the one the guest named.
+-    let Some(task_id) = resolve_task_word(
++    // A live slot, or one the guest has defined and this device has not reached:
++    // the definition sits in another channel's ring, held behind a shader
++    // translation, while the query naming the task is answered now. The guest
++    // reads the reply as soon as its doorbell returns, so the reply is written
++    // through the queued definition's page tables, and the drain still defines
++    // the task in its own turn.
++    match resolve_task_word(
+         &state.tasks,
+         TaskWordSite::HeapTextureQuery,
+         request.task_id,
+-    ) else {
++    ) {
++        Some(task_id) => reply_heap_query_for_task(state, host, &request, task_id),
++        None => reply_heap_query_through_queued_task(state, host, &request),
++    }
++}
++
++fn reply_heap_query_through_queued_task<H: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut H,
++    request: &crate::runtime::heap_query::Request,
++) -> bool {
++    let task_id = request.task_id;
++    let Some(entry) = queued_task_definition(state, host, task_id) else {
+         Emit::decline("heap_texture_query", &QueryError::BadTask)
+-            .field("task", request.task_id)
++            .field("task", task_id)
+             .field("gva", format!("{:#x}", request.reply_gva))
+             .fail();
+         return false;
+     };
++    let previous = state.tasks.get(task_id).cloned();
++    state.tasks.define(task_id, entry);
++    let answered = reply_heap_query_for_task(state, host, request, task_id);
++    match previous {
++        Some(previous) => state.tasks.define(task_id, previous),
++        None => state.tasks.remove(task_id),
++    }
++    crate::observe::off(format!(
++        "heap_texture_query queued_task task={task_id} answered={answered}"
++    ));
++    answered
++}
++
++/// The newest `DefineTask2` for `task_id` still queued in a child ring, as the
++/// entry the drain will install when it reaches it.
++fn queued_task_definition<H: HostMemory + HostOps>(
++    state: &DeviceState,
++    host: &H,
++    task_id: u32,
++) -> Option<crate::model::TaskEntry> {
++    (1..MAX_CHANNELS as u32)
++        .flat_map(|channel| {
++            crate::runtime::reply_fence::queued(
++                host,
++                state.gfx.root_page,
++                state.page_shift,
++                channel,
++                CHILD_OP_DEFINE_TASK2,
++            )
++        })
++        .filter(|packet| packet.payload.len() >= DEFINE_TASK_LEN)
++        .filter(|packet| {
++            let raw_id = ld32(&packet.payload[DEFINE_TASK_RAW_ID..]);
++            raw_id & 1 == 0 && raw_id >> DEFINE_TASK_ID_SHIFT == task_id
++        })
++        .last()
++        .map(|packet| {
++            crate::model::TaskEntry::define(
++                define_task_length(&packet.payload),
++                ld32(&packet.payload[DEFINE_TASK_DIRECTORY_PFN..]),
++            )
++        })
++}
++
++fn reply_heap_query_for_task<H: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut H,
++    request: &crate::runtime::heap_query::Request,
++    task_id: u32,
++) -> bool {
+     let requirement = match crate::runtime::heap_query::query_size_and_align(&request.descriptor) {
+         Ok(requirement) => requirement,
+         Err(error) => {
+diff --git a/crates/reims-vgpu/src/runtime/reply_fence.rs b/crates/reims-vgpu/src/runtime/reply_fence.rs
+index b28090e80..528693144 100644
+--- a/crates/reims-vgpu/src/runtime/reply_fence.rs
++++ b/crates/reims-vgpu/src/runtime/reply_fence.rs
+@@ -74,6 +74,51 @@ pub fn find<M: HostMemory>(
+     channel: u32,
+     cache: &mut RingPages,
+ ) -> Option<Pending> {
++    let (queries, head_gpa, after) = scan(
++        mem,
++        root_page,
++        page_shift,
++        channel,
++        cache,
++        CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN,
++    )?;
++    (!queries.is_empty()).then_some(Pending {
++        queries,
++        head_gpa,
++        after,
++    })
++}
++
++/// Every `opcode` packet between `channel`'s head and tail that the drain has
++/// not run yet, oldest first. Read from guest memory and nothing else, like
++/// [`find`].
++pub fn queued<M: HostMemory>(
++    mem: &M,
++    root_page: u32,
++    page_shift: u32,
++    channel: u32,
++    opcode: u16,
++) -> Vec<Query> {
++    scan(
++        mem,
++        root_page,
++        page_shift,
++        channel,
++        &mut RingPages::default(),
++        opcode,
++    )
++    .map(|(queries, _, _)| queries)
++    .unwrap_or_default()
++}
++
++fn scan<M: HostMemory>(
++    mem: &M,
++    root_page: u32,
++    page_shift: u32,
++    channel: u32,
++    cache: &mut RingPages,
++    opcode: u16,
++) -> Option<(Vec<Query>, u64, u32)> {
+     if root_page == 0 {
+         return None;
+     }
+@@ -123,7 +168,7 @@ pub fn find<M: HostMemory>(
+         }
+         let payload_at =
+             PACKET_HEADER_LEN + u32::from(ld16(&header[PACKET_STAMP_COUNT..])) * PACKET_STAMP_LEN;
+-        if ld16(&header[PACKET_OPCODE..]) == CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN
++        if ld16(&header[PACKET_OPCODE..]) == opcode
+             && payload_at <= total
+             && total <= MAX_QUERY_LEN
+         {
+@@ -137,11 +182,7 @@ pub fn find<M: HostMemory>(
+         at = at.wrapping_add(total);
+         remaining -= total;
+     }
+-    (!queries.is_empty()).then_some(Pending {
+-        queries,
+-        head_gpa: regs_gpa + CHILD_REG_HEAD,
+-        after,
+-    })
++    Some((queries, regs_gpa + CHILD_REG_HEAD, after))
+ }
+ 
+ fn read_ring<M: HostMemory>(
+-- 
+2.43.0
+
