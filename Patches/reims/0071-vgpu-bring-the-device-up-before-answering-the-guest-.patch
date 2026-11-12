@@ -1,0 +1,110 @@
+From ebc261a3867a2e90a433740766e621e373233e58 Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Fri, 13 Nov 2026 07:30:31 +0800
+Subject: [PATCH 71/71] vgpu: bring the device up before answering the guest's
+ device-info query
+
+Component: Vulkan backend, the GPU-dependent half of CmdGetDeviceInfo (all
+Vulkan pathways).
+
+The guest asks for device info once, about four seconds into boot, before
+any draw has created the Vulkan context. device_info_limits() read whatever
+context existed and fell back to the Vulkan 1.2 floor. So every boot told the
+guest it had one sample, no D24S8, 128 threads per threadgroup, 16 KiB of
+threadgroup memory and no native FP16, and the guest kept that for the whole
+boot. It now calls ContextOwner::ensure, the same call the first draw makes,
+and answers from the real device. The floor remains the answer when the
+device cannot be created.
+
+Measured on arm64 Linux (NVIDIA GB10), macOS 27.2 guest. The device_info
+line went from
+  host_samples=1 host_d24s8=0 host_threads=128x128x64 host_tg_mem=16384
+  host_fp16=0 derived=[key1=1(was 8) key2=0(was 1) ...]
+to
+  host_samples=8 host_d24s8=1 host_threads=1024x1024x64 host_tg_mem=49152
+  host_fp16=1 derived=[]
+and the guest reached its desktop.
+
+This does not fix Liquid Glass on 27.2. A later finding: the guest refuses
+CoreAnimation's backdrop textures because supportsTextureDescriptor2 is off.
+That flag is set only at protocol rungs this device does not implement.
+
+Verified:
+- cargo test -p reims-vgpu --no-default-features
+  --features backend-vulkan,host-window -- --test-threads=1: 2344 lib tests
+  pass, as do the integration tests except one run of vk_engine_parity's
+  mrt_color_input_secondary_preserves_dcc_continues_pass_and_discards_transient.
+  That test passed three times alone, and the whole file passed twice in a
+  row after, so I read it as an existing flake. It does not reach
+  device_info_limits.
+- clippy -D warnings: 65 diagnostics before and after on rustc 1.99.1, the
+  same set.
+
+Not verified: the backend-metal and x86 clippy arms, and the x86/PCI
+pathway.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/backend/vulkan/engine/mod.rs          | 30 +++++++++++--------
+ 1 file changed, 18 insertions(+), 12 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs b/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
+index f8e011ec4..89dfc2f65 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
+@@ -2383,19 +2383,24 @@ pub fn max_render_target_dimension() -> u32 {
+ /// What this Vulkan device can execute, for the GPU-dependent half of the
+ /// guest's device-info reply.
+ ///
+-/// Before a device is resolved the answer is the Vulkan 1.2 floor rather than
+-/// the reply table's own values: the served reply is only ever *reduced* by
+-/// this, so a boot that answers before the device is up must not be the one
+-/// that promises the most.
++/// The device is brought up here if no draw has done it yet. The guest asks
++/// once, about four seconds into boot, before any draw. Answering from
++/// whatever context happened to exist served the Vulkan 1.2 floor on every
++/// boot: one sample, no D24S8, 128 threads, 16 KiB of threadgroup memory and
++/// no native FP16. The guest keeps that answer for the life of the boot, so
++/// it was told it ran on a far smaller GPU than the one doing the work.
++///
++/// The floor is still the answer when the device cannot be created: the served
++/// reply is only ever *reduced* by this, so a host that cannot say must not be
++/// the one that promises the most.
+ pub fn device_info_limits() -> crate::model::DeviceInfoLimits {
+     use crate::backend::vulkan::caps::device_features::{
+         VULKAN_MIN_COMPUTE_SHARED_MEMORY_BYTES, VULKAN_MIN_COMPUTE_WORKGROUP_SIZE,
+     };
+-    lock_engine()
+-        .owner
+-        .ctx
+-        .as_ref()
+-        .map(|ctx| crate::model::DeviceInfoLimits {
++    let mut guard = lock_engine();
++    let engine = &mut *guard;
++    match engine.owner.ensure(&engine.counters) {
++        Ok(ctx) => crate::model::DeviceInfoLimits {
+             max_sample_count: ctx.features.max_sample_count,
+             d24_stencil8: ctx.features.d24_unorm_s8_attachment,
+             max_threads_per_threadgroup: ctx.features.max_compute_workgroup_size,
+@@ -2407,14 +2412,15 @@ pub fn device_info_limits() -> crate::model::DeviceInfoLimits {
+             // let the Apple plugin choose its non-native-FP16 path.
+             native_fp16: ctx.features.float16
+                 && ctx.caps.device_type != ash::vk::PhysicalDeviceType::CPU,
+-        })
+-        .unwrap_or(crate::model::DeviceInfoLimits {
++        },
++        Err(_) => crate::model::DeviceInfoLimits {
+             max_sample_count: 1,
+             d24_stencil8: false,
+             max_threads_per_threadgroup: VULKAN_MIN_COMPUTE_WORKGROUP_SIZE,
+             max_threadgroup_memory_bytes: VULKAN_MIN_COMPUTE_SHARED_MEMORY_BYTES,
+             native_fp16: false,
+-        })
++        },
++    }
+ }
+ 
+ /// `(maxTotalThreadsPerThreadgroup, threadExecutionWidth)` for this host, as
+-- 
+2.43.0
+
