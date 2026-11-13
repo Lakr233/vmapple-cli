@@ -77,7 +77,10 @@ could read a resident image back to a file. It was run with "About This Mac" on
   window with dark text: the grey is that shader's output.
 - Giving that pipeline a white 1×1 texture instead of its input made the window
   white, as it should be. Giving it a transparent one gave the same grey as the
-  real input.
+  real input. (Corrected later: the switch replaced every texture the pipeline
+  samples, the shape's distance field included. A white distance field puts every
+  pixel outside the shape, so the glass drew nothing. This does not show which
+  input was wrong. See [Why the Glass Is Grey](#why-the-glass-is-grey).)
 - Read back before each draw into the layer, the window's fill was 1.0 after its
   solid-colour draw, and 0.534 after the glass shader drew into the layer.
 - That draw samples another 512×704 texture. Between a clear-only pass that
@@ -195,3 +198,74 @@ Booted once each, cold, on 2026-11-12. Each reached the same screen as at 0068:
 None of their serial logs shows a panic. 15.6.1 stopped with `stop`. For 26.6.2
 and 13.6, `stop` timed out and the login window's Shut Down button ended them.
 On 14.6.1 the button was pressed while `stop` was also running.
+
+## Why the Glass Is Grey
+
+Found late on 2026-11-12. The fix is not done; this records the cause and how far
+the work got. All of it is on the same 27.2 disk.
+
+### The Grey Is a Fallback
+
+Masking one pipeline's colour writes, one pipeline at a time, while "About This
+Mac" redrew, found a single draw that turns the window grey. Without it, the
+window is white with its text and button, which is how 27.2 draws it. That
+pipeline's entry point is `glass_background_all_lph`. Its uniforms are named in
+the shader's own metadata:
+
+- It samples `source_texture`, the content behind the window, at a level picked
+  from `blur_radius` (8 here).
+- It multiplies that content by a colour matrix, `face_cm0`–`face_cm2`, which is
+  0.7 times identity here.
+
+WindowServer clears `source_texture` to zero every frame and never writes it.
+So the glass is 0.7 × nothing, laid over the window. Four such layers stack to
+the sRGB 136 that was measured.
+
+WindowServer never fills it because it never gets the textures it would blur
+into. On every boot the guest logs, hundreds of times:
+
+    (AppleParavirtGPUMetalIOGPUFamily) Cannot create a texture with this usage on this host
+    [com.apple.coreanimation:Metal] Failed to allocate 128x192 surface texture.
+
+Reading the guest's own Metal plugin and kernel driver (in this host's working
+directory only) shows why:
+
+- When the plugin serializes a texture creation, it asks
+  `supportsTextureDescriptor2`. If that is off, it uses the older record, whose
+  usage field is one byte. Any texture with a usage of 0x100 or above is refused
+  with that message. CoreAnimation's backdrop textures need such a usage.
+- `supportsTextureDescriptor2` comes from a feature struct the kernel driver
+  builds from the negotiated protocol version. A 27.2 guest asks for 252. Its
+  driver has a second ladder of versions, 200 to 252, above the old one that
+  ends at 62. TextureDescriptor2 is on from 237 up and off at every version
+  below 200.
+- Reims negotiates at most 62, macOS 26's top rung. So 27.2 always runs
+  without TextureDescriptor2, and Liquid Glass falls back to flat grey.
+
+### What Higher Protocol Versions Need
+
+A diagnostic switch forced the negotiated version:
+
+- **63, 64, 70:** not versions the guest has. The screen stayed black.
+- **252 and 237:** the guest sends child commands this device does not have,
+  `0x43`, `0x44` and `0x45`, about a thousand a boot. The screen stayed black.
+- **200, the lowest new version:** only `0x43` is new. `0x43` is
+  `EXEC_INDIRECT2` (`0x37`) with each resource record cut from 24 bytes to its
+  first 8, `{object_id, ops}`; the header and command-buffer records are
+  unchanged.
+
+With `0x43` widened to `0x37` the guest submitted work at version 200, but the
+screen stayed black. Reims also refused many draws (MRT requests, render
+targets in formats it did not resolve) and compute pipeline descriptors with a
+field it does not read. So versions 200 and up change more of the wire than one
+command, and supporting them is its own piece of work. The `0x43` decoding is
+kept in the diagnostic patch, not in `Patches/reims`.
+
+### 0071
+
+Writing this up found one real defect on the way. The guest asks for device
+info about four seconds into boot, before any draw has created the Vulkan
+device. Reims answered from the Vulkan 1.2 floor: one sample, no D24S8, 128
+threads, 16 KiB of threadgroup memory, no native FP16. 0071 brings the device
+up first and answers from it: 8 samples, D24S8, 1024 threads, 48 KiB, FP16. It
+does not change the glass.
