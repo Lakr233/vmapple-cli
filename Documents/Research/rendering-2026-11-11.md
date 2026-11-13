@@ -201,8 +201,8 @@ On 14.6.1 the button was pressed while `stop` was also running.
 
 ## Why the Glass Is Grey
 
-Found late on 2026-11-12. The fix is not done; this records the cause and how far
-the work got. All of it is on the same 27.2 disk.
+Found late on 2026-11-12. This records the cause; [Protocol 237](#protocol-237)
+records the fix and what is still wrong. All of it is on the same 27.2 disk.
 
 ### The Grey Is a Fallback
 
@@ -258,8 +258,8 @@ With `0x43` widened to `0x37` the guest submitted work at version 200, but the
 screen stayed black. Reims also refused many draws (MRT requests, render
 targets in formats it did not resolve) and compute pipeline descriptors with a
 field it does not read. So versions 200 and up change more of the wire than one
-command, and supporting them is its own piece of work. The `0x43` decoding is
-kept in the diagnostic patch, not in `Patches/reims`.
+command, and supporting them is its own piece of work, done in
+[Protocol 237](#protocol-237).
 
 ### 0071
 
@@ -269,3 +269,129 @@ device. Reims answered from the Vulkan 1.2 floor: one sample, no D24S8, 128
 threads, 16 KiB of threadgroup memory, no native FP16. 0071 brings the device
 up first and answers from it: 8 samples, D24S8, 1024 threads, 48 KiB, FP16. It
 does not change the glass.
+
+## Protocol 237
+
+Done on 2026-11-13 with Reims 0072–0076 and metal2vulkan 0004. A 27.2 guest
+asks for 252 and now gets 237, and its Liquid Glass draws a blurred backdrop.
+Not every time: see [What Is Still Wrong](#what-is-still-wrong).
+
+### The Ladder
+
+The guest's kernel driver turns the negotiated version into a 0x38-byte
+feature table, and its Metal plugin reads that table. From the driver:
+
+- 62, the top of the 26-era ladder, sets bytes 0x2–0xa and 0x10.
+- The second ladder runs from 200 to 252. Its valid rungs are 200–209, 230–233,
+  235, 237, 238, 245 and 250–252. Each rung adds bytes to the 26-era set:
+  200 adds 0x14–0x22, 201–209 add 0x23–0x2b, 230–233 add 0x2c–0x2f, 235 adds 0x30,
+  237 adds 0x32, 238 adds 0x31, 245 adds 0x33 and 250–252 add 0x34–0x36.
+
+What the plugin does with the bytes this device now turns on, read off its
+`setupSerializerFeatures` and device getters:
+
+| byte | what it turns on |
+| --- | --- |
+| 0x14 | shared texture handles |
+| 0x15 | heap and pipeline queries through the info encoder |
+| 0x16 | default raster sample count |
+| 0x17 | vertex amplification |
+| 0x19 | programmable sample positions |
+| 0x1a | rasterization rate maps |
+| 0x1b | tile shaders, imageblocks, memory-order atomics (each also needs a device-info key) |
+| 0x1e | texture swizzle |
+| 0x1f | dynamic attribute stride |
+| 0x20 | blit encoder SPI, fill texture |
+| 0x21 | multiplane mipped blits |
+| 0x22 | compute pass dispatch type |
+| 0x24 | command buffer jump |
+| 0x25 | shared-storage heap resources |
+| 0x27 | protection options envelope |
+| 0x28 | compressed texture reinterpretation flush |
+| 0x29 | argument buffers; the driver sends `0x44` instead of `0x33` |
+| 0x2b | extended XR10 formats |
+| 0x2c | resource pools |
+| 0x2d | indirect command buffers |
+| 0x2e | protected texture options |
+| 0x2f | dispatch threads indirect |
+| 0x30 | info indirect |
+| 0x32 | TextureDescriptor2 |
+
+### What Changed on the Wire
+
+Each item was found by booting at 237 and reading what Reims refused, then
+reading the driver or plugin for the layout:
+
+- **Child packets.** `0x43` and `0x45` are `EXEC_INDIRECT2` with eight-byte
+  resource records; `0x45` carries the info encoder's command buffers. `0x44`
+  sets the object list by task address, with a second list nothing here
+  reads. Without `0x44` no object resolved and every draw was refused (0075).
+- **Texture descriptors.** Object-list descriptors carry TextureDescriptor2
+  records (`0x34`, `0x39`). Read with the old layout, formats came out as
+  0x500 and widths as 0x80000000. They are now rewritten to the old layout
+  before anything reads them (0072).
+- **Pool buffers.** Object type 19 is a buffer from a resource pool, with a
+  12-byte descriptor (0072).
+- **Info queries.** Heap texture size and alignment (`0x1d5`) and compute
+  pipeline info (`0x1c2`) arrive as info records. Unanswered, the guest's kernel
+  refused heaps of size 0 ("invalid arguments") and the guest dispatched empty
+  grids (0073).
+- **Compute descriptors** carry `maxTotalThreadsPerThreadgroup` (0072).
+- **Two-plane textures** are on at every rung of the new ladder (0075).
+- **Tile shaders and imageblocks.** At 237 the plugin offers them whenever
+  device-info keys 23 and 24 say yes. The Vulkan backend now says no (0075).
+
+### The Backdrop Blur
+
+CoreAnimation captures the screen behind a glass surface and blurs it with
+compute kernels: `backdrop_capture_compute_tile`, `variable_blur_copy_base_mip`,
+`variable_blur_downsample_compute_agx2`. All of them fill a shared imageblock
+tile, meet at a barrier, and have one thread write the whole tile. Two things
+stopped them:
+
+- Reims refused any kernel with an imageblock (0074).
+- metal2vulkan wrote only the calling thread's cell, so each 32×32 tile wrote
+  one texel. A kernel without a `threads_per_threadgroup` argument also kept its
+  cells per thread, so the writing thread saw none of the others (0004).
+
+With both fixed, the 256×256 RGBA16F texture the glass samples went from all
+zero to about 454,000 non-zero bytes, and the About window drew as frosted glass.
+The downsample kernel writes mip levels 1–4 of that texture, and a Vulkan storage
+image is bound at one level. Those writes are dropped, so the glass samples
+level 0 and is blurred less than on a Mac.
+
+### Boots
+
+All cold boots of the 27.2 disk on arm64 Linux (NVIDIA GB10), with no panic,
+to the desktop with its wallpaper, Dock and menu bar. In the first, the guest
+logged no "Cannot create a texture with this usage" and one "invalid
+arguments" heap refusal, as many as at 62.
+
+| build | About This Mac | menus |
+| --- | --- | --- |
+| 0072–0075 | frosted glass, text on first open | Apple menu: a grey panel without items |
+| 0072–0075, and a compute fallback that did not trigger and was dropped | not opened | Apple menu: frosted glass with items; Finder menu: glass without items |
+| 0072–0076 | grey, text on first open | Apple and Finder menus: items on grey glass |
+| 0072–0076 | grey, text on first open; the boot Apple logo shows through the lower part | Apple and Finder menus: items on grey glass |
+
+Diagnostic builds of the same code drew About This Mac as frosted glass in two
+more boots. The last row is the build in `Patches`; the one above it ran 0076
+before its two copies of the black sample were moved into one helper.
+
+### What Is Still Wrong
+
+- **The capture sometimes reads a retired display buffer.** Mapping 2 shows the
+  boot screen and the first desktop frames. Then the guest drops its wire count
+  to zero and deletes its backing, and WindowServer presents only mappings 3
+  and 4. CoreAnimation's capture still samples mapping 2 at times. Its pages now
+  belong to another surface and Reims holds nothing newer than the boot screen
+  for it. So the capture fails and the glass stays grey (one capture per window
+  open), or the boot Apple logo is sampled. On a Mac the host keeps the surface's
+  last frame. Reims lost that frame when the chain that drew it was abandoned to
+  the CPU recovery rail early in the boot.
+- **Unwritten heap textures.** Every frame samples 42×42 and 54×54 RGBA16F heap
+  textures that nothing this device runs writes. 0076 samples them as
+  transparent black instead of refusing the draw, which brings menu items back.
+  What fills them on a Mac is not known.
+- **Corners.** About This Mac and the menus sometimes draw small dark squares
+  at their corners.

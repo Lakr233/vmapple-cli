@@ -1,0 +1,105 @@
+From c7cde8eab53e8eabbc8da47cedc038246c3f7bf1 Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Fri, 13 Nov 2026 11:46:36 +0800
+Subject: [PATCH 76/76] vgpu: sample an unwritten heap texture as transparent
+ black
+
+Component: Vulkan draw, sampled heap textures.
+
+A heap texture lives only in the resident a render pass draws it into.
+Sampling one nothing had rendered yet returned no source, and the draw
+was refused. Metal leaves a private texture's unwritten texels
+undefined, and a refused draw does more harm than a black one: on
+macOS 27 at protocol 237 every WindowServer frame sampled such a
+texture (42x42 and 54x54 RGBA16F, usage 7, in one heap), one draw in
+each frame was refused, and the refusal abandoned the frame's render
+chain onto the CPU recovery rail. Menus drew without their items.
+
+Both sampled-heap rails now bind a transparent-black texture of the
+heap texture's size instead.
+
+Measured on arm64 Linux (NVIDIA GB10), macOS 27.2 guest at protocol 237,
+cold boots:
+- before: draws_fail=1 on every exec, 307 resident_chain_abandoned
+  lines in one boot, the Finder menu drawn as an empty panel;
+- after: one refused draw and one abandoned chain in a whole boot, and
+  the Apple and Finder menus drew with their items over Liquid Glass.
+What writes those heap textures on a real host is not established.
+
+Verified: the reims-vgpu test suite passes; clippy unchanged.
+Not verified: the backend-metal arm (this rail is Vulkan-only).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/reims-vgpu/src/runtime/draw/vulkan.rs | 34 ++++++++++++++++----
+ 1 file changed, 28 insertions(+), 6 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index 533fe9700..2c39c8845 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -1406,8 +1406,12 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
+         ));
+     }
+ 
+-    // A heap texture is sampled from the resident a pass rendered it into; one
+-    // nothing has rendered yet has no content anywhere this device can reach.
++    // A heap texture is sampled from the resident a pass rendered it into. One
++    // nothing has rendered yet has no content anywhere this device can reach,
++    // and Metal leaves a private texture's unwritten texels undefined; it is
++    // served as transparent black rather than refusing the draw. macOS 27's
++    // menus sample small heap textures (42x42, 54x54 RGBA16F) no pass here
++    // writes, and refusing that draw dropped every menu's items.
+     let heap_resource = resource.clone().or_else(|| {
+         objects::resolve_resource(state, host, task_id, texture_ref).ok()
+     });
+@@ -1423,8 +1427,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
+         };
+         let identity = heap_target_identity(task_id, target, heap.width, heap.height);
+         if !crate::backend::vulkan::engine::resident_content_ready(&identity) {
+-            crate::runtime::drain::note_store_route("heap_sample_unrendered");
+-            return None;
++            return unrendered_heap_sample(&heap);
+         }
+         let pf = translate::pixel::translate(heap.format).ok()?;
+         crate::runtime::drain::note_store_route("heap_sample_resident");
+@@ -1517,8 +1520,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
+                 };
+                 let identity = heap_target_identity(task_id, target, heap.width, heap.height);
+                 if !crate::backend::vulkan::engine::resident_content_ready(&identity) {
+-                    crate::runtime::drain::note_store_route("heap_sample_unrendered");
+-                    return None;
++                    return unrendered_heap_sample(&heap);
+                 }
+                 crate::runtime::drain::note_store_route("heaptex_view");
+                 crate::runtime::drain::note_store_route("heap_sample_resident");
+@@ -2276,6 +2278,26 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
+     ))
+ }
+ 
++/// The sample a heap texture nothing has rendered into yet gets: transparent
++/// black at its size. See the comment where [`resolve_sampled_source`] calls it.
++fn unrendered_heap_sample(heap: &HeapTexture) -> Option<(u32, u32, u32, SampledSourceRequest)> {
++    crate::runtime::drain::note_store_route("heap_sample_unrendered");
++    let bytes = (heap.width as usize)
++        .checked_mul(heap.height as usize)?
++        .checked_mul(TexelLayout::Rgba8.bytes_per_texel() as usize)?;
++    Some((
++        heap.width,
++        heap.height,
++        0,
++        SampledSourceRequest::Bytes(
++            std::sync::Arc::new(vec![0u8; bytes]),
++            None,
++            SampledByteFormat::synthesised(TexelLayout::Rgba8),
++            crate::backend::vulkan::engine::SampledByteOrigin::Synthetic,
++        ),
++    ))
++}
++
+ /// Whether a decoded resource object owns the resident reached by the surface
+ /// branch above.
+ ///
+-- 
+2.43.0
+

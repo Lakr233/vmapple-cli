@@ -1,0 +1,55 @@
+From db366fffc54732ae39e5b323a5d827121aa13a9b Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Fri, 13 Nov 2026 11:06:04 +0800
+Subject: [PATCH 74/76] vgpu: run compute kernels that use imageblocks
+
+Component: Vulkan compute reflection.
+
+A compute kernel with an explicit imageblock was refused as an interface
+the runtime cannot provision. It is not one: metal2vulkan lowers the
+imageblock to a Workgroup array inside the shader and its slice writes
+to storage-image writes, so there is nothing for the runtime to bind.
+macOS 27's CoreAnimation blurs every Liquid Glass backdrop through such
+kernels (backdrop_capture_compute_tile, variable_blur_copy_base_mip,
+variable_blur_downsample_compute_agx2), and with them refused the glass
+sampled an empty texture and drew flat grey.
+
+This needs metal2vulkan's whole-region slice write (vmapple-cli's
+metal2vulkan patch 0004); without it each tile writes one texel.
+
+Measured on arm64 Linux (NVIDIA GB10), macOS 27.2 guest at protocol 237:
+the blur chain's output went from all-zero to 454k non-zero bytes of
+256x256 RGBA16F, and the About window drew as frosted glass.
+
+Verified: the reims-vgpu test suite passes; clippy unchanged.
+Not verified: the backend-metal and x86 arms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/reims-vgpu/src/runtime/spirv_bind.rs | 10 ++++------
+ 1 file changed, 4 insertions(+), 6 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/spirv_bind.rs b/crates/reims-vgpu/src/runtime/spirv_bind.rs
+index 880bb13fc..3fed9327e 100644
+--- a/crates/reims-vgpu/src/runtime/spirv_bind.rs
++++ b/crates/reims-vgpu/src/runtime/spirv_bind.rs
+@@ -2300,12 +2300,10 @@ pub fn first_unsupported_vulkan_interface(
+             count: 1,
+         });
+     }
+-    if !reflection.imageblock_layouts.is_empty() {
+-        return Some(UnsupportedVulkanInterface {
+-            feature: "kernel_imageblock",
+-            count: reflection.imageblock_layouts.len(),
+-        });
+-    }
++    // A compute kernel's explicit imageblock is not an interface the runtime
++    // provisions: the translator lowers it to a Workgroup array inside the
++    // shader, and its slice writes to ordinary storage-image writes. macOS 27's
++    // CoreAnimation blurs every Liquid Glass backdrop through such kernels.
+     if !reflection.implicit_imageblock_attachments.is_empty() {
+         return Some(UnsupportedVulkanInterface {
+             feature: "implicit_imageblock_attachments",
+-- 
+2.43.0
+

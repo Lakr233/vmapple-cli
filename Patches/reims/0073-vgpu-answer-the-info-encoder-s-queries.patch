@@ -1,0 +1,272 @@
+From 416842028be33306c680f7dedf37a64cda3773e2 Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Fri, 13 Nov 2026 11:06:00 +0800
+Subject: [PATCH 73/76] vgpu: answer the info encoder's queries
+
+Component: exec info segments (all pathways).
+
+From protocol 235 a macOS 27 guest asks two questions through its info
+encoder instead of through child packets:
+- heapTextureSizeAndAlignWithDescriptor: as record 0x1c3 (32-byte
+  descriptor) or 0x1d5 (40-byte), in place of child 0x40;
+- computePipelineStateInfo:info: as record 0x1c2, in place of child 0x3b.
+Each names a reply buffer and offset. Nothing answered them, so the guest
+read zero for every heap texture's size, and its kernel refused the
+heaps with "invalid arguments"; it read zero threadgroup limits for every
+compute pipeline and dispatched empty grids.
+
+The heap query is answered by the same size-and-align computation as
+0x40. The compute query writes the 28 bytes the guest copies into the
+pipeline: maxTotalThreadsPerThreadgroup, threadExecutionWidth and
+staticThreadgroupMemoryLength as u64s, from the values 0x3b answers.
+
+Measured on arm64 Linux (NVIDIA GB10), macOS 27.2 guest at protocol 237:
+the guest's kernel logged 19 "invalid arguments" resource refusals in
+one boot, and the desktop drew without its wallpaper. With both
+queries answered (the compute reply buffers are pool buffers, read by
+the previous patch) the wallpaper drew.
+
+Verified: the reims-vgpu test suite passes; clippy unchanged.
+Not verified: the backend-metal and x86 arms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/reims-vgpu/src/runtime/drain/mod.rs |   8 +-
+ crates/reims-vgpu/src/runtime/exec/mod.rs  | 174 ++++++++++++++++++++-
+ 2 files changed, 176 insertions(+), 6 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/drain/mod.rs b/crates/reims-vgpu/src/runtime/drain/mod.rs
+index 3991cf518..66c712423 100644
+--- a/crates/reims-vgpu/src/runtime/drain/mod.rs
++++ b/crates/reims-vgpu/src/runtime/drain/mod.rs
+@@ -2297,7 +2297,7 @@ fn reply_device_info<H: HostMemory + HostOps>(
+ /// key 2, and it is named below rather than left as a hole, because "the guest
+ /// asked about five keys and we answered three" invites the wrong repair twice:
+ /// there is no key 5 to add, and key 2 must not be answered the obvious way.
+-const COMPUTE_INFO_KEY_MAX_TOTAL_THREADS: u32 = 1;
++pub(crate) const COMPUTE_INFO_KEY_MAX_TOTAL_THREADS: u32 = 1;
+ 
+ /// Key 2 — `SupportsIndirectCommandBuffers`, and this device deliberately
+ /// answers nothing.
+@@ -2323,8 +2323,8 @@ const COMPUTE_INFO_KEY_MAX_TOTAL_THREADS: u32 = 1;
+ #[allow(dead_code)] // named so a later session does not read the gap as an omission.
+ const COMPUTE_INFO_KEY_SUPPORTS_ICB: u32 = 2;
+ 
+-const COMPUTE_INFO_KEY_THREAD_EXECUTION_WIDTH: u32 = 3;
+-const COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY: u32 = 4;
++pub(crate) const COMPUTE_INFO_KEY_THREAD_EXECUTION_WIDTH: u32 = 3;
++pub(crate) const COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY: u32 = 4;
+ 
+ /// What this host answers for a compute pipeline's threadgroup limits.
+ ///
+@@ -2371,7 +2371,7 @@ const COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY: u32 = 4;
+ /// open question rather than a known cost. What is established is that the 0 is
+ /// wrong for any kernel that declares threadgroup memory, and that only
+ /// reflection can make it right.
+-fn compute_info_caps() -> [(u32, u32); 3] {
++pub(crate) fn compute_info_caps() -> [(u32, u32); 3] {
+     // Apple GPUs report 1024 and 32 across every family the arm64 pathway
+     // targets, and the Metal backend serves an Apple GPU to an Apple guest.
+     #[cfg(not(feature = "backend-vulkan"))]
+diff --git a/crates/reims-vgpu/src/runtime/exec/mod.rs b/crates/reims-vgpu/src/runtime/exec/mod.rs
+index 51ff1cac7..9aa33edba 100644
+--- a/crates/reims-vgpu/src/runtime/exec/mod.rs
++++ b/crates/reims-vgpu/src/runtime/exec/mod.rs
+@@ -1354,8 +1354,8 @@ fn walk_stream<M: HostMemory + HostOps>(
+ }
+ 
+ fn handle_info_record<M: HostMemory + HostOps>(
+-    state: &DeviceState,
+-    host: &M,
++    state: &mut DeviceState,
++    host: &mut M,
+     task_id: u32,
+     opcode: u32,
+     cmd_bytes: &[u8],
+@@ -1363,6 +1363,19 @@ fn handle_info_record<M: HostMemory + HostOps>(
+     use crate::runtime::icb::{
+         apply_icb_host_resource_info, decode_icb_host_resource_info, INFO_OP_ICB_HOST_RESOURCE,
+     };
++    use reims_vgpu_wire::ops::info as w_info;
++    match opcode {
++        w_info::OPCODE_HEAP_TEXTURE_DESCRIPTOR_SIZE_AND_ALIGN
++        | w_info::OPCODE_HEAP_TEXTURE_DESCRIPTOR_SIZE_AND_ALIGN_WIDE => {
++            answer_heap_texture_info(state, host, task_id, opcode, cmd_bytes);
++            return;
++        }
++        w_info::OPCODE_COMPUTE_PIPELINE_STATE_INFO => {
++            answer_compute_pipeline_info(state, host, task_id, cmd_bytes);
++            return;
++        }
++        _ => {}
++    }
+     let bytes = cmd_bytes;
+     if opcode == INFO_OP_ICB_HOST_RESOURCE {
+         // `icb_backing_fail` was a counter with no reason beside it: an ICB
+@@ -1397,6 +1410,163 @@ fn handle_info_record<M: HostMemory + HostOps>(
+     }
+ }
+ 
++/// An info record's payload: the walker may hand the record with or without its
++/// eight-byte header.
++fn info_payload(opcode: u32, cmd_bytes: &[u8]) -> &[u8] {
++    if cmd_bytes.len() >= reims_vgpu_wire::OP_HEADER_LEN && ld32(cmd_bytes) == opcode {
++        &cmd_bytes[reims_vgpu_wire::OP_HEADER_LEN..]
++    } else {
++        cmd_bytes
++    }
++}
++
++/// Write an info answer at `reply_offset` into the buffer `reply_ref` names.
++fn write_info_reply<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    task_id: u32,
++    what: &str,
++    reply_ref: u32,
++    reply_offset: u64,
++    reply: &[u8],
++) -> bool {
++    let (gva, len) =
++        match crate::runtime::objects::resolve_buffer_span(state, host, task_id, reply_ref) {
++            Ok(span) => span,
++            Err(refusal) => {
++                crate::observe::fail(format!(
++                    "{what} refused reason=reply_buffer task={task_id} ref={reply_ref} {refusal:?}"
++                ));
++                return false;
++            }
++        };
++    if reply_offset.saturating_add(reply.len() as u64) > len {
++        crate::observe::fail(format!(
++            "{what} refused reason=reply_out_of_range task={task_id} ref={reply_ref} \
++             offset={reply_offset:#x} len={len:#x}"
++        ));
++        return false;
++    }
++    if crate::runtime::gva_mem::write_task_gva_product_within(
++        state,
++        host,
++        task_id,
++        gva + reply_offset,
++        reply,
++        None,
++    )
++    .is_err()
++    {
++        crate::observe::fail(format!(
++            "{what} refused reason=write task={task_id} gva={:#x}",
++            gva + reply_offset
++        ));
++        return false;
++    }
++    true
++}
++
++/// `heapTextureSizeAndAlignWithDescriptor:` as an info record: `0x1c3` with the
++/// 32-byte descriptor, `0x1d5` with the 40-byte one, each followed by
++/// `{reply_buffer_ref, reply_offset}`. At protocol 237 a macOS 27 guest asks
++/// this way instead of through child packet `0x40`; the answer is the same
++/// `{size, align}`. Unanswered, the guest reads size 0 and its kernel refuses
++/// the heap with `invalid arguments`.
++fn answer_heap_texture_info<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    task_id: u32,
++    opcode: u32,
++    cmd_bytes: &[u8],
++) {
++    use crate::runtime::heap_query;
++    use reims_vgpu_wire::ops::info as w_info;
++    let body = info_payload(opcode, cmd_bytes);
++    let wide = opcode == w_info::OPCODE_HEAP_TEXTURE_DESCRIPTOR_SIZE_AND_ALIGN_WIDE;
++    let desc_len = if wide {
++        heap_query::WIDE_TEXTURE_BODY_LEN
++    } else {
++        heap_query::TEXTURE_BODY_LEN
++    };
++    if body.len() < desc_len + 12 {
++        crate::observe::fail(format!(
++            "heap_texture_info refused reason=short op={opcode:#x} len={}",
++            cmd_bytes.len()
++        ));
++        return;
++    }
++    let desc = if wide {
++        heap_query::decode_wide_serialized_texture_descriptor(&body[..desc_len])
++    } else {
++        heap_query::decode_serialized_texture_descriptor(&body[..desc_len])
++    };
++    let requirement = match desc.and_then(|desc| heap_query::query_size_and_align(&desc)) {
++        Ok(requirement) => requirement,
++        Err(error) => {
++            crate::observe::fail(format!(
++                "heap_texture_info refused reason={error:?} op={opcode:#x} task={task_id}"
++            ));
++            return;
++        }
++    };
++    let reply_ref = ld32(&body[desc_len..]);
++    let reply_offset = ld64(&body[desc_len + 4..]);
++    write_info_reply(
++        state,
++        host,
++        task_id,
++        "heap_texture_info",
++        reply_ref,
++        reply_offset,
++        &requirement.encode(),
++    );
++}
++
++/// `computePipelineStateInfo:info:` (`0x1c2`): `{pipeline_ref, reply_buffer_ref,
++/// reply_offset}`. The guest copies 28 bytes of the reply into the pipeline:
++/// `maxTotalThreadsPerThreadgroup`, `threadExecutionWidth` and
++/// `staticThreadgroupMemoryLength` as `u64`s and a `u32` left zero. The values
++/// are the ones `CmdGetComputeInfo` (`0x3b`) answers below protocol 235.
++/// Unanswered, every one reads 0 and the guest dispatches empty grids.
++fn answer_compute_pipeline_info<M: HostMemory + HostOps>(
++    state: &mut DeviceState,
++    host: &mut M,
++    task_id: u32,
++    cmd_bytes: &[u8],
++) {
++    use reims_vgpu_wire::ops::info as w_info;
++    const REPLY_LEN: usize = 28;
++    let body = info_payload(w_info::OPCODE_COMPUTE_PIPELINE_STATE_INFO, cmd_bytes);
++    if body.len() < 16 {
++        crate::observe::fail(format!(
++            "compute_pipeline_info refused reason=short len={}",
++            cmd_bytes.len()
++        ));
++        return;
++    }
++    let reply_ref = ld32(&body[4..]);
++    let reply_offset = ld64(&body[8..]);
++    let mut reply = [0u8; REPLY_LEN];
++    for (key, value) in crate::runtime::drain::compute_info_caps() {
++        let at = match key {
++            crate::runtime::drain::COMPUTE_INFO_KEY_MAX_TOTAL_THREADS => 0,
++            crate::runtime::drain::COMPUTE_INFO_KEY_THREAD_EXECUTION_WIDTH => 8,
++            crate::runtime::drain::COMPUTE_INFO_KEY_STATIC_THREADGROUP_MEMORY => 16,
++            _ => continue,
++        };
++        reply[at..at + 8].copy_from_slice(&u64::from(value).to_le_bytes());
++    }
++    write_info_reply(
++        state,
++        host,
++        task_id,
++        "compute_pipeline_info",
++        reply_ref,
++        reply_offset,
++        &reply,
++    );
++}
++
+ fn handle_event_record(state: &mut DeviceState, task_id: u32, cmd_bytes: &[u8]) {
+     let cmd = match event_decode::decode(cmd_bytes) {
+         Ok(c) => c,
+-- 
+2.43.0
+

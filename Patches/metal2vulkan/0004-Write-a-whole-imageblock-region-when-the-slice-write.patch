@@ -1,0 +1,830 @@
+From 554d8af0fa08075141c5567c65c89f0369cdc3ab Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Fri, 13 Nov 2026 10:45:53 +0800
+Subject: [PATCH] Write a whole imageblock region when the slice write names
+ one
+
+An explicit-region air.write_imageblock_slice_to_texture writes every
+cell of the region. macOS 27's CoreAnimation blur kernels depend on it:
+the threads fill a shared imageblock tile, meet at a barrier, and one
+thread writes the whole tile with region 32x32 or 16x32. The per-cell
+lowering stored only the calling thread's cell, so each tile produced
+one texel and Liquid Glass sampled an empty backdrop.
+
+- A slice write with the explicit-region flag set and a region that is
+  not constant-empty becomes a call to a helper function that walks the
+  region with two loops, reads each cell from the shared array and
+  writes it, clipped to the image. Zero-area constant regions keep the
+  existing transparent-texel behaviour.
+- The destination is bound at one level and OpImageWrite takes none, so
+  writes that name a level other than 0 are dropped instead of landing
+  on level 0.
+- A compute kernel with such a write and no APV extent gets a 32x32
+  shared tile. The emitter used a per-invocation private scratch when
+  the kernel had no threads_per_threadgroup parameter, which hid every
+  other thread's cells from the writing thread. Any row stride at least
+  as wide as the imageblock keeps cells apart.
+
+Verified: cargo test --release --lib, 1331 pass including the new
+native_kernel_imageblock_region_write_walks_the_whole_region, which
+runs spirv-val. clippy has no new warnings. On arm64 Linux (NVIDIA
+GB10) with Reims at protocol 237, a 27.2 guest's blur chain went from
+all-zero output to the expected backdrop, and its About window drew as
+frosted glass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/native/imageblock.rs                  |   8 +
+ src/native/ir/parse.rs                    |  10 +-
+ src/native/tests/textures.rs              |  69 +++
+ src/passes/air_calls/float_imageblock.rs  |   3 +
+ src/passes/air_calls/imageblock_region.rs | 631 ++++++++++++++++++++++
+ src/passes/air_calls/mod.rs               |   2 +
+ 6 files changed, 722 insertions(+), 1 deletion(-)
+ create mode 100644 src/passes/air_calls/imageblock_region.rs
+
+diff --git a/src/native/imageblock.rs b/src/native/imageblock.rs
+index 7636e08..a6b2d04 100644
+--- a/src/native/imageblock.rs
++++ b/src/native/imageblock.rs
+@@ -6,3 +6,11 @@
+ /// covers every supported `kernel_local_size` shape. Cross-coordinate imageblock lowering allocates
+ /// one metadata-typed cell per slot and uses the decoded `threads_per_threadgroup.x` as row stride.
+ pub(super) const CELL_CAPACITY: u32 = 512;
++
++/// Imageblock extent assumed for a compute kernel whose AIR names none.
++///
++/// Apple compute kernels size their imageblock with `setImageblockWidth:height:` at dispatch, which
++/// the translated shader cannot see. Any row stride at least as wide as the imageblock keeps cells
++/// distinct, so a fixed 32x32 shared tile serves every kernel whose imageblock fits in it — the
++/// CoreAnimation blur kernels use 32x32 and 16x32.
++pub(crate) const DEFAULT_KERNEL_DIMENSIONS: [u32; 2] = [32, 32];
+diff --git a/src/native/ir/parse.rs b/src/native/ir/parse.rs
+index 2251026..13820f5 100644
+--- a/src/native/ir/parse.rs
++++ b/src/native/ir/parse.rs
+@@ -122,7 +122,15 @@ impl LlModule {
+             infer_metadata_byte_buffer_params(kern, entry_name, &functions);
+         let metadata_data_buffer_params =
+             infer_metadata_data_buffer_params(kern, entry_name, &functions);
+-        let imageblock_dimensions = infer_apv_imageblock_dimensions(ll);
++        let imageblock_dimensions = infer_apv_imageblock_dimensions(ll).or_else(|| {
++            (kern.is_some()
++                && ll.contains("@air.imageblock_data(")
++                && ll.lines().any(|line| {
++                    line.contains("call void @air.write_imageblock_slice_to_texture")
++                        && line.contains(", i1 true,")
++                }))
++            .then_some(crate::native::imageblock::DEFAULT_KERNEL_DIMENSIONS)
++        });
+         let cross_coordinate_imageblock =
+             infer_cross_coordinate_imageblock(&functions, &entry_functions);
+         let imageblock_threads_per_threadgroup_param = kern
+diff --git a/src/native/tests/textures.rs b/src/native/tests/textures.rs
+index e2e7164..475df15 100644
+--- a/src/native/tests/textures.rs
++++ b/src/native/tests/textures.rs
+@@ -2798,6 +2798,75 @@ declare void @air.write_imageblock_slice_to_texture_2d_array.i16.v4f16(ptr addrs
+     let _ = std::fs::remove_dir_all(tmp);
+ }
+ 
++/// CoreAnimation's blur kernels fill a shared imageblock tile, meet at a barrier and have one thread
++/// write the whole tile. The write names the origin cell and an explicit 32x32 region, so it must
++/// walk every cell of the region rather than store the calling thread's one cell.
++#[test]
++fn native_kernel_imageblock_region_write_walks_the_whole_region() {
++    let ll = r#"
++target triple = "spirv-unknown-vulkan1.3"
++%"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
++
++define void @k(%"struct.metal::_imageblock_base" %img_blk, ptr addrspace(1) %dst, <2 x i16> %tg, <2 x i16> %tid) {
++entry:
++  %cell = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %tid, i32 0, i16 0)
++  store <4 x half> <half 0xH3C00, half 0xH3C00, half 0xH3C00, half 0xH3C00>, ptr addrspace(4) %cell, align 8
++  call void @air.wg.barrier(i32 8, i32 1)
++  %x = extractelement <2 x i16> %tid, i64 0
++  %y = extractelement <2 x i16> %tid, i64 1
++  %xy = or i16 %x, %y
++  %first = icmp eq i16 %xy, 0
++  br i1 %first, label %write, label %done
++
++write:
++  %origin = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> zeroinitializer, i32 0, i16 0)
++  %base = shl <2 x i16> %tg, <i16 5, i16 5>
++  tail call void @air.write_imageblock_slice_to_texture_2d.i16.v4f16(ptr addrspace(1) %dst, ptr addrspace(4) %origin, i1 true, <2 x i16> zeroinitializer, <2 x i16> <i16 32, i16 32>, <2 x i16> %base, i16 0, i1 false, i32 2)
++  br label %done
++
++done:
++  ret void
++}
++
++declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
++declare void @air.write_imageblock_slice_to_texture_2d.i16.v4f16(ptr addrspace(1), ptr addrspace(4), i1, <2 x i16>, <2 x i16>, <2 x i16>, i16, i1, i32)
++declare void @air.wg.barrier(i32, i32)
++
++!air.kernel = !{!0}
++!0 = !{ptr @k, !1, !2}
++!1 = !{}
++!2 = !{!3, !5, !6, !7}
++!3 = !{i32 0, !"air.imageblock", !"explicit", !"air.imageblock_data_size", i32 8, !"air.struct_type_info", !4, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"imageblock<ImageBlockData, layout_explicit>", !"air.arg_name", !"imgBlk"}
++!4 = !{i32 0, i32 8, i32 0, !"half4", !"v"}
++!5 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<half, write>", !"air.arg_name", !"dst"}
++!6 = !{i32 2, !"air.threadgroup_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tg"}
++!7 = !{i32 3, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tid"}
++"#;
++    let tmp = std::env::temp_dir().join(format!(
++        "metal2vulkan_kernel_imageblock_region_{}",
++        std::process::id()
++    ));
++    let _ = std::fs::create_dir_all(&tmp);
++    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
++    let asm = disassemble(&spv).expect("disassemble");
++    assert!(asm.contains("OpFunctionCall"), "{asm}");
++    assert!(asm.contains("OpLoopMerge"), "{asm}");
++    assert!(asm.contains("OpImageWrite"), "{asm}");
++    assert!(
++        asm.lines()
++            .any(|line| line.contains("OpVariable") && line.contains("Workgroup")),
++        "the tile must be shared between the threads that fill it and the one that writes it\n{asm}"
++    );
++    assert!(!asm.contains("air.imageblock"), "{asm}");
++    if std::process::Command::new("spirv-val")
++        .arg("--version")
++        .output()
++        .is_ok()
++    {
++        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
++    }
++    let _ = std::fs::remove_dir_all(tmp);
++}
+ #[test]
+ fn native_kernel_imageblock_slice_write_zero_extent_writes_transparent_zero() {
+     let ll = r#"
+diff --git a/src/passes/air_calls/float_imageblock.rs b/src/passes/air_calls/float_imageblock.rs
+index d0097d0..23b4473 100644
+--- a/src/passes/air_calls/float_imageblock.rs
++++ b/src/passes/air_calls/float_imageblock.rs
+@@ -1051,6 +1051,9 @@ pub(in crate::passes) fn lower_imageblock_slice_write(
+     args: &[Word],
+     v4: Word,
+ ) -> Result<Vec<Instruction>, String> {
++    if let Some(out) = lower_imageblock_region_write(ctx, name, args, v4)? {
++        return Ok(out);
++    }
+     if args.len() < 6 {
+         return Err("air.write_imageblock_slice_to_texture missing operands".into());
+     }
+diff --git a/src/passes/air_calls/imageblock_region.rs b/src/passes/air_calls/imageblock_region.rs
+new file mode 100644
+index 0000000..b6b3219
+--- /dev/null
++++ b/src/passes/air_calls/imageblock_region.rs
+@@ -0,0 +1,631 @@
++//! `air.write_imageblock_slice_to_texture_2d` with an explicit region.
++
++use super::*;
++
++/// Lower a slice write whose region is given explicitly as a write of every cell in that region.
++///
++/// Apple's compute kernels fill a shared imageblock tile, meet at a barrier, and then have one
++/// thread write the whole tile: the call names the tile origin's cell, a region size and the
++/// texture coordinate the region lands at. Writing only the calling thread's cell, as the per-cell
++/// lowering does, leaves every other texel of the tile unwritten.
++///
++/// The region is walked in a helper function, so the caller's block does not need splitting:
++/// `helper(first_cell, row_stride, width, height, x, y, level)`. The helper reads the shared cell
++/// array and the storage image through their module-scope variables and clips each texel to the
++/// image.
++///
++/// A Vulkan storage image is bound at one level and `OpImageWrite` takes no level, so a write that
++/// names a level other than 0 would land on level 0 over the texels already there. Those writes are
++/// dropped instead: the bound level keeps what was written to it, and a sampler asking for a
++/// coarser level of a single-level image reads that.
++///
++/// `None` falls back to the per-cell lowering: an implicit or zero region, a destination that is
++/// not a plain 2D float storage image variable, or cells that are not a Workgroup array.
++pub(in crate::passes) fn lower_imageblock_region_write(
++    ctx: &mut Ctx,
++    name: &str,
++    args: &[Word],
++    v4: Word,
++) -> Result<Option<Vec<Instruction>>, String> {
++    if args.len() < 6 || const_bool_value(ctx, args[2]) != Some(true) {
++        return Ok(None);
++    }
++    if matches!(
++        value_def_instruction(ctx, args[4]).map(|def| def.class.opcode),
++        None | Some(Op::Undef)
++    ) {
++        return Ok(None);
++    }
++    if constant_region_is_empty(ctx, args[4]) {
++        return Ok(None);
++    }
++    let img = resolve_image_value(ctx, args[0]);
++    if !image_is_storage(ctx, img) {
++        return Ok(None);
++    }
++    if ctx
++        .image_dims
++        .get(&img)
++        .copied()
++        .unwrap_or((Dim::Dim2D, false))
++        != (Dim::Dim2D, false)
++    {
++        return Ok(None);
++    }
++    if ctx
++        .image_comp
++        .get(&img)
++        .copied()
++        .unwrap_or(ImageComp::Float)
++        != ImageComp::Float
++    {
++        return Ok(None);
++    }
++    let Some(img_def) = value_def_instruction(ctx, img) else {
++        return Ok(None);
++    };
++    if img_def.class.opcode != Op::Load {
++        return Ok(None);
++    }
++    let Some(Operand::IdRef(img_var)) = img_def.operands.first().cloned() else {
++        return Ok(None);
++    };
++    if value_def_instruction(ctx, img_var).map(|def| def.class.opcode) != Some(Op::Variable) {
++        return Ok(None);
++    }
++    let Some(img_ty) = img_def.result_type else {
++        return Ok(None);
++    };
++
++    let Some(cell_def) = value_def_instruction(ctx, args[1]) else {
++        return Ok(None);
++    };
++    if !matches!(
++        cell_def.class.opcode,
++        Op::AccessChain | Op::InBoundsAccessChain
++    ) || cell_def.operands.len() != 2
++    {
++        return Ok(None);
++    }
++    let (Some(Operand::IdRef(cells)), Some(Operand::IdRef(first_cell))) = (
++        cell_def.operands.first().cloned(),
++        cell_def.operands.get(1).cloned(),
++    ) else {
++        return Ok(None);
++    };
++    let cells_is_workgroup = value_def_instruction(ctx, cells).is_some_and(|def| {
++        def.class.opcode == Op::Variable
++            && def.operands.first() == Some(&Operand::StorageClass(StorageClass::Workgroup))
++    });
++    if !cells_is_workgroup {
++        return Ok(None);
++    }
++    let Some(cell_ptr_ty) = cell_def.result_type else {
++        return Ok(None);
++    };
++    let Some(cell_ty) = pointer_pointee_type(ctx, cell_ptr_ty) else {
++        return Ok(None);
++    };
++    let texel_ty = imageblock_slice_texel_type(ctx, name, v4).unwrap_or(cell_ty);
++    let Some(path) = imageblock_zero_offset_subobject_path(ctx, cell_ty, texel_ty) else {
++        return Ok(None);
++    };
++    let (elem, lanes) = vector_type_shape(ctx, texel_ty).unwrap_or((texel_ty, 1));
++    let half = is_half_scalar(ctx, elem);
++    if lanes != 4 || !(half || is_f32_scalar(ctx, elem)) {
++        return Ok(None);
++    }
++
++    let mut out = Vec::new();
++    let uint = ctx.ty_uint();
++    let stride = row_stride_of(ctx, first_cell).unwrap_or_else(|| ctx.const_uint(32));
++    let [origin_x, origin_y] = split_uint2(ctx, args[3], &mut out)?;
++    let [width, height] = split_uint2(ctx, args[4], &mut out)?;
++    let [x, y] = split_uint2(ctx, args[5], &mut out)?;
++    let lod = level_of(ctx, args.get(6).copied(), &mut out)?;
++    let origin_row = ctx.module.fresh_id();
++    out.push(Instruction::new(
++        Op::IMul,
++        Some(uint),
++        Some(origin_row),
++        vec![Operand::IdRef(origin_y), Operand::IdRef(stride)],
++    ));
++    let origin_offset = ctx.module.fresh_id();
++    out.push(Instruction::new(
++        Op::IAdd,
++        Some(uint),
++        Some(origin_offset),
++        vec![Operand::IdRef(origin_row), Operand::IdRef(origin_x)],
++    ));
++    let first = ctx.module.fresh_id();
++    out.push(Instruction::new(
++        Op::IAdd,
++        Some(uint),
++        Some(first),
++        vec![Operand::IdRef(first_cell), Operand::IdRef(origin_offset)],
++    ));
++
++    let helper = build_region_store(ctx, img_var, img_ty, cells, texel_ty, &path, half, v4);
++    let void = ctx.ty_void();
++    out.push(Instruction::new(
++        Op::FunctionCall,
++        Some(void),
++        Some(ctx.module.fresh_id()),
++        vec![
++            Operand::IdRef(helper),
++            Operand::IdRef(first),
++            Operand::IdRef(stride),
++            Operand::IdRef(width),
++            Operand::IdRef(height),
++            Operand::IdRef(x),
++            Operand::IdRef(y),
++            Operand::IdRef(lod),
++        ],
++    ));
++    Ok(Some(out))
++}
++
++/// Whether a constant region has a zero lane. The per-cell lowering keeps Apple's measured
++/// zero-area behaviour, a transparent texel at the destination, so such a call stays there.
++fn constant_region_is_empty(ctx: &Ctx, region: Word) -> bool {
++    let Some(def) = value_def_instruction(ctx, region) else {
++        return false;
++    };
++    match def.class.opcode {
++        Op::ConstantNull => true,
++        Op::ConstantComposite => def.operands.iter().any(|operand| match operand {
++            Operand::IdRef(lane) => value_def_instruction(ctx, *lane).is_some_and(|lane| {
++                lane.class.opcode == Op::ConstantNull
++                    || (lane.class.opcode == Op::Constant
++                        && matches!(lane.operands.first(), Some(Operand::LiteralBit32(0))))
++            }),
++            _ => false,
++        }),
++        _ => false,
++    }
++}
++/// The row stride the emitter multiplied the cell's y coordinate by: `first = y * stride + x`.
++fn row_stride_of(ctx: &Ctx, index: Word) -> Option<Word> {
++    let add = value_def_instruction(ctx, index)?;
++    if add.class.opcode != Op::IAdd {
++        return None;
++    }
++    let Some(Operand::IdRef(row)) = add.operands.first() else {
++        return None;
++    };
++    let mul = value_def_instruction(ctx, *row)?;
++    if mul.class.opcode != Op::IMul {
++        return None;
++    }
++    match mul.operands.get(1) {
++        Some(Operand::IdRef(stride)) => Some(*stride),
++        _ => None,
++    }
++}
++
++/// The mip level a slice write names, as a `uint`; 0 when the call names none.
++fn level_of(
++    ctx: &mut Ctx,
++    level: Option<Word>,
++    out: &mut Vec<Instruction>,
++) -> Result<Word, String> {
++    let Some(level) = level else {
++        return Ok(ctx.const_uint(0));
++    };
++    let ty = value_result_type(ctx, level)
++        .ok_or("air.write_imageblock_slice_to_texture: level operand has no type")?;
++    if scalar_bit_width(ctx, ty) == 32 {
++        return Ok(level);
++    }
++    let uint = ctx.ty_uint();
++    let id = ctx.module.fresh_id();
++    out.push(Instruction::new(
++        Op::UConvert,
++        Some(uint),
++        Some(id),
++        vec![Operand::IdRef(level)],
++    ));
++    Ok(id)
++}
++/// Widen a two-lane integer vector to `uint2` and return its lanes.
++fn split_uint2(
++    ctx: &mut Ctx,
++    value: Word,
++    out: &mut Vec<Instruction>,
++) -> Result<[Word; 2], String> {
++    let ty = value_result_type(ctx, value)
++        .ok_or("air.write_imageblock_slice_to_texture: region operand has no type")?;
++    let uint = ctx.ty_uint();
++    let uint2 = ctx.ty_vec_uint(2);
++    let wide = if scalar_bit_width(ctx, ty) == 32 {
++        value
++    } else {
++        let id = ctx.module.fresh_id();
++        out.push(Instruction::new(
++            Op::UConvert,
++            Some(uint2),
++            Some(id),
++            vec![Operand::IdRef(value)],
++        ));
++        id
++    };
++    let mut lanes = [0; 2];
++    for (lane, id) in lanes.iter_mut().enumerate() {
++        *id = ctx.module.fresh_id();
++        out.push(Instruction::new(
++            Op::CompositeExtract,
++            Some(uint),
++            Some(*id),
++            vec![Operand::IdRef(wide), Operand::LiteralBit32(lane as u32)],
++        ));
++    }
++    Ok(lanes)
++}
++
++/// `void (uint first, uint stride, uint width, uint height, uint x, uint y, uint level)`.
++fn region_store_type(ctx: &mut Ctx) -> Word {
++    let void = ctx.ty_void();
++    let uint = ctx.ty_uint();
++    let mut operands = vec![Operand::IdRef(void)];
++    operands.extend(std::iter::repeat_n(Operand::IdRef(uint), 7));
++    if let Some(id) = ctx
++        .new_globals
++        .iter()
++        .chain(ctx.module.types_global_values.iter())
++        .find(|inst| inst.class.opcode == Op::TypeFunction && inst.operands == operands)
++        .and_then(|inst| inst.result_id)
++    {
++        return id;
++    }
++    let id = ctx.module.fresh_id();
++    ctx.new_globals
++        .push(Instruction::new(Op::TypeFunction, None, Some(id), operands));
++    id
++}
++
++#[allow(clippy::too_many_arguments)]
++fn build_region_store(
++    ctx: &mut Ctx,
++    img_var: Word,
++    img_ty: Word,
++    cells: Word,
++    texel_ty: Word,
++    path: &[u32],
++    half: bool,
++    v4: Word,
++) -> Word {
++    let void = ctx.ty_void();
++    let uint = ctx.ty_uint();
++    let uint2 = ctx.ty_vec_uint(2);
++    let bool_ty = ctx.ty_bool();
++    let fn_ty = region_store_type(ctx);
++    let texel_ptr_ty = ctx.ty_ptr(StorageClass::Workgroup, texel_ty);
++    let zero = ctx.const_uint(0);
++    let one = ctx.const_uint(1);
++    let path_ids: Vec<Word> = path.iter().map(|&index| ctx.const_uint(index)).collect();
++    let mut fresh = || ctx.module.fresh_id();
++
++    let function = fresh();
++    let params: Vec<Word> = (0..7).map(|_| fresh()).collect();
++    let [first, stride, width, height, x0, y0, lod] = [
++        params[0], params[1], params[2], params[3], params[4], params[5], params[6],
++    ];
++    let [entry, y_head, y_body, x_head, x_body, store, store_merge, x_next, x_merge, y_next, y_merge] =
++        [(); 11].map(|_| fresh());
++    let [image, size, image_w, image_h] = [(); 4].map(|_| fresh());
++    let [y, y_more, x, x_more] = [(); 4].map(|_| fresh());
++    let [row, row_first, cell, texel_ptr, texel, texel32] = [(); 6].map(|_| fresh());
++    let [tx, ty, in_x, in_y, in_image, base_level, inside, coord] = [(); 8].map(|_| fresh());
++    let [x_inc, y_inc] = [(); 2].map(|_| fresh());
++
++    let inst = Instruction::new;
++    let label = |id| Some(inst(Op::Label, None, Some(id), vec![]));
++    let mut access = vec![Operand::IdRef(cells), Operand::IdRef(cell)];
++    access.extend(path_ids.iter().map(|&id| Operand::IdRef(id)));
++    let texel_value = if half { texel32 } else { texel };
++    let mut body = vec![
++        inst(
++            Op::IMul,
++            Some(uint),
++            Some(row),
++            vec![Operand::IdRef(y), Operand::IdRef(stride)],
++        ),
++        inst(
++            Op::IAdd,
++            Some(uint),
++            Some(row_first),
++            vec![Operand::IdRef(first), Operand::IdRef(row)],
++        ),
++        inst(
++            Op::IAdd,
++            Some(uint),
++            Some(cell),
++            vec![Operand::IdRef(row_first), Operand::IdRef(x)],
++        ),
++        inst(
++            Op::InBoundsAccessChain,
++            Some(texel_ptr_ty),
++            Some(texel_ptr),
++            access,
++        ),
++        inst(
++            Op::Load,
++            Some(texel_ty),
++            Some(texel),
++            vec![Operand::IdRef(texel_ptr)],
++        ),
++    ];
++    if half {
++        body.push(inst(
++            Op::FConvert,
++            Some(v4),
++            Some(texel32),
++            vec![Operand::IdRef(texel)],
++        ));
++    }
++    body.extend([
++        inst(
++            Op::IAdd,
++            Some(uint),
++            Some(tx),
++            vec![Operand::IdRef(x0), Operand::IdRef(x)],
++        ),
++        inst(
++            Op::IAdd,
++            Some(uint),
++            Some(ty),
++            vec![Operand::IdRef(y0), Operand::IdRef(y)],
++        ),
++        inst(
++            Op::ULessThan,
++            Some(bool_ty),
++            Some(in_x),
++            vec![Operand::IdRef(tx), Operand::IdRef(image_w)],
++        ),
++        inst(
++            Op::ULessThan,
++            Some(bool_ty),
++            Some(in_y),
++            vec![Operand::IdRef(ty), Operand::IdRef(image_h)],
++        ),
++        inst(
++            Op::LogicalAnd,
++            Some(bool_ty),
++            Some(in_image),
++            vec![Operand::IdRef(in_x), Operand::IdRef(in_y)],
++        ),
++        inst(
++            Op::IEqual,
++            Some(bool_ty),
++            Some(base_level),
++            vec![Operand::IdRef(lod), Operand::IdRef(zero)],
++        ),
++        inst(
++            Op::LogicalAnd,
++            Some(bool_ty),
++            Some(inside),
++            vec![Operand::IdRef(in_image), Operand::IdRef(base_level)],
++        ),
++        inst(
++            Op::SelectionMerge,
++            None,
++            None,
++            vec![
++                Operand::IdRef(store_merge),
++                Operand::SelectionControl(spirv::SelectionControl::NONE),
++            ],
++        ),
++        inst(
++            Op::BranchConditional,
++            None,
++            None,
++            vec![
++                Operand::IdRef(inside),
++                Operand::IdRef(store),
++                Operand::IdRef(store_merge),
++            ],
++        ),
++    ]);
++
++    let blocks = vec![
++        Block {
++            label: label(entry),
++            instructions: vec![
++                inst(
++                    Op::Load,
++                    Some(img_ty),
++                    Some(image),
++                    vec![Operand::IdRef(img_var)],
++                ),
++                inst(
++                    Op::ImageQuerySize,
++                    Some(uint2),
++                    Some(size),
++                    vec![Operand::IdRef(image)],
++                ),
++                inst(
++                    Op::CompositeExtract,
++                    Some(uint),
++                    Some(image_w),
++                    vec![Operand::IdRef(size), Operand::LiteralBit32(0)],
++                ),
++                inst(
++                    Op::CompositeExtract,
++                    Some(uint),
++                    Some(image_h),
++                    vec![Operand::IdRef(size), Operand::LiteralBit32(1)],
++                ),
++                inst(Op::Branch, None, None, vec![Operand::IdRef(y_head)]),
++            ],
++        },
++        Block {
++            label: label(y_head),
++            instructions: vec![
++                inst(
++                    Op::Phi,
++                    Some(uint),
++                    Some(y),
++                    vec![
++                        Operand::IdRef(zero),
++                        Operand::IdRef(entry),
++                        Operand::IdRef(y_inc),
++                        Operand::IdRef(y_next),
++                    ],
++                ),
++                inst(
++                    Op::ULessThan,
++                    Some(bool_ty),
++                    Some(y_more),
++                    vec![Operand::IdRef(y), Operand::IdRef(height)],
++                ),
++                inst(
++                    Op::LoopMerge,
++                    None,
++                    None,
++                    vec![
++                        Operand::IdRef(y_merge),
++                        Operand::IdRef(y_next),
++                        Operand::LoopControl(spirv::LoopControl::NONE),
++                    ],
++                ),
++                inst(
++                    Op::BranchConditional,
++                    None,
++                    None,
++                    vec![
++                        Operand::IdRef(y_more),
++                        Operand::IdRef(y_body),
++                        Operand::IdRef(y_merge),
++                    ],
++                ),
++            ],
++        },
++        Block {
++            label: label(y_body),
++            instructions: vec![inst(Op::Branch, None, None, vec![Operand::IdRef(x_head)])],
++        },
++        Block {
++            label: label(x_head),
++            instructions: vec![
++                inst(
++                    Op::Phi,
++                    Some(uint),
++                    Some(x),
++                    vec![
++                        Operand::IdRef(zero),
++                        Operand::IdRef(y_body),
++                        Operand::IdRef(x_inc),
++                        Operand::IdRef(x_next),
++                    ],
++                ),
++                inst(
++                    Op::ULessThan,
++                    Some(bool_ty),
++                    Some(x_more),
++                    vec![Operand::IdRef(x), Operand::IdRef(width)],
++                ),
++                inst(
++                    Op::LoopMerge,
++                    None,
++                    None,
++                    vec![
++                        Operand::IdRef(x_merge),
++                        Operand::IdRef(x_next),
++                        Operand::LoopControl(spirv::LoopControl::NONE),
++                    ],
++                ),
++                inst(
++                    Op::BranchConditional,
++                    None,
++                    None,
++                    vec![
++                        Operand::IdRef(x_more),
++                        Operand::IdRef(x_body),
++                        Operand::IdRef(x_merge),
++                    ],
++                ),
++            ],
++        },
++        Block {
++            label: label(x_body),
++            instructions: body,
++        },
++        Block {
++            label: label(store),
++            instructions: vec![
++                inst(
++                    Op::CompositeConstruct,
++                    Some(uint2),
++                    Some(coord),
++                    vec![Operand::IdRef(tx), Operand::IdRef(ty)],
++                ),
++                inst(
++                    Op::ImageWrite,
++                    None,
++                    None,
++                    vec![
++                        Operand::IdRef(image),
++                        Operand::IdRef(coord),
++                        Operand::IdRef(texel_value),
++                    ],
++                ),
++                inst(Op::Branch, None, None, vec![Operand::IdRef(store_merge)]),
++            ],
++        },
++        Block {
++            label: label(store_merge),
++            instructions: vec![inst(Op::Branch, None, None, vec![Operand::IdRef(x_next)])],
++        },
++        Block {
++            label: label(x_next),
++            instructions: vec![
++                inst(
++                    Op::IAdd,
++                    Some(uint),
++                    Some(x_inc),
++                    vec![Operand::IdRef(x), Operand::IdRef(one)],
++                ),
++                inst(Op::Branch, None, None, vec![Operand::IdRef(x_head)]),
++            ],
++        },
++        Block {
++            label: label(x_merge),
++            instructions: vec![inst(Op::Branch, None, None, vec![Operand::IdRef(y_next)])],
++        },
++        Block {
++            label: label(y_next),
++            instructions: vec![
++                inst(
++                    Op::IAdd,
++                    Some(uint),
++                    Some(y_inc),
++                    vec![Operand::IdRef(y), Operand::IdRef(one)],
++                ),
++                inst(Op::Branch, None, None, vec![Operand::IdRef(y_head)]),
++            ],
++        },
++        Block {
++            label: label(y_merge),
++            instructions: vec![inst(Op::Return, None, None, vec![])],
++        },
++    ];
++
++    ctx.module.functions.push(Function {
++        def: Some(inst(
++            Op::Function,
++            Some(void),
++            Some(function),
++            vec![
++                Operand::FunctionControl(FunctionControl::NONE),
++                Operand::IdRef(fn_ty),
++            ],
++        )),
++        parameters: params
++            .iter()
++            .map(|&id| inst(Op::FunctionParameter, Some(uint), Some(id), vec![]))
++            .collect(),
++        blocks,
++        end: Some(inst(Op::FunctionEnd, None, None, vec![])),
++    });
++    function
++}
+diff --git a/src/passes/air_calls/mod.rs b/src/passes/air_calls/mod.rs
+index 7bd3a5d..e90bd54 100644
+--- a/src/passes/air_calls/mod.rs
++++ b/src/passes/air_calls/mod.rs
+@@ -12,7 +12,9 @@ pub(in crate::passes) use dispatch_texture::*;
+ mod integer_simd;
+ pub(in crate::passes) use integer_simd::*;
+ mod float_imageblock;
++mod imageblock_region;
+ pub(in crate::passes) use float_imageblock::*;
++pub(in crate::passes) use imageblock_region::*;
+ mod rawbyte_unary;
+ pub(in crate::passes) use rawbyte_unary::*;
+ mod matrix_shuffle;
+-- 
+2.43.0
+
