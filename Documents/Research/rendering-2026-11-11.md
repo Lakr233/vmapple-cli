@@ -272,9 +272,10 @@ does not change the glass.
 
 ## Protocol 237
 
-Done on 2026-11-13 with Reims 0072–0076 and metal2vulkan 0004. A 27.2 guest
+Done on 2026-11-13 with Reims 0072–0079 and metal2vulkan 0004. A 27.2 guest
 asks for 252 and now gets 237, and its Liquid Glass draws a blurred backdrop.
-Not every time: see [What Is Still Wrong](#what-is-still-wrong).
+0072–0076 got there with grey glass and black corners; 0077–0079 fixed those.
+See [0077–0079](#00770079) and [What Is Still Wrong](#what-is-still-wrong).
 
 ### The Ladder
 
@@ -326,6 +327,8 @@ reading the driver or plugin for the layout:
   resource records; `0x45` carries the info encoder's command buffers. `0x44`
   sets the object list by task address, with a second list nothing here
   reads. Without `0x44` no object resolved and every draw was refused (0075).
+  Each resource record's flag byte packs the four validity ops into its low
+  nibble (0077).
 - **Texture descriptors.** Object-list descriptors carry TextureDescriptor2
   records (`0x34`, `0x39`). Read with the old layout, formats came out as
   0x500 and widths as 0x80000000. They are now rewritten to the old layout
@@ -378,20 +381,51 @@ Diagnostic builds of the same code drew About This Mac as frosted glass in two
 more boots. The last row is the build in `Patches`; the one above it ran 0076
 before its two copies of the black sample were moved into one helper.
 
+### 0077–0079
+
+At 0076 the glass was often grey, the Dock had no background in some builds,
+and windows and menus had black corners. The explanation written then, that
+CoreAnimation captured a retired display buffer, was wrong. Each defect below
+was found by reading back every draw's target and every kernel's inputs in
+one frame, on diagnostic builds.
+
+- **Resource tables (0077).** `0x43` resource records carry one flag word
+  where `0x37` carries four validity-op bytes. The guest packs the four ops into
+  the low nibble of its first byte (clear host valid, set host valid, clear guest
+  valid, set guest valid, from bit 0) and sets the high nibble as well. Read as
+  four bytes, the high nibble said "clear host valid", which Reims takes to mean
+  the guest's CPU wrote the resource. One boot's records by first byte: 0x40
+  572, 0x20 313, 0x10 276, 0xa0 268, 0x42 173, 0xa8 157, 0xd0 102. 23 of 25
+  frames a pass had stored into a linear texture were abandoned for the guest's
+  pages, and the Dock's blur kernel read an all-zero 896×64 backdrop. With the
+  nibble read, none was abandoned and the Dock got its glass back. The same
+  misreading bumped mapping content generations 531 times in a boot instead of
+  4. A diagnostic change that made the backdrop capture read a surface's
+  resident instead of its pages changed nothing once the nibble was read, and
+  was dropped. What the high nibble means is not known.
+- **`inplace_copy_lph` (0078).** The 42×42 and 54×54 RGBA16F heap textures 0076
+  sampled as black are written by this fragment shader: it has no colour output
+  and copies the framebuffer under a window's or menu's rounded corner into a
+  storage image. Its target is a heap texture, and Reims kept storage-image
+  writes only for linear textures. The texels now go to a per-texture snapshot
+  that draws sample, and the corners are round.
+- **Mipmapped heap textures (0079).** Toolbar and button glass blurs into heap
+  textures with mip levels (448×96 in five, 84×30 in two). Compute refused any
+  heap texture with more than one level, and the toolbar drew black. Kernels now
+  run on the base level, and their output to a heap texture becomes its snapshot.
+
+About This Mac's white interior is drawn by the guest: the draw before the
+capture fills the content rectangle with opaque white from its vertex colours.
+Only the frame around it is glass.
+
+| build | About This Mac | menus | Dock | Finder toolbar |
+| --- | --- | --- | --- | --- |
+| 0072–0079, four cold boots | glass frame, round corners | Apple and Finder menus: tinted glass with items | glass tray | glass, with title and buttons |
+
 ### What Is Still Wrong
 
-- **The capture sometimes reads a retired display buffer.** Mapping 2 shows the
-  boot screen and the first desktop frames. Then the guest drops its wire count
-  to zero and deletes its backing, and WindowServer presents only mappings 3
-  and 4. CoreAnimation's capture still samples mapping 2 at times. Its pages now
-  belong to another surface and Reims holds nothing newer than the boot screen
-  for it. So the capture fails and the glass stays grey (one capture per window
-  open), or the boot Apple logo is sampled. On a Mac the host keeps the surface's
-  last frame. Reims lost that frame when the chain that drew it was abandoned to
-  the CPU recovery rail early in the boot.
-- **Unwritten heap textures.** Every frame samples 42×42 and 54×54 RGBA16F heap
-  textures that nothing this device runs writes. 0076 samples them as
-  transparent black instead of refusing the draw, which brings menu items back.
-  What fills them on a Mac is not known.
-- **Corners.** About This Mac and the menus sometimes draw small dark squares
-  at their corners.
+- **Mip levels.** Kernels write only level 0, so glass is blurred less than on
+  a Mac.
+- **A stray strip.** In one boot a newly opened Finder window's toolbar showed
+  a grey strip under its title in the first frame, gone in the next.
+- **15.6.1** still draws its language panel too dark to read in some boots.
