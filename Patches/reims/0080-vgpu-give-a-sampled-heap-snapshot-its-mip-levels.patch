@@ -1,0 +1,544 @@
+From 01d8f17a4c818107d36a9b217ceea3563e0be304 Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Fri, 13 Nov 2026 16:40:40 +0800
+Subject: [PATCH 80/81] vgpu: give a sampled heap snapshot its mip levels
+
+Component: Vulkan engine sampled images, and the draw rail's sampled heap
+textures.
+
+macOS 27's glass shaders sample the backdrop blur pyramid at an explicit
+level of detail. The pyramid is a mipmapped heap texture whose levels
+above 0 the guest's downsample kernel writes, and this device keeps only
+level 0 (0079). Every sampled image was created with one level, so the
+glass read level 0 at any LOD and was blurred far less than on a Mac.
+
+A sampled snapshot of a mipmapped 2D heap texture now gets an image with
+the texture's mip count, capped by its size. Level 0 is uploaded and each
+level above is the one below halved with a linear blit, recorded with the
+upload. SampledKey and SampledSlot carry the count, so a recycled image
+keeps its shape.
+
+Measured on arm64 Linux (NVIDIA GB10), macOS 27.2 guest at protocol 237:
+85 mipmapped samples in one cold boot, no panic, and the Dock, menus and
+About This Mac drawn as glass.
+
+Verified: the reims-vgpu test suite passes, with a new test for the key;
+clippy unchanged.
+Not verified: the backend-metal arm.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/backend/vulkan/engine/exec.rs         | 75 ++++++++++++++++++-
+ .../src/backend/vulkan/engine/pools/mod.rs    | 16 ++++
+ .../engine/pools/sampled_working_set.rs       |  1 +
+ .../engine/pools/submission_and_buffers.rs    | 15 +++-
+ .../src/backend/vulkan/engine/types.rs        |  5 ++
+ crates/reims-vgpu/src/runtime/draw/mod.rs     |  2 +
+ crates/reims-vgpu/src/runtime/draw/vulkan.rs  | 28 +++++++
+ crates/reims-vgpu/tests/vk_engine_batch.rs    |  1 +
+ crates/reims-vgpu/tests/vk_engine_parity.rs   | 15 ++++
+ 9 files changed, 152 insertions(+), 6 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs b/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
+index 9b30796fa..ca60d94e0 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/exec.rs
+@@ -2056,11 +2056,13 @@ unsafe fn upload_buffer_to_sampled_image(
+     array_layers: u32,
+     extent_depth: u32,
+     row_length_texels: u32,
++    mip_levels: u32,
+ ) {
++    let mip_levels = mip_levels.max(1);
+     let range = vk::ImageSubresourceRange {
+         aspect_mask: vk::ImageAspectFlags::COLOR,
+         base_mip_level: 0,
+-        level_count: 1,
++        level_count: mip_levels,
+         base_array_layer: 0,
+         layer_count: array_layers,
+     };
+@@ -2101,13 +2103,76 @@ unsafe fn upload_buffer_to_sampled_image(
+         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+         &copy,
+     );
+-    let to_shader = [vk::ImageMemoryBarrier::default()
++    // Each level above 0 is the one below it halved with a linear blit. The
++    // source level moves to TRANSFER_SRC before its blit; the last level
++    // stays TRANSFER_DST, so the two groups leave for the shader separately.
++    let level = |base_mip_level, level_count| vk::ImageSubresourceRange {
++        base_mip_level,
++        level_count,
++        ..range
++    };
++    for dst in 1..mip_levels {
++        let to_source = [vk::ImageMemoryBarrier::default()
++            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
++            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
++            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
++            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
++            .image(image)
++            .subresource_range(level(dst - 1, 1))];
++        ctx.device.cmd_pipeline_barrier(
++            cb,
++            vk::PipelineStageFlags::TRANSFER,
++            vk::PipelineStageFlags::TRANSFER,
++            vk::DependencyFlags::empty(),
++            &[],
++            &[],
++            &to_source,
++        );
++        let corner = |mip: u32| vk::Offset3D {
++            x: (width >> mip).max(1) as i32,
++            y: (height >> mip).max(1) as i32,
++            z: 1,
++        };
++        let layers = |mip_level| vk::ImageSubresourceLayers {
++            aspect_mask: vk::ImageAspectFlags::COLOR,
++            mip_level,
++            base_array_layer: 0,
++            layer_count: array_layers,
++        };
++        let blit = [vk::ImageBlit::default()
++            .src_subresource(layers(dst - 1))
++            .src_offsets([vk::Offset3D::default(), corner(dst - 1)])
++            .dst_subresource(layers(dst))
++            .dst_offsets([vk::Offset3D::default(), corner(dst)])];
++        ctx.device.cmd_blit_image(
++            cb,
++            image,
++            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
++            image,
++            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
++            &blit,
++            vk::Filter::LINEAR,
++        );
++    }
++    let last = mip_levels - 1;
++    let mut to_shader = vec![vk::ImageMemoryBarrier::default()
+         .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+         .dst_access_mask(vk::AccessFlags::SHADER_READ)
+         .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+         .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+         .image(image)
+-        .subresource_range(range)];
++        .subresource_range(level(last, 1))];
++    if last > 0 {
++        to_shader.push(
++            vk::ImageMemoryBarrier::default()
++                .src_access_mask(vk::AccessFlags::TRANSFER_READ)
++                .dst_access_mask(vk::AccessFlags::SHADER_READ)
++                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
++                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
++                .image(image)
++                .subresource_range(level(0, last)),
++        );
++    }
+     ctx.device.cmd_pipeline_barrier(
+         cb,
+         vk::PipelineStageFlags::TRANSFER,
+@@ -4766,6 +4831,7 @@ pub(crate) unsafe fn execute_draw_inner(
+             if *volume { 1 } else { *layers },
+             if *volume { *layers } else { 1 },
+             0,
++            img.mip_levels,
+         );
+     }
+ 
+@@ -4963,6 +5029,7 @@ pub(crate) unsafe fn execute_draw_inner(
+             if *volume { 1 } else { *layers },
+             if *volume { *layers } else { 1 },
+             *row_length_texels,
++            1,
+         );
+     }
+ 
+@@ -7222,6 +7289,7 @@ mod tests {
+                 width: w,
+                 height: h,
+                 layers: 1,
++                mip_levels: 1,
+                 arrayed: false,
+                 volume: false,
+                 cube: false,
+@@ -7325,6 +7393,7 @@ mod tests {
+             width: 16,
+             height: 16,
+             layers: 1,
++            mip_levels: 1,
+             arrayed: false,
+             volume: false,
+             cube: false,
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/pools/mod.rs b/crates/reims-vgpu/src/backend/vulkan/engine/pools/mod.rs
+index 226622cf3..309f098cf 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/pools/mod.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/pools/mod.rs
+@@ -1216,6 +1216,7 @@ pub(crate) struct SampledSlot {
+     pub width: u32,
+     pub height: u32,
+     pub layers: u32,
++    pub mip_levels: u32,
+     pub volume: bool,
+     pub cube: bool,
+     pub arrayed: bool,
+@@ -1282,6 +1283,7 @@ pub(crate) struct SampledKey {
+     pub(crate) width: u32,
+     pub(crate) height: u32,
+     pub(crate) layers: u32,
++    pub(crate) mip_levels: u32,
+     pub(crate) volume: bool,
+     pub(crate) cube: bool,
+     pub(crate) arrayed: bool,
+@@ -1303,6 +1305,7 @@ impl SampledKey {
+             width: r.width,
+             height: r.height,
+             layers: r.layers,
++            mip_levels: r.mip_levels.max(1),
+             volume: r.volume,
+             cube: r.cube,
+             arrayed: r.arrayed,
+@@ -1333,6 +1336,7 @@ impl SampledSlot {
+             width: self.width,
+             height: self.height,
+             layers: self.layers,
++            mip_levels: self.mip_levels,
+             volume: self.volume,
+             cube: self.cube,
+             arrayed: self.arrayed,
+@@ -1355,6 +1359,7 @@ impl SampledSlot {
+             width: self.width,
+             height: self.height,
+             layers: self.layers,
++            mip_levels: self.mip_levels,
+             volume: self.volume,
+             cube: self.cube,
+             arrayed: self.arrayed,
+@@ -3293,6 +3298,7 @@ mod sampled_key_tests {
+             width: 7,
+             height: 5,
+             layers: 3,
++            mip_levels: 1,
+             arrayed,
+             volume,
+             cube,
+@@ -3306,6 +3312,16 @@ mod sampled_key_tests {
+         }
+     }
+ 
++    /// A resource that names no mip levels still gets an image with one.
++    #[test]
++    fn a_sampled_key_has_at_least_one_mip_level() {
++        let mut r = resource(false, false, false, false);
++        r.mip_levels = 0;
++        assert_eq!(SampledKey::of(&r).mip_levels, 1);
++        r.mip_levels = 5;
++        assert_eq!(SampledKey::of(&r).mip_levels, 5);
++    }
++
+     /// Each shape flag reaches the key field of its own name.
+     ///
+     /// The four are adjacent, all `bool`, and declared in a different order on
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/pools/sampled_working_set.rs b/crates/reims-vgpu/src/backend/vulkan/engine/pools/sampled_working_set.rs
+index 8683c0759..8a9549194 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/pools/sampled_working_set.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/pools/sampled_working_set.rs
+@@ -144,6 +144,7 @@ mod tests {
+             width: 64,
+             height: 64,
+             layers: 1,
++            mip_levels: 1,
+             volume: false,
+             cube: false,
+             arrayed: false,
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/pools/submission_and_buffers.rs b/crates/reims-vgpu/src/backend/vulkan/engine/pools/submission_and_buffers.rs
+index da9a928cb..5f390ca97 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/pools/submission_and_buffers.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/pools/submission_and_buffers.rs
+@@ -3717,6 +3717,7 @@ impl ResourcePools {
+             width,
+             height,
+             layers,
++            mip_levels,
+             volume,
+             cube,
+             arrayed,
+@@ -3782,11 +3783,17 @@ impl ResourcePools {
+                         height,
+                         depth: extent_depth,
+                     })
+-                    .mip_levels(1)
++                    .mip_levels(mip_levels)
+                     .array_layers(array_layers)
+                     .samples(vk::SampleCountFlags::TYPE_1)
+                     .tiling(vk::ImageTiling::OPTIMAL)
+-                    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
++                    .usage(if mip_levels > 1 {
++                        vk::ImageUsageFlags::SAMPLED
++                            | vk::ImageUsageFlags::TRANSFER_DST
++                            | vk::ImageUsageFlags::TRANSFER_SRC
++                    } else {
++                        vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST
++                    })
+                     .initial_layout(vk::ImageLayout::UNDEFINED),
+                 None,
+             )
+@@ -3816,7 +3823,7 @@ impl ResourcePools {
+                 .subresource_range(vk::ImageSubresourceRange {
+                     aspect_mask: vk::ImageAspectFlags::COLOR,
+                     base_mip_level: 0,
+-                    level_count: 1,
++                    level_count: mip_levels,
+                     base_array_layer: 0,
+                     layer_count: array_layers,
+                 }),
+@@ -3840,6 +3847,7 @@ impl ResourcePools {
+             width,
+             height,
+             layers,
++            mip_levels,
+             volume,
+             cube,
+             arrayed,
+@@ -4616,6 +4624,7 @@ mod recycle_tests {
+             width: w,
+             height: h,
+             layers: 1,
++            mip_levels: 1,
+             volume: false,
+             cube: false,
+             arrayed: false,
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/types.rs b/crates/reims-vgpu/src/backend/vulkan/engine/types.rs
+index 0c857cada..8001a5a96 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/types.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/types.rs
+@@ -1115,6 +1115,11 @@ pub struct SampledImageResource {
+     pub width: u32,
+     pub height: u32,
+     pub layers: u32,
++    /// Mip levels the image is created with. Level 0 is uploaded and the rest
++    /// are generated from it with linear blits. 1 for every bind but a sampled
++    /// snapshot of a mipmapped heap texture, whose higher levels no kernel here
++    /// writes.
++    pub mip_levels: u32,
+     pub arrayed: bool,
+     pub volume: bool,
+     pub cube: bool,
+diff --git a/crates/reims-vgpu/src/runtime/draw/mod.rs b/crates/reims-vgpu/src/runtime/draw/mod.rs
+index c00c745bd..3d87e1cdd 100644
+--- a/crates/reims-vgpu/src/runtime/draw/mod.rs
++++ b/crates/reims-vgpu/src/runtime/draw/mod.rs
+@@ -1703,6 +1703,7 @@ pub(crate) struct HeapTexture {
+     pub format: u16,
+     pub sample_count: u32,
+     pub texture_type: u8,
++    pub mip_levels: u32,
+ }
+ 
+ /// The heap texture a type-8 descriptor creates, or `None` for any other record.
+@@ -1724,6 +1725,7 @@ pub(crate) fn heap_texture_of(desc: &[u8]) -> Option<HeapTexture> {
+         format: body.pixel_format,
+         sample_count: u32::from(body.sample_count.max(1)),
+         texture_type: body.texture_type,
++        mip_levels: u32::from(body.mipmap_level_count).max(1),
+     })
+ }
+ 
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index db6fd6021..b55459079 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -2342,6 +2342,7 @@ mod heap_snapshot_tests {
+             format: crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT,
+             sample_count: 1,
+             texture_type: 2,
++            mip_levels: 1,
+         }
+     }
+ 
+@@ -8544,6 +8545,31 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+                 } else {
+                     (tw, th)
+                 };
++                // A mipmapped heap texture's snapshot holds its base level. The
++                // levels above it are generated by halving, which is what the
++                // guest's own downsample kernel writes and this device cannot:
++                // a glass shader samples them for its blur, and level 0 alone
++                // blurs far less than a Mac does.
++                let mip_levels = texture_resource
++                    .as_ref()
++                    .filter(|_| {
++                        matches!(
++                            source,
++                            crate::backend::vulkan::engine::SampledSource::Bytes(_)
++                        ) && !arrayed
++                            && !volume
++                            && !cube
++                            && !one_dim
++                    })
++                    .and_then(|resource| heap_texture_of(&resource.descriptor))
++                    .map_or(1, |heap| {
++                        heap.mip_levels
++                            .min(32 - tw.max(th).max(1).leading_zeros())
++                            .max(1)
++                    });
++                if mip_levels > 1 {
++                    crate::runtime::drain::note_store_route("heap_sample_mipmapped");
++                }
+                 images.push(crate::backend::vulkan::engine::SampledImageResource {
+                     binding: img_bind,
+                     array_element,
+@@ -8551,6 +8577,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+                     width: tw,
+                     height: th,
+                     layers,
++                    mip_levels,
+                     arrayed,
+                     volume,
+                     cube,
+@@ -8660,6 +8687,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+                 width: 1,
+                 height: 1,
+                 layers: shape.layers,
++                mip_levels: 1,
+                 arrayed: shape.arrayed,
+                 volume: shape.volume,
+                 cube: shape.cube,
+diff --git a/crates/reims-vgpu/tests/vk_engine_batch.rs b/crates/reims-vgpu/tests/vk_engine_batch.rs
+index 419dbb60a..7ee43671d 100644
+--- a/crates/reims-vgpu/tests/vk_engine_batch.rs
++++ b/crates/reims-vgpu/tests/vk_engine_batch.rs
+@@ -719,6 +719,7 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
+         width: 2,
+         height: 2,
+         layers: 1,
++        mip_levels: 1,
+         arrayed: false,
+         volume: false,
+         cube: false,
+diff --git a/crates/reims-vgpu/tests/vk_engine_parity.rs b/crates/reims-vgpu/tests/vk_engine_parity.rs
+index 215ce0a63..c7f03e687 100644
+--- a/crates/reims-vgpu/tests/vk_engine_parity.rs
++++ b/crates/reims-vgpu/tests/vk_engine_parity.rs
+@@ -608,6 +608,7 @@ fn depth_test_honored_compare_and_clear_wired() {
+             width: 2,
+             height: 2,
+             layers: 1,
++            mip_levels: 1,
+             arrayed: false,
+             volume: false,
+             cube: false,
+@@ -741,6 +742,7 @@ fn depth_test_honored_on_resident_target_path() {
+             width: 2,
+             height: 2,
+             layers: 1,
++            mip_levels: 1,
+             arrayed: false,
+             volume: false,
+             cube: false,
+@@ -881,6 +883,7 @@ fn stencil_test_honored_compare_ref_and_clear_wired() {
+             width: 2,
+             height: 2,
+             layers: 1,
++            mip_levels: 1,
+             arrayed: false,
+             volume: false,
+             cube: false,
+@@ -1034,6 +1037,7 @@ fn sampled_and_sampler_still_renders() {
+         width: 2,
+         height: 2,
+         layers: 1,
++        mip_levels: 1,
+         arrayed: false,
+         volume: false,
+         cube: false,
+@@ -1138,6 +1142,7 @@ fn sampled_upload_happens_once_across_more_draws_than_the_ring_is_deep() {
+         width: 2,
+         height: 2,
+         layers: 1,
++        mip_levels: 1,
+         arrayed: false,
+         volume: false,
+         cube: false,
+@@ -1218,6 +1223,7 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
+         width: 16,
+         height: 16,
+         layers: 1,
++        mip_levels: 1,
+         arrayed: false,
+         volume: false,
+         cube: false,
+@@ -1321,6 +1327,7 @@ fn resident_sample_uses_the_bindings_compatible_format_view() {
+         width: 16,
+         height: 16,
+         layers: 1,
++        mip_levels: 1,
+         arrayed: false,
+         volume: false,
+         cube: false,
+@@ -1380,6 +1387,7 @@ fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
+         width: 16,
+         height: 16,
+         layers: 1,
++        mip_levels: 1,
+         arrayed: false,
+         volume: false,
+         cube: false,
+@@ -1398,6 +1406,7 @@ fn resident_sample_alias_uses_native_feedback_or_snapshot_fallback() {
+         width: 16,
+         height: 16,
+         layers: 1,
++        mip_levels: 1,
+         arrayed: false,
+         volume: false,
+         cube: false,
+@@ -1494,6 +1503,7 @@ fn sampled_identity_fast_path_skips_content_compare() {
+         width: 2,
+         height: 2,
+         layers: 1,
++        mip_levels: 1,
+         arrayed: false,
+         volume: false,
+         cube: false,
+@@ -2043,6 +2053,7 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
+         width: 2,
+         height: 2,
+         layers: 1,
++        mip_levels: 1,
+         arrayed: false,
+         volume: false,
+         cube: false,
+@@ -2205,6 +2216,7 @@ fn reflected_static_sampler_descriptor_samples_texture() {
+         width: 2,
+         height: 2,
+         layers: 1,
++        mip_levels: 1,
+         arrayed: false,
+         volume: false,
+         cube: false,
+@@ -2336,6 +2348,7 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
+             width: 2,
+             height: 2,
+             layers: 1,
++            mip_levels: 1,
+             arrayed: false,
+             volume: false,
+             cube: false,
+@@ -2462,6 +2475,7 @@ fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
+             width: 2,
+             height: 2,
+             layers: 1,
++            mip_levels: 1,
+             arrayed: false,
+             volume: false,
+             cube: false,
+@@ -3501,6 +3515,7 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
+         width: 16,
+         height: 16,
+         layers: 1,
++        mip_levels: 1,
+         arrayed: false,
+         volume: false,
+         cube: false,
+-- 
+2.43.0
+
