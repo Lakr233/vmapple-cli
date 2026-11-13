@@ -1,0 +1,204 @@
+From 94ca92d353ee1a9380224e12905dd0a0adaa6e75 Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Fri, 13 Nov 2026 15:53:25 +0800
+Subject: [PATCH 79/79] vgpu: run kernels on mipmapped heap textures at their
+ base level
+
+Component: compute staging, heap textures.
+
+macOS 27 blurs the backdrop of toolbars and buttons into mipmapped heap
+textures (448x96 in five levels, 84x30 in two). Compute staging refused
+any heap texture with more than one level, so the dispatch was dropped
+and the glass drew black: a Finder window's toolbar was a black band.
+
+Such a texture is now staged as its base level. metal2vulkan already
+drops writes to a nonzero level, so the higher levels hold nothing and
+the glass is blurred less than on a Mac. A kernel's output to a heap
+texture also becomes its heap snapshot (0078), and a heap texture no
+kernel has left a resident for is staged from that snapshot or the
+pass's resident instead of zeros.
+
+Measured on arm64 Linux (NVIDIA GB10), macOS 27.2 guest at protocol 237,
+cold boots: before, 80 heap_fail reason=shape lines and a black Finder
+toolbar; after, 248 base-level stages and 200 kernel snapshots in one
+boot, and the toolbar draws its title and buttons on glass.
+
+Verified: the reims-vgpu test suite passes, with a new test for the
+kernel snapshot; clippy unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/runtime/compute_exec/mod.rs           | 55 ++++++++++++++++++-
+ .../src/runtime/compute_exec/tests.rs         | 46 +++++++++++++++-
+ 2 files changed, 97 insertions(+), 4 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/compute_exec/mod.rs b/crates/reims-vgpu/src/runtime/compute_exec/mod.rs
+index 2a0821f25..595b01894 100644
+--- a/crates/reims-vgpu/src/runtime/compute_exec/mod.rs
++++ b/crates/reims-vgpu/src/runtime/compute_exec/mod.rs
+@@ -1311,6 +1311,12 @@ enum TextureWriteback {
+         /// it was — the writer's own walk fails closed on its own terms.
+         pages: std::collections::HashSet<u64>,
+     },
++    /// A heap texture: no guest bytes, so its output becomes the snapshot draws
++    /// sample, under `(task, ref, generation)`, as `len` tight bytes.
++    Heap {
++        key: (u32, u32, u64),
++        len: usize,
++    },
+     Type11 {
+         mapping_id: u32,
+         surface_offset: u64,
+@@ -1846,9 +1852,16 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
+         }
+     }
+     if let Some((heap_ref, use_offset, offset, descriptor)) = heap_texture {
++        // A mipmapped heap texture is staged as its base level. Kernels reach
++        // only level 0 here: metal2vulkan drops writes to a nonzero level, and
++        // macOS 27's glass blur pyramids (448x96 and 84x30 in five and two
++        // levels) were otherwise refused whole, and their glass drew black.
++        if descriptor.mipmap_level_count > 1 {
++            crate::runtime::drain::note_store_route("compute_heap_base_level");
++        }
+         if descriptor.texture_type != 2
+             || descriptor.depth != 1
+-            || descriptor.mipmap_level_count != 1
++            || descriptor.mipmap_level_count == 0
+             || descriptor.sample_count != 1
+             || descriptor.array_length != 1
+         {
+@@ -1927,6 +1940,28 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
+             serve.and_then(ResidentServe::sample_source).is_some() as u8,
+             use_offset as u8
+         ));
++        // A heap texture no kernel has left a resident for holds what a pass
++        // rendered or a storage write left, the texels a draw samples, and a
++        // kernel's output goes back there for the next draw to sample.
++        let snapshot_key = objects::resolve_resource(state, host, task_id, texture_ref)
++            .ok()
++            .map(|resource| (task_id, texture_ref, resource.lifetime_ref().id()));
++        #[cfg(feature = "backend-vulkan")]
++        let bytes = snapshot_key
++            .filter(|_| serve.is_none())
++            .and_then(|snapshot_key| {
++                let target = crate::model::HeapTargetRef {
++                    base_ref: texture_ref,
++                    generation: snapshot_key.2,
++                    base_format: format,
++                };
++                let identity =
++                    crate::runtime::draw::heap_target_identity(task_id, target, width, height);
++                crate::runtime::draw::heap_texels(state, snapshot_key, &identity, need)
++            })
++            .unwrap_or_else(|| vec![0; need]);
++        #[cfg(not(feature = "backend-vulkan"))]
++        let bytes = vec![0; need];
+         return Ok(StagedTexture {
+             binding,
+             #[cfg(feature = "backend-vulkan")]
+@@ -1939,7 +1974,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
+             storage_selector,
+             width,
+             height,
+-            bytes: vec![0; need],
++            bytes,
+             is_storage,
+             #[cfg(feature = "backend-vulkan")]
+             residency: is_storage.then_some(ComputeStorageResidencyCandidate {
+@@ -1948,7 +1983,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
+             }),
+             #[cfg(feature = "backend-vulkan")]
+             serve,
+-            writeback: TextureWriteback::None,
++            writeback: match snapshot_key {
++                Some(key) if is_storage => TextureWriteback::Heap { key, len: need },
++                _ => TextureWriteback::None,
++            },
+         });
+     }
+     let stage_entry = objects::lookup_list_entry(state, host, task_id, stage_ref);
+@@ -2878,6 +2916,17 @@ fn writeback_texture<M: HostMemory + HostOps>(
+ ) -> Result<(), ComputeStatus> {
+     match &tex.writeback {
+         TextureWriteback::None => Ok(()),
++        TextureWriteback::Heap { key, len } => {
++            if let Some(texels) = tex.bytes.get(..*len) {
++                state
++                    .heap_snapshots
++                    .insert(*key, std::sync::Arc::new(texels.to_vec()));
++                crate::runtime::drain::note_store_route("compute_heap_snapshot");
++            } else {
++                crate::runtime::drain::note_store_route("compute_heap_snapshot_short");
++            }
++            Ok(())
++        }
+         TextureWriteback::Linear {
+             texture_ref,
+             gva,
+diff --git a/crates/reims-vgpu/src/runtime/compute_exec/tests.rs b/crates/reims-vgpu/src/runtime/compute_exec/tests.rs
+index fb31a92ab..b6e4b62e2 100644
+--- a/crates/reims-vgpu/src/runtime/compute_exec/tests.rs
++++ b/crates/reims-vgpu/src/runtime/compute_exec/tests.rs
+@@ -1570,7 +1570,14 @@ fn stage_heap_texture_uses_host_only_residency_identity() {
+         Some(StorageImageSelector::Rgba32Float)
+     );
+     assert_eq!(staged.bytes.len(), 180 * 135 * 16);
+-    assert!(matches!(staged.writeback, TextureWriteback::None));
++    // No guest window: the output becomes the heap texture's snapshot.
++    assert!(matches!(
++        staged.writeback,
++        TextureWriteback::Heap {
++            key: (1, 20, _),
++            len: 388_800
++        }
++    ));
+     let residency = staged.residency.expect("heap texture needs GPU residency");
+     assert!(residency.key.is_heap());
+     assert!(!residency.key.is_linear());
+@@ -1649,6 +1656,43 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
+     );
+ }
+ 
++/// A kernel's output to a heap texture has no guest window to land in, so it
++/// becomes the snapshot the next draw samples.
++#[test]
++#[cfg(feature = "backend-vulkan")]
++fn a_heap_texture_kernel_output_becomes_its_snapshot() {
++    use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM;
++
++    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
++    let mut host = FakeHost::new();
++    let texels: Vec<u8> = (1..=16).collect();
++    let staged = StagedTexture {
++        binding: 33,
++        array_element: 0,
++        descriptor_count: 1,
++        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
++        texture_ref: 11,
++        pixel_format: MTL_FORMAT_RGBA8_UNORM,
++        storage_selector: Some(pixel_format::StorageImageSelector::Rgba8Unorm),
++        width: 2,
++        height: 2,
++        bytes: texels.clone(),
++        is_storage: true,
++        residency: None,
++        serve: None,
++        writeback: TextureWriteback::Heap {
++            key: (6, 11, 4),
++            len: 16,
++        },
++    };
++
++    assert_eq!(writeback_texture(&mut state, &mut host, 6, &staged), Ok(()));
++    assert_eq!(
++        state.heap_snapshots.get(&(6, 11, 4)).map(|s| s.as_slice()),
++        Some(texels.as_slice())
++    );
++}
++
+ /// No product MiB budget on compute staging — guest size is authoritative.
+ /// Full-screen wide-gamut (live SkyLight 1928×1920 RGBA16F ≈ 28.2 MiB) must
+ /// be host-addressable (usize), not rejected by an arbitrary cap.
+-- 
+2.43.0
+
