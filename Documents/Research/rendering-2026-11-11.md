@@ -272,9 +272,9 @@ does not change the glass.
 
 ## Protocol 237
 
-Done on 2026-11-13 with Reims 0072–0081 and metal2vulkan 0004. A 27.2 guest
+Done on 2026-11-13 with Reims 0072–0083 and metal2vulkan 0004. A 27.2 guest
 asks for 252 and now gets 237, and its Liquid Glass draws a blurred backdrop.
-0072–0076 got there with grey glass and black corners; 0077–0081 fixed those.
+0072–0076 got there with grey glass and black corners; 0077–0083 fixed those.
 See [0077–0079](#00770079) and [What Is Still Wrong](#what-is-still-wrong).
 
 ### The Ladder
@@ -433,6 +433,25 @@ Only the frame around it is glass.
   compute staging read the pages and failed, 27 times in one boot, each a
   dropped backdrop capture. Compute now reads the resident too.
 
+### 0082–0083
+
+About This Mac draws a glass rim tinted by the wallpaper around a white,
+square-cornered content area. Read back draw by draw, the window is drawn in
+this order: a white background over the whole window (square corners), a copy,
+the backdrop capture, then three glass draws over the window that leave the
+centre white and tint a band about 28 px wide at the edges.
+
+- **The capture (0082).** It sampled the display surface's guest pages, which
+  do not hold the frame being composed: it read the wallpaper where the white
+  background had just been drawn. Compute now reads the resident under the draw
+  rail's rule, and the capture, read back, holds the white window.
+- **The blur (0083).** The glass samples a 256×256 mipmapped linear texture at
+  one level. It now has its levels.
+
+Neither changed the rim: screenshots before and after match. The rim comes from
+the glass draws themselves, and whether a Mac draws the same band has not been
+compared on a Mac.
+
 ### What Is Still Wrong
 
 - **System Settings' symbols.** Its sidebar and list icons draw as coloured
@@ -441,6 +460,9 @@ Only the frame around it is glass.
   composited. The guest logs RenderBox `precondition failure` lines from
   `iconservicesagent` and `DockHelper` around these renders. Clearing the icon
   caches and reporting argument-buffer tier keys 38 and 39 did not change it.
+- **About This Mac's rim.** See [0082–0083](#00820083): the tinted band around
+  the white content is drawn by the glass draws, and is not yet compared with a
+  Mac.
 - **A first window's black toolbar.** The first window an app opens after a
   boot sometimes draws its toolbar black until it redraws. The toolbar material
   is drawn into a linear texture and then overdrawn by a draw whose textures
