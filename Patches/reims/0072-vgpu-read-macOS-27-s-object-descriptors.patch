@@ -1,0 +1,356 @@
+From 693dfaac6a79c25eca3c710eb2fffdb5b0044eb1 Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Fri, 13 Nov 2026 11:05:56 +0800
+Subject: [PATCH 72/76] vgpu: read macOS 27's object descriptors
+
+Component: object-list descriptor decode (all pathways).
+
+At protocol 237 a macOS 27 guest's serializer writes TextureDescriptor2
+records, and object-list descriptors embed the record their object was
+made from. Read with the 32-byte layout, the 40-byte descriptor gave
+formats like 0x500 (the pixel format's high byte beside usage's low
+byte) and widths like 0x80000000, and every render target, type-11
+surface and memoryless texture was refused.
+
+read_descriptor now gives each descriptor the shape protocol 62 gives
+the same object before anything decodes it:
+- type 9 is a 0x34 record, rewritten as record 1;
+- type 11 is a mapping prefix and a 0x39 record, rewritten as 0x2f;
+- types 2 and 3 end in a 0x34 record, rewritten in place.
+The 0x37 and 0x38 records already have wide decoders and are left alone.
+
+Two more object forms appear at that protocol:
+- Object type 19 is a buffer carved from a resource pool, with the
+  buffer descriptor's trailing four zero bytes dropped. The list entry
+  reports it as a buffer and the descriptor is padded.
+- Compute pipeline descriptors carry tag 0x08,
+  maxTotalThreadsPerThreadgroup (1024 on every record seen). It is a cap
+  on dispatches this device sizes from the dispatch record, so it joins
+  the benign tags instead of refusing the pipeline.
+
+Measured on arm64 Linux (NVIDIA GB10), macOS 27.2 guest at protocol 237:
+the descriptors in the tests are ones that boot sent.
+
+Verified:
+- cargo test -p reims-vgpu --no-default-features
+  --features backend-vulkan,host-window -- --test-threads=1 passes,
+  with five new tests over the captured descriptors.
+- clippy reports the same 40 diagnostics as before.
+
+Not verified: the backend-metal and x86 arms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/runtime/decode/resource/mod.rs        | 129 +++++++++++++++++-
+ .../src/runtime/decode/resource/tests.rs      | 105 ++++++++++++++
+ crates/reims-vgpu/src/runtime/objects/mod.rs  |   3 +
+ 3 files changed, 231 insertions(+), 6 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/decode/resource/mod.rs b/crates/reims-vgpu/src/runtime/decode/resource/mod.rs
+index 0cce7fd3f..08fb91006 100644
+--- a/crates/reims-vgpu/src/runtime/decode/resource/mod.rs
++++ b/crates/reims-vgpu/src/runtime/decode/resource/mod.rs
+@@ -9,7 +9,7 @@ use crate::runtime::heap_query; // ICB layout fixture encoder only
+ use core::mem::{offset_of, size_of};
+ use reims_vgpu_wire::ops::{
+     backed_texture as w_backed, depth_stencil as w_ds, heap_texture as w_heap, icb as w_icb,
+-    sampler as w_smp, texture_view as w_view,
++    sampler as w_smp, texture as w_tex, texture_view as w_view,
+ };
+ use reims_vgpu_wire::OP_HEADER_LEN as OP_HDR;
+ 
+@@ -93,6 +93,13 @@ pub const OBJECT_TYPE_TEXTURE_VIEW: u8 = 8;
+ /// of nearly every WindowServer pass.
+ pub const OBJECT_TYPE_MEMORYLESS_TEXTURE: u8 = 9;
+ pub const OBJECT_TYPE_IOSURFACE: u8 = 11;
++/// A buffer carved from one of the guest's resource pools, from protocol 200.
++/// Its descriptor is a type-1 descriptor without the trailing four zero bytes,
++/// `{u64 size, u32 handle}`, and every buffer rail reads it as one:
++/// [`decode_list_object_entry`] reports it as [`OBJECT_TYPE_BUFFER`] and the
++/// descriptor read pads it. A 27.2 guest hands these to the info encoder as
++/// reply buffers.
++pub const OBJECT_TYPE_POOL_BUFFER: u8 = 19;
+ 
+ /// Type-7 first dword subtypes.
+ pub const TYPE7_OBJECT_SAMPLER: u32 = w_smp::OPCODE_NEW_SAMPLER;
+@@ -1807,10 +1814,10 @@ pub fn decode_list_object_entry(bytes: &[u8]) -> Result<ListObjectEntry, DecodeS
+     let object_type = (first & OBJECT_TYPE_MASK) as u8;
+     let twin_layout = object_type == OBJECT_TYPE_TWIN_LAYOUT_TEXTURE;
+     Ok(ListObjectEntry {
+-        object_type: if twin_layout {
+-            OBJECT_TYPE_TEXTURE_VARIANT
+-        } else {
+-            object_type
++        object_type: match object_type {
++            OBJECT_TYPE_TWIN_LAYOUT_TEXTURE => OBJECT_TYPE_TEXTURE_VARIANT,
++            OBJECT_TYPE_POOL_BUFFER => OBJECT_TYPE_BUFFER,
++            other => other,
+         },
+         descriptor_length: first >> OBJECT_DESC_LEN_SHIFT,
+         descriptor_gva: ld64(&bytes[OBJECT_LIST_ENTRY_DESC_GVA..]),
+@@ -1826,6 +1833,109 @@ pub fn list_object_entry_offset(ref_: u32, entry_count: u32) -> Option<u64> {
+     (ref_ as u64).checked_mul(OBJECT_LIST_ENTRY_LEN as u64)
+ }
+ 
++/// Bytes of a pool buffer's descriptor; see [`OBJECT_TYPE_POOL_BUFFER`].
++pub const POOL_BUFFER_DESC_LEN: usize = 12;
++
++/// The record opcode a protocol-62 type-11 descriptor carries after its mapping
++/// prefix, as a 26-era guest writes it. Its `TextureDescriptor2` form is the
++/// IOSurface-texture opcode `0x39`.
++const IOSURFACE_TEXTURE_OBJECT_OPCODE: u32 = 0x2f;
++
++/// Rewrite a 40-byte `TextureDescriptor2` descriptor as the 32-byte one.
++///
++/// The wide form packs type and flags into one byte, then the pixel format,
++/// then `usage` as a `u32` of its own. The narrow form packs type and flags, an
++/// eight-bit `usage` and the pixel format into one word. Everything from
++/// `width` to the trailing `u64` is the same fields in the same order, three
++/// bytes later. Usage bits above the eighth and the swizzle the wide form
++/// appends have no slot in the narrow form and are dropped; nothing that reads
++/// the narrow form reads either.
++pub fn narrow_texture_descriptor(wide: &[u8]) -> Option<[u8; w_tex::TEXTURE_DESCRIPTOR_LEN]> {
++    let wide = wide.get(..w_tex::WIDE_TEXTURE_DESCRIPTOR_LEN)?;
++    let pixel_format = u32::from(ld16(&wide[1..]));
++    let usage = ld32(&wide[3..]);
++    let packed = u32::from(wide[0]) | ((usage & 0xff) << 8) | (pixel_format << 16);
++    let mut narrow = [0u8; w_tex::TEXTURE_DESCRIPTOR_LEN];
++    narrow[..4].copy_from_slice(&packed.to_le_bytes());
++    narrow[4..].copy_from_slice(&wide[7..7 + w_tex::TEXTURE_DESCRIPTOR_LEN - 4]);
++    Some(narrow)
++}
++
++/// Give an object-list descriptor the shape protocol 62 gives the same object,
++/// so every decoder downstream reads one layout. `true` when it changed.
++///
++/// At protocol 237 the guest's serializer writes `TextureDescriptor2` records,
++/// and an object-list descriptor embeds the record its object was made from:
++///
++/// - type 9 is a `0x34` record (`newTextureWithDescriptor:`), narrow `1`;
++/// - type 11 is an eight-byte mapping prefix and a `0x39` IOSurface-texture
++///   record, narrow `0x2f`, whose plane widens from two bytes to four;
++/// - type 2 and 3 end in the `0x34` record after the kernel's layout and level
++///   records.
++///
++/// The `0x37` buffer-texture and `0x38` heap-texture records are not rewritten:
++/// their wide forms already have decoders. A pool buffer's 12-byte descriptor
++/// is padded to the buffer descriptor's 16.
++pub fn normalize_object_descriptor(object_type: u8, bytes: &mut Vec<u8>) -> bool {
++    if object_type == OBJECT_TYPE_BUFFER && bytes.len() == POOL_BUFFER_DESC_LEN {
++        bytes.resize(LINEAR_DESC_MIN_LEN, 0);
++        return true;
++    }
++    narrow_leading_record(object_type, bytes) || narrow_trailing_record(bytes)
++}
++
++/// The record at the start of a type-9 or type-11 descriptor.
++fn narrow_leading_record(object_type: u8, bytes: &mut Vec<u8>) -> bool {
++    let base = if object_type == OBJECT_TYPE_IOSURFACE { 8 } else { 0 };
++    let Some(opcode) = bytes.get(base..base + 4).map(ld32) else {
++        return false;
++    };
++    // (narrow opcode, object refs before the descriptor, bytes kept after it)
++    let (narrow_op, refs, tail) = match opcode {
++        w_tex::OPCODE_NEW_TEXTURE_WIDE => (w_tex::OPCODE_NEW_TEXTURE, 1, 0),
++        w_backed::OPCODE_IOSURFACE_TEXTURE_WIDE => (IOSURFACE_TEXTURE_OBJECT_OPCODE, 1, 4),
++        _ => return false,
++    };
++    let desc_at = base + OP_HDR + 4 * refs;
++    let Some(narrow) = bytes.get(desc_at..).and_then(narrow_texture_descriptor) else {
++        return false;
++    };
++    let tail_at = desc_at + w_tex::WIDE_TEXTURE_DESCRIPTOR_LEN;
++    let tail_end = tail_at.saturating_add(tail).min(bytes.len());
++    let mut out = Vec::with_capacity(bytes.len());
++    out.extend_from_slice(&bytes[..desc_at]);
++    out.extend_from_slice(&narrow);
++    out.extend_from_slice(&bytes[tail_at..tail_end]);
++    let record_len = (out.len() - base) as u32;
++    out[base..base + 4].copy_from_slice(&narrow_op.to_le_bytes());
++    out[base + 4..base + 8].copy_from_slice(&record_len.to_le_bytes());
++    *bytes = out;
++    true
++}
++
++/// The `0x34` record a linear texture's descriptor ends in.
++fn narrow_trailing_record(bytes: &mut Vec<u8>) -> bool {
++    let wide_len = w_tex::NEW_TEXTURE_WIDE_TOTAL_LEN as usize;
++    let Some(at) = bytes.len().checked_sub(wide_len) else {
++        return false;
++    };
++    if at < OP_HDR
++        || ld32(&bytes[at..]) != w_tex::OPCODE_NEW_TEXTURE_WIDE
++        || ld32(&bytes[at + 4..]) as usize != wide_len
++    {
++        return false;
++    }
++    let Some(narrow) = narrow_texture_descriptor(&bytes[at + OP_HDR + 4..]) else {
++        return false;
++    };
++    bytes.truncate(at + OP_HDR + 4);
++    bytes.extend_from_slice(&narrow);
++    let narrow_len = (bytes.len() - at) as u32;
++    bytes[at..at + 4].copy_from_slice(&w_tex::OPCODE_NEW_TEXTURE.to_le_bytes());
++    bytes[at + 4..at + 8].copy_from_slice(&narrow_len.to_le_bytes());
++    true
++}
++
+ pub fn decode_buffer_descriptor(bytes: &[u8]) -> Result<BufferDescriptor, DecodeStatus> {
+     if bytes.len() < LINEAR_DESC_MIN_LEN {
+         return Err(DecodeStatus::ErrShort("res_buffer_desc_short"));
+@@ -2485,6 +2595,12 @@ const COMPUTE_PIPELINE_TAG_LABEL: u8 = 0x02;
+ /// the threadgroup hint; refusing it lost every frame drawn through that
+ /// kernel. Not identified, and taken as a compiler hint like its neighbours.
+ const COMPUTE_PIPELINE_TAG_10: u8 = 0x0a;
++/// `MTLComputePipelineDescriptor.maxTotalThreadsPerThreadgroup`, which macOS 27
++/// sets from the `computePipelineStateInfo:` answer (1024 on every record seen).
++/// It caps the threadgroups the guest may dispatch with the pipeline; this
++/// device takes each threadgroup size from the dispatch record, and the guest
++/// sized those from the same answer, so there is nothing to apply.
++const COMPUTE_PIPELINE_TAG_MAX_TOTAL_THREADS: u8 = 0x08;
+ /// `MTLComputePipelineDescriptor.stageInputDescriptor` — a byte offset from the
+ /// end of the 16-byte type-7 header to a nested property list, in the same units
+ /// as [`PIPELINE_TAG_VERTEX_DESCRIPTOR_OFFSET`] and
+@@ -2594,10 +2710,11 @@ const RENDER_PIPELINE_TAGS_BENIGN: [u8; 4] = [
+ ];
+ /// The compute half of [`RENDER_PIPELINE_TAGS_BENIGN`]; same rule, and listed
+ /// apart for the same reason `COMPUTE_PIPELINE_TAGS_CONSUMED` is.
+-const COMPUTE_PIPELINE_TAGS_BENIGN: [u8; 3] = [
++const COMPUTE_PIPELINE_TAGS_BENIGN: [u8; 4] = [
+     COMPUTE_PIPELINE_TAG_THREADGROUP_MULTIPLE,
+     COMPUTE_PIPELINE_TAG_LABEL,
+     COMPUTE_PIPELINE_TAG_10,
++    COMPUTE_PIPELINE_TAG_MAX_TOTAL_THREADS,
+ ];
+ 
+ /// A pipeline-descriptor field this decoder does not read **and has not
+diff --git a/crates/reims-vgpu/src/runtime/decode/resource/tests.rs b/crates/reims-vgpu/src/runtime/decode/resource/tests.rs
+index 73652b26b..bc81f4383 100644
+--- a/crates/reims-vgpu/src/runtime/decode/resource/tests.rs
++++ b/crates/reims-vgpu/src/runtime/decode/resource/tests.rs
+@@ -3240,3 +3240,108 @@ fn sparse_secondary_color_attachment_does_not_alias_color0() {
+     assert!(pd.color_attachments[0].blending_enabled);
+     assert_eq!(pd.color0, PipelineColorAttachment::default());
+ }
++
++fn from_hex(hex: &str) -> Vec<u8> {
++    (0..hex.len())
++        .step_by(2)
++        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
++        .collect()
++}
++
++/// A type-9 descriptor a 27.2 guest sent at protocol 237: a `0x34` record whose
++/// descriptor is `TextureDescriptor2`'s. Narrowed, the memoryless decoder reads
++/// the format and size it reads at protocol 62.
++#[test]
++fn a_wide_new_texture_record_is_read_as_the_narrow_one() {
++    let mut desc = from_hex(
++        "34000000340000000b00000042730005000000800700003c00000001000000\
++         010001000100300000000000000000000203040500",
++    );
++    assert_eq!(desc.len(), 52);
++    assert!(normalize_object_descriptor(
++        OBJECT_TYPE_MEMORYLESS_TEXTURE,
++        &mut desc
++    ));
++    assert_eq!(desc.len(), 44);
++    assert_eq!(ld32(&desc[0..]), 1);
++    assert_eq!(ld32(&desc[4..]), 44);
++    let tex = decode_memoryless_texture_descriptor(&desc).expect("decodes");
++    assert_eq!(tex.pixel_format, 0x73);
++    assert_eq!((tex.width, tex.height), (1920, 60));
++}
++
++/// A type-11 descriptor from the same boot: an eight-byte mapping prefix, then
++/// a `0x39` IOSurface-texture record with a four-byte plane.
++#[test]
++fn a_wide_iosurface_texture_record_keeps_its_mapping_and_geometry() {
++    let mut desc = from_hex(
++        "010000000000000039000000380000000a0000004250000500000080070000\
++         3c0000000100000001000100010010000000000000000000020304050000000000",
++    );
++    assert_eq!(desc.len(), 64);
++    assert!(normalize_object_descriptor(
++        OBJECT_TYPE_IOSURFACE,
++        &mut desc
++    ));
++    assert_eq!(desc.len(), 56);
++    let Descriptor::IOSurfaceTexture {
++        mapping_id,
++        object_ref,
++        pixel_format,
++        width,
++        height,
++    } = decode_iosurface_texture_descriptor(&desc).expect("decodes")
++    else {
++        panic!("not a type-11 descriptor");
++    };
++    assert_eq!((mapping_id, object_ref), (1, 0xa));
++    assert_eq!(pixel_format, 0x50);
++    assert_eq!((width, height), (1920, 60));
++}
++
++/// A linear texture's descriptor ends in the `0x34` record; only that tail is
++/// rewritten, and the format lands where the type-2 decoder reads it.
++#[test]
++fn a_linear_texture_descriptor_has_its_trailing_record_narrowed() {
++    let mut desc = vec![0u8; 72];
++    desc.extend(from_hex(
++        "34000000340000001000000042500005000100800700008000000001000000\
++         010001000100200000000000000000000203040500",
++    ));
++    assert!(normalize_object_descriptor(OBJECT_TYPE_TEXTURE, &mut desc));
++    assert_eq!(desc.len(), 72 + 44);
++    assert_eq!(ld32(&desc[72..]), 1);
++    assert_eq!(ld16(&desc[TEXTURE_DESC_PIXEL_FORMAT..]), 0x50);
++}
++
++/// A pool buffer is listed as a buffer and its descriptor padded to a buffer's.
++#[test]
++fn a_pool_buffer_is_read_as_a_buffer() {
++    let mut entry = vec![0u8; OBJECT_LIST_ENTRY_LEN];
++    st32(
++        &mut entry[OBJECT_LIST_ENTRY_HEADER..],
++        u32::from(OBJECT_TYPE_POOL_BUFFER) | (12 << OBJECT_DESC_LEN_SHIFT),
++    );
++    let entry = decode_list_object_entry(&entry).expect("decodes");
++    assert_eq!(entry.object_type, OBJECT_TYPE_BUFFER);
++    let mut desc = from_hex("0040000000000000d4000000");
++    assert!(normalize_object_descriptor(entry.object_type, &mut desc));
++    let buffer = decode_buffer_descriptor(&desc).expect("decodes");
++    assert_eq!(buffer.allocation_size, 0x4000);
++    assert_eq!(buffer.handle, 0xd4);
++}
++
++/// A protocol-62 descriptor is left alone.
++#[test]
++fn a_narrow_descriptor_is_not_rewritten() {
++    let mut desc = from_hex(
++        "01000000000000002f000000300000000a00000042055000800700003c00000001\
++         0000000100010001001000000000000000000000000000",
++    );
++    let before = desc.clone();
++    assert!(!normalize_object_descriptor(
++        OBJECT_TYPE_IOSURFACE,
++        &mut desc
++    ));
++    assert_eq!(desc, before);
++}
+diff --git a/crates/reims-vgpu/src/runtime/objects/mod.rs b/crates/reims-vgpu/src/runtime/objects/mod.rs
+index f339d07e8..acd04e248 100644
+--- a/crates/reims-vgpu/src/runtime/objects/mod.rs
++++ b/crates/reims-vgpu/src/runtime/objects/mod.rs
+@@ -1543,6 +1543,9 @@ pub fn read_descriptor<M: HostMemory>(
+         state.page_shift,
+     )
+     .ok()?;
++    // Protocol 237 descriptors take their protocol-62 shape before anything,
++    // the twin-layout reshape included, reads them.
++    crate::runtime::decode::resource::normalize_object_descriptor(entry.object_type, &mut buf);
+     if entry.twin_layout
+         && !crate::runtime::decode::resource::reshape_twin_layout_descriptor(&mut buf)
+     {
+-- 
+2.43.0
+

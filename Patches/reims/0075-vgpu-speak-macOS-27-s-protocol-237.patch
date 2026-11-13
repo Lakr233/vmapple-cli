@@ -1,0 +1,564 @@
+From 684e9504e6b95cd9c8f268155819744e8d72af94 Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Fri, 13 Nov 2026 11:06:08 +0800
+Subject: [PATCH 75/76] vgpu: speak macOS 27's protocol 237
+
+Component: protocol negotiation and child packets (all pathways), Vulkan
+device info.
+
+A 27.2 guest asks for protocol 252. This device clamped it to 62, the
+top of the 26-era ladder, and at 62 the guest's Metal plugin has
+TextureDescriptor2 off: it serializes texture usage in eight bits and
+refuses every texture that needs more, which includes every Liquid Glass
+backdrop. The guest's kernel driver has a second ladder from 200 to 252;
+237 is its lowest rung with TextureDescriptor2. A request at or above
+237 now negotiates 237; anything below is clamped as before.
+
+What 237 sends that 62 does not:
+- 0x43 EXEC_INDIRECT3 and 0x45 EXEC_INDIRECT_INFO: EXEC_INDIRECT2 with
+  eight-byte resource records. Both are widened to 0x37 and run on its
+  rail; 0x45's command buffers hold info-segment records.
+- 0x44 SET_OBJECT_LIST2: the object list named by task GVA, beside a
+  second list nothing here reads. Applied through SET_OBJECT_LIST.
+- Feature byte 10 (two-plane textures) on every rung of the new ladder,
+  so device-info key 12 answers yes there.
+- Feature byte 0x1b, which the plugin ANDs with device-info keys 23
+  and 24 (tile shaders, imageblocks). The Vulkan backend has no tile
+  memory, so DeviceInfoLimits gains tile_memory and the Vulkan arm
+  answers 0; the Metal arm still answers 1. Below 200 the byte is off and
+  the answer never mattered.
+
+The rest of what 237 changes is in the three patches before this one.
+The rung table and the opcodes were read off the 27.2 guest's kernel
+driver and Metal plugin, and checked against the packets a boot sends.
+
+Measured on arm64 Linux (NVIDIA GB10), macOS 27.2 guest, cold boot:
+desktop, wallpaper, Dock and menus draw; "Cannot create a texture with
+this usage" no longer appears in the guest log; the About window draws
+as frosted glass, with its text on the first draw.
+
+Verified:
+- cargo test -p reims-vgpu --no-default-features
+  --features backend-vulkan,host-window -- --test-threads=1 passes
+  (2354 lib tests and the integration tests), with new tests for the
+  negotiation, the rung set, the tile-memory keys and SET_OBJECT_LIST2.
+- clippy reports the same 40 diagnostics as before.
+
+Not verified: the backend-metal and x86 arms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/backend/vulkan/engine/mod.rs          |   2 +
+ crates/reims-vgpu/src/model/regs.rs           | 138 +++++++++++++++++-
+ crates/reims-vgpu/src/runtime/decode/fifo.rs  |  89 +++++++++++
+ crates/reims-vgpu/src/runtime/drain/mod.rs    |  71 +++++++++
+ crates/reims-vgpu/src/runtime/drain/tests.rs  |  31 ++++
+ 5 files changed, 327 insertions(+), 4 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs b/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
+index 89dfc2f65..fe343c281 100644
+--- a/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
++++ b/crates/reims-vgpu/src/backend/vulkan/engine/mod.rs
+@@ -2412,6 +2412,7 @@ pub fn device_info_limits() -> crate::model::DeviceInfoLimits {
+             // let the Apple plugin choose its non-native-FP16 path.
+             native_fp16: ctx.features.float16
+                 && ctx.caps.device_type != ash::vk::PhysicalDeviceType::CPU,
++            tile_memory: false,
+         },
+         Err(_) => crate::model::DeviceInfoLimits {
+             max_sample_count: 1,
+@@ -2419,6 +2420,7 @@ pub fn device_info_limits() -> crate::model::DeviceInfoLimits {
+             max_threads_per_threadgroup: VULKAN_MIN_COMPUTE_WORKGROUP_SIZE,
+             max_threadgroup_memory_bytes: VULKAN_MIN_COMPUTE_SHARED_MEMORY_BYTES,
+             native_fp16: false,
++            tile_memory: false,
+         },
+     }
+ }
+diff --git a/crates/reims-vgpu/src/model/regs.rs b/crates/reims-vgpu/src/model/regs.rs
+index de4638aeb..4fc99d7b8 100644
+--- a/crates/reims-vgpu/src/model/regs.rs
++++ b/crates/reims-vgpu/src/model/regs.rs
+@@ -369,7 +369,14 @@ pub const ROOT_OP_DEVICE_INFO_TAHOE: u16 = 0x3a;
+ /// whoever reads the log: an in-range unassigned slot is a guest sending a
+ /// command this build of the host does not have, while out-of-range is a corrupt
+ /// header or a desynced ring.
+-pub const CHILD_OP_MAX: u16 = 0x40;
++///
++/// # macOS 27 adds three
++///
++/// At [`PROTOCOL_VERSION_MACOS27`] the guest sends [`CHILD_OP_EXEC_INDIRECT3`],
++/// [`CHILD_OP_SET_OBJECT_LIST2`] and [`CHILD_OP_EXEC_INDIRECT_INFO`], so the
++/// ceiling moved from `0x40` to `0x45`. Read off the 27.2 guest's kernel
++/// driver, which builds each of them, and off the packets a 27.2 boot sends.
++pub const CHILD_OP_MAX: u16 = 0x45;
+ 
+ /// The opcodes the reference host routes to its one shared deprecated handler.
+ ///
+@@ -545,6 +552,30 @@ pub const CHILD_OP_DISCARD_RESOURCES: u16 = 0x3f;
+ /// the guest blocks on the reply, so a refusal is a stall and not a dropped
+ /// command.
+ pub const CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN: u16 = 0x40;
++/// [`CHILD_OP_EXEC_INDIRECT2`] with each resource record cut to its first eight
++/// bytes, `{object_id, ops}`. The 12-byte header and the 16-byte command-buffer
++/// records are unchanged. The guest sends it from protocol 200.
++pub const CHILD_OP_EXEC_INDIRECT3: u16 = 0x43;
++/// [`CHILD_OP_SET_OBJECT_LIST`] with a second list beside the first:
++/// `{u32 task, u64 list_gva, u64 list2_gva, u32 list_bytes, u32 list2_bytes}`.
++/// The first list is the 12-byte-entry object list `0x33` names by page; the
++/// second has 16-byte entries. The guest's kernel driver sends it when feature
++/// `0x29` of its protocol struct is on (from protocol 207) and `0x33` otherwise.
++pub const CHILD_OP_SET_OBJECT_LIST2: u16 = 0x44;
++/// The info encoder's submissions under the `InfoIndirect` capability (on from
++/// protocol 235): the same layout as [`CHILD_OP_EXEC_INDIRECT3`], with command
++/// buffers that hold only info-segment records — heap-texture size queries and
++/// compute-pipeline info among them — where below that protocol they arrived as
++/// child packets of their own.
++pub const CHILD_OP_EXEC_INDIRECT_INFO: u16 = 0x45;
++
++/// [`CHILD_OP_SET_OBJECT_LIST2`] payload offsets.
++pub const SET_OBJECT_LIST2_TASK_ID: usize = 0x00;
++pub const SET_OBJECT_LIST2_GVA: usize = 0x04;
++pub const SET_OBJECT_LIST2_SECOND_GVA: usize = 0x0c;
++pub const SET_OBJECT_LIST2_BYTES: usize = 0x14;
++pub const SET_OBJECT_LIST2_SECOND_BYTES: usize = 0x18;
++pub const SET_OBJECT_LIST2_LEN: usize = 28;
+ 
+ /// `CmdDisplayTransaction2_DEPRECATED` (op 6) trailer `[pipe][surface][task]`:
+ /// surface id offset. `CmdDisplaySwapMapping` (op 8) is a different command with
+@@ -594,6 +625,9 @@ const _: () = {
+         CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES,
+         CHILD_OP_DISCARD_RESOURCES,
+         CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN,
++        CHILD_OP_EXEC_INDIRECT3,
++        CHILD_OP_SET_OBJECT_LIST2,
++        CHILD_OP_EXEC_INDIRECT_INFO,
+     ];
+     let mut i = 0;
+     while i < ops.len() {
+@@ -1093,15 +1127,42 @@ pub const MMIO_U64: u32 = 8;
+ /// unlocks.
+ pub const PROTOCOL_VERSION_MAX: u32 = 62;
+ 
++/// The macOS 27 rung this host implements.
++///
++/// A 27.2 guest writes 252 here. Its kernel driver keeps the ladder above and
++/// adds a second one from 200 to 252, whose valid rungs are 200–209, 230–233,
++/// 235, 237, 238, 245 and 250–252; each rung turns on every feature byte of the rungs
++/// below it in that ladder, plus the 26-era set. 237 is the lowest rung with
++/// feature `0x32`, which the Metal plugin passes to
++/// `-[PGSerializer setSupportsTextureDescriptor2:]`. Without it the plugin
++/// serializes texture usage in eight bits and refuses every texture whose usage
++/// needs more, which is how macOS 27 lost every Liquid Glass backdrop below
++/// this rung.
++///
++/// What 237 changes on the wire, all handled here: child packets
++/// [`CHILD_OP_EXEC_INDIRECT3`], [`CHILD_OP_SET_OBJECT_LIST2`] and
++/// [`CHILD_OP_EXEC_INDIRECT_INFO`]; the `TextureDescriptor2` texture records in
++/// object-list descriptors; resource-pool buffers (object type 19); info-segment
++/// queries in place of `0x3b` and `0x40`; and the compute pipeline descriptor's
++/// `maxTotalThreadsPerThreadgroup` field.
++pub const PROTOCOL_VERSION_MACOS27: u32 = 237;
++
+ /// What this host writes back for a guest-requested protocol version.
+ ///
+ /// Clamping is the whole point. A guest newer than this host asks for a version
+ /// past the top rung, and an echo would hand that number straight back and land
+ /// the guest in its all-features-off default; clamping lands it on the newest
+-/// rung both sides implement.
++/// rung both sides implement. A guest that asks for the macOS 27 ladder at or
++/// above [`PROTOCOL_VERSION_MACOS27`] gets that rung; anything below it is
++/// clamped to [`PROTOCOL_VERSION_MAX`], a rung every guest that knows the second
++/// ladder also has.
+ #[inline]
+ pub fn negotiate_protocol_version(requested: u32) -> u32 {
+-    requested.min(PROTOCOL_VERSION_MAX)
++    if requested >= PROTOCOL_VERSION_MACOS27 {
++        PROTOCOL_VERSION_MACOS27
++    } else {
++        requested.min(PROTOCOL_VERSION_MAX)
++    }
+ }
+ 
+ /// Wire keys of the device-info reply whose value is a property of the GPU that
+@@ -1334,9 +1395,16 @@ pub const DEVICE_INFO_KEY_PRIMITIVE_TYPE_MASK: u32 = 11;
+ /// feature appears at 31, is explicitly turned back off at 40, and returns at
+ /// 41. Both ends of the protocol encode that same gap, so it is a contract and
+ /// not an accident. Do not rewrite this as `version >= 31`.
++///
++/// macOS 27's second ladder sets the same byte on every one of its valid rungs:
++/// each enters the chain of feature stores above the 26-era set, which includes
++/// offset 10.
+ #[inline]
+ pub fn protocol_dual_plane_textures(version: u32) -> bool {
+-    matches!(version, 31 | 41 | 42 | 43 | 60 | 61 | 62)
++    matches!(
++        version,
++        31 | 41 | 42 | 43 | 60 | 61 | 62 | 200..=209 | 230..=233 | 235 | 237 | 238 | 245 | 250..=252
++    )
+ }
+ 
+ /// What the host GPU can actually do, for the keys above.
+@@ -1347,6 +1415,15 @@ pub struct DeviceInfoLimits {
+     pub max_threads_per_threadgroup: [u32; 3],
+     pub max_threadgroup_memory_bytes: u32,
+     pub native_fp16: bool,
++    /// Whether this host runs tile shaders and imageblock-backed render passes
++    /// ([`DEVICE_INFO_KEY_TILE_SHADERS`], [`DEVICE_INFO_KEY_IMAGEBLOCKS`]).
++    ///
++    /// The Metal backend does. The Vulkan backend has no tile memory to give a
++    /// render pass, and below protocol 200 the answer never mattered: the guest
++    /// ANDs it with a feature byte that only macOS 27's ladder sets. At
++    /// [`PROTOCOL_VERSION_MACOS27`] a yes made CoreAnimation build imageblock
++    /// dispatches this backend refused every frame.
++    pub tile_memory: bool,
+ }
+ 
+ /// The device-info reply for this host: GPU-dependent keys reduced to what
+@@ -1375,6 +1452,9 @@ pub fn device_info_caps(limits: &DeviceInfoLimits, version: u32) -> Vec<(u32, u3
+                 DEVICE_INFO_KEY_MAX_THREADS_D => limits.max_threads_per_threadgroup[2],
+                 DEVICE_INFO_KEY_THREADGROUP_MEMORY => limits.max_threadgroup_memory_bytes,
+                 DEVICE_INFO_KEY_NATIVE_FP16 => u32::from(limits.native_fp16),
++                DEVICE_INFO_KEY_TILE_SHADERS | DEVICE_INFO_KEY_IMAGEBLOCKS => {
++                    u32::from(limits.tile_memory)
++                }
+                 DEVICE_INFO_KEY_DUAL_PLANE_TEXTURES => {
+                     return (key, u32::from(protocol_dual_plane_textures(version)));
+                 }
+@@ -1844,6 +1924,7 @@ mod tests {
+             max_threads_per_threadgroup: [4096, 4096, 4096],
+             max_threadgroup_memory_bytes: 262_144,
+             native_fp16: true,
++            tile_memory: true,
+         };
+         assert_eq!(
+             device_info_caps(&generous, VERSION_WITH_DUAL_PLANE),
+@@ -1866,6 +1947,7 @@ mod tests {
+             max_threads_per_threadgroup: [4096, 4096, 4096],
+             max_threadgroup_memory_bytes: 262_144,
+             native_fp16: true,
++            tile_memory: true,
+         };
+         let key12 = |version: u32| -> u32 {
+             device_info_caps(&host, version)
+@@ -1907,6 +1989,50 @@ mod tests {
+         }
+     }
+ 
++    /// A macOS 27 guest lands on the one rung of its second ladder this device
++    /// implements; every older request is clamped exactly as before.
++    #[test]
++    fn a_macos27_request_lands_on_the_rung_this_device_implements() {
++        assert_eq!(negotiate_protocol_version(252), PROTOCOL_VERSION_MACOS27);
++        assert_eq!(negotiate_protocol_version(237), PROTOCOL_VERSION_MACOS27);
++        assert_eq!(negotiate_protocol_version(236), PROTOCOL_VERSION_MAX);
++        assert_eq!(negotiate_protocol_version(200), PROTOCOL_VERSION_MAX);
++        assert_eq!(negotiate_protocol_version(63), PROTOCOL_VERSION_MAX);
++        assert_eq!(negotiate_protocol_version(4), 4);
++        assert!(protocol_dual_plane_textures(PROTOCOL_VERSION_MACOS27));
++        for version in 210..=229 {
++            assert!(
++                !protocol_dual_plane_textures(version),
++                "{version} is not a rung"
++            );
++        }
++        assert!(!protocol_dual_plane_textures(236));
++    }
++
++    /// Tile shaders and imageblocks are promised only by a host that has tile
++    /// memory to back them.
++    #[test]
++    fn tile_shaders_and_imageblocks_follow_the_host() {
++        let mut host = DeviceInfoLimits {
++            max_sample_count: 8,
++            d24_stencil8: true,
++            max_threads_per_threadgroup: [1024, 1024, 64],
++            max_threadgroup_memory_bytes: 32768,
++            native_fp16: true,
++            tile_memory: true,
++        };
++        let key = |limits: &DeviceInfoLimits, key: u32| {
++            device_info_caps(limits, PROTOCOL_VERSION_MACOS27)
++                .into_iter()
++                .find(|&(k, _)| k == key)
++                .map(|(_, v)| v)
++        };
++        assert_eq!(key(&host, DEVICE_INFO_KEY_TILE_SHADERS), Some(1));
++        assert_eq!(key(&host, DEVICE_INFO_KEY_IMAGEBLOCKS), Some(1));
++        host.tile_memory = false;
++        assert_eq!(key(&host, DEVICE_INFO_KEY_TILE_SHADERS), Some(0));
++        assert_eq!(key(&host, DEVICE_INFO_KEY_IMAGEBLOCKS), Some(0));
++    }
+     /// A host at the Vulkan floor is told to the guest as the floor.
+     ///
+     /// Each of these is an instruction the guest acts on: it sizes threadgroups
+@@ -1922,6 +2048,7 @@ mod tests {
+             max_threads_per_threadgroup: [128, 128, 64],
+             max_threadgroup_memory_bytes: 16384,
+             native_fp16: false,
++            tile_memory: false,
+         };
+         let served: std::collections::BTreeMap<u32, u32> =
+             device_info_caps(&floor, VERSION_WITH_DUAL_PLANE)
+@@ -2314,6 +2441,9 @@ mod tests {
+                 "HEAP_TEXTURE_SIZE_AND_ALIGN",
+                 CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN,
+             ),
++            ("EXEC_INDIRECT3", CHILD_OP_EXEC_INDIRECT3),
++            ("SET_OBJECT_LIST2", CHILD_OP_SET_OBJECT_LIST2),
++            ("EXEC_INDIRECT_INFO", CHILD_OP_EXEC_INDIRECT_INFO),
+         ];
+         for (i, (name, op)) in table.iter().enumerate() {
+             for (other, other_op) in &table[i + 1..] {
+diff --git a/crates/reims-vgpu/src/runtime/decode/fifo.rs b/crates/reims-vgpu/src/runtime/decode/fifo.rs
+index 158e2837f..ffdd84c3f 100644
+--- a/crates/reims-vgpu/src/runtime/decode/fifo.rs
++++ b/crates/reims-vgpu/src/runtime/decode/fifo.rs
+@@ -387,6 +387,57 @@ pub fn decode_exec_resource_table(payload: &[u8]) -> Option<Vec<ExecResourceDesc
+     Some(descs)
+ }
+ 
++/// Length of one resource record in an `EXEC_INDIRECT3` (`0x43`) payload: the
++/// object id and the validity ops, and nothing else.
++pub const CHILD_EXEC3_RESOURCE_DESC_LEN: u32 = 8;
++
++/// Rewrite an `EXEC_INDIRECT3` (`0x43`) payload as the `EXEC_INDIRECT2`
++/// (`0x37`) payload it carries the same submission as.
++///
++/// The guest switches to `0x43` from protocol 200, the first rung of the
++/// ladder macOS 27 adds above 62. The two differ in one thing: each resource
++/// record is eight bytes, `{object_id, ops}`, where `0x37`'s is twenty-four —
++/// the same eight followed by sixteen that the guest has always zeroed. The
++/// 12-byte header (`task, resource_count, cmdbuf_count`) and the 16-byte
++/// command-buffer records (`gva, length`) are unchanged. So the rewrite pads
++/// each record and copies the rest, and the submission then runs through every
++/// rail `0x37` already has, deferral and continuation included.
++///
++/// `EXEC_INDIRECT_INFO` (`0x45`) has the same layout and is widened the same
++/// way. Its command buffers carry info-segment records, which the exec walk
++/// already routes to the info handler.
++///
++/// `None` when the payload is shorter than the counts it declares.
++pub fn widen_exec_indirect3(payload: &[u8]) -> Option<Vec<u8>> {
++    let header = CHILD_EXEC_INDIRECT_HEADER_LEN as usize;
++    if payload.len() < header {
++        return None;
++    }
++    let count = ld32(&payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..]) as usize;
++    let records_len = count.checked_mul(CHILD_EXEC3_RESOURCE_DESC_LEN as usize)?;
++    let records_end = header.checked_add(records_len)?;
++    if records_end > payload.len() {
++        return None;
++    }
++    let mut out = Vec::with_capacity(
++        payload.len()
++            + count
++                * (CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN - CHILD_EXEC3_RESOURCE_DESC_LEN) as usize,
++    );
++    out.extend_from_slice(&payload[..header]);
++    let (records, _) =
++        payload[header..records_end].as_chunks::<{ CHILD_EXEC3_RESOURCE_DESC_LEN as usize }>();
++    for record in records {
++        out.extend_from_slice(record);
++        out.extend_from_slice(
++            &[0u8; (CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN - CHILD_EXEC3_RESOURCE_DESC_LEN)
++                as usize],
++        );
++    }
++    out.extend_from_slice(&payload[records_end..]);
++    Some(out)
++}
++
+ /// Decode CmdReplacePhysical (`0x3c`): `{task_id, object_id}`, 8 bytes.
+ ///
+ /// The guest emits this once per attached resource at the tail of a re-commit
+@@ -565,6 +616,44 @@ mod tests {
+         assert_eq!(descs[1].tail_nonzero_bytes(), 2);
+     }
+ 
++    #[test]
++    fn an_exec_indirect3_payload_widens_to_the_exec_indirect2_it_carries() {
++        // task 1, two resources, one command buffer at 0x108000 of 0x3c4 bytes —
++        // the shape a 27.2 guest at protocol 200 sends.
++        let mut narrow = Vec::new();
++        for word in [1u32, 2, 1, 0xa, 0x22, 0xf, 0x20] {
++            narrow.extend_from_slice(&word.to_le_bytes());
++        }
++        narrow.extend_from_slice(&0x108000u64.to_le_bytes());
++        narrow.extend_from_slice(&0x3c4u64.to_le_bytes());
++
++        let wide = widen_exec_indirect3(&narrow).expect("well-formed");
++        assert_eq!(wide.len(), 12 + 2 * 24 + 16);
++        let table = decode_exec_resource_table(&wide).expect("table decodes");
++        assert_eq!(table.len(), 2);
++        assert_eq!(table[0].object_id, 0xa);
++        assert_eq!(table[1].object_id, 0xf);
++        assert_eq!(table[0].tail_nonzero_bytes(), 0);
++        let cbuf = 12 + 2 * 24;
++        assert_eq!(
++            u64::from_le_bytes(wide[cbuf..cbuf + 8].try_into().unwrap()),
++            0x108000
++        );
++        assert_eq!(
++            u64::from_le_bytes(wide[cbuf + 8..cbuf + 16].try_into().unwrap()),
++            0x3c4
++        );
++    }
++
++    #[test]
++    fn a_short_exec_indirect3_payload_is_refused() {
++        let mut narrow = Vec::new();
++        for word in [1u32, 4, 1, 0xa] {
++            narrow.extend_from_slice(&word.to_le_bytes());
++        }
++        assert!(widen_exec_indirect3(&narrow).is_none());
++    }
++
+     /// The quad decoder is shared with `CmdInvalidateResources`; only the record
+     /// length differs. A second decoder for the same four bytes would be a
+     /// second place for the field order to drift.
+diff --git a/crates/reims-vgpu/src/runtime/drain/mod.rs b/crates/reims-vgpu/src/runtime/drain/mod.rs
+index 66c712423..3fb491486 100644
+--- a/crates/reims-vgpu/src/runtime/drain/mod.rs
++++ b/crates/reims-vgpu/src/runtime/drain/mod.rs
+@@ -544,6 +544,53 @@ fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Optio
+     }
+ }
+ 
++/// `CmdSetObjectList2` (`0x44`), macOS 27's form of [`apply_set_object_list`].
++///
++/// The first list is the same 12-byte-entry object list, now named by its task
++/// GVA rather than its page, and is applied through the same rail. The second
++/// list (16-byte entries) is the guest's, and nothing this device decodes reads
++/// it: every object reference a 27.2 boot made resolved through the first.
++fn apply_set_object_list2(state: &mut DeviceState, payload: &[u8], channel: Option<u32>) {
++    if packet_short(
++        "set_object_list2",
++        channel,
++        payload.len(),
++        SET_OBJECT_LIST2_LEN,
++    ) {
++        return;
++    }
++    let task_id = ld32(&payload[SET_OBJECT_LIST2_TASK_ID..]);
++    let gva = ld64(&payload[SET_OBJECT_LIST2_GVA..]);
++    let byte_len = ld32(&payload[SET_OBJECT_LIST2_BYTES..]);
++    let page_mask = (1u64 << state.page_shift) - 1;
++    let Some(pfn) = (gva & page_mask == 0)
++        .then_some(gva >> state.page_shift)
++        .and_then(|pfn| u32::try_from(pfn).ok())
++    else {
++        crate::observe::fail(format!(
++            "set_object_list2 refused reason=gva_not_a_page task={task_id} gva={gva:#x} site={}",
++            packet_site(channel)
++        ));
++        return;
++    };
++    let mut legacy = [0u8; SET_OBJECT_LIST_LEN];
++    legacy[SET_OBJECT_LIST_TASK_ID..SET_OBJECT_LIST_TASK_ID + 4]
++        .copy_from_slice(&task_id.to_le_bytes());
++    legacy[SET_OBJECT_LIST_PFN..SET_OBJECT_LIST_PFN + 4].copy_from_slice(&pfn.to_le_bytes());
++    legacy[SET_OBJECT_LIST_COUNT..SET_OBJECT_LIST_COUNT + 4]
++        .copy_from_slice(&byte_len.to_le_bytes());
++    if crate::observe::first_sight("set_object_list2", u64::from(task_id) << 32 ^ gva) {
++        crate::observe::off(format!(
++            "set_object_list2 site={} task={task_id} gva={gva:#x} bytes={byte_len} \
++             second_gva={:#x} second_bytes={}",
++            packet_site(channel),
++            ld64(&payload[SET_OBJECT_LIST2_SECOND_GVA..]),
++            ld32(&payload[SET_OBJECT_LIST2_SECOND_BYTES..])
++        ));
++    }
++    apply_set_object_list(state, &legacy, channel);
++}
++
+ fn apply_define_task2<H: HostMemory + HostOps>(
+     state: &mut DeviceState,
+     host: &mut H,
+@@ -2086,6 +2133,7 @@ fn device_info_limits() -> crate::model::DeviceInfoLimits {
+             max_threads_per_threadgroup: [u32::MAX; 3],
+             max_threadgroup_memory_bytes: u32::MAX,
+             native_fp16: true,
++            tile_memory: true,
+         }
+     }
+     #[cfg(feature = "backend-vulkan")]
+@@ -4489,6 +4537,26 @@ fn process_child_packet<H: HostMemory + HostOps>(
+     channel_id: u32,
+     packet: &Packet,
+ ) -> ChildPacketDisposition {
++    // macOS 27 submits through EXEC_INDIRECT3 and EXEC_INDIRECT_INFO, which are
++    // EXEC_INDIRECT2 with their resource records narrowed. Widen them here so
++    // the one exec rail — continuation and deferral included — serves all three.
++    let widened;
++    let packet = match packet.opcode {
++        CHILD_OP_EXEC_INDIRECT3 | CHILD_OP_EXEC_INDIRECT_INFO => {
++            match crate::runtime::decode::fifo::widen_exec_indirect3(&packet.payload) {
++                Some(payload) => {
++                    widened = Packet {
++                        opcode: CHILD_OP_EXEC_INDIRECT2,
++                        payload,
++                        ..packet.clone()
++                    };
++                    &widened
++                }
++                None => packet,
++            }
++        }
++        _ => packet,
++    };
+     // A packet that stopped at a draw waiting for its pipeline is this
+     // channel's head until it finishes. Something else here means the ring
+     // moved under it, and it can neither finish nor run again from the top.
+@@ -4508,6 +4576,9 @@ fn process_child_packet<H: HostMemory + HostOps>(
+         CHILD_OP_SET_OBJECT_LIST => {
+             apply_set_object_list(state, &packet.payload, Some(channel_id));
+         }
++        CHILD_OP_SET_OBJECT_LIST2 => {
++            apply_set_object_list2(state, &packet.payload, Some(channel_id));
++        }
+         CHILD_OP_DELETE_RESOURCE => {
+             if !packet_short("delete_resource", Some(channel_id), packet.payload.len(), 8) {
+                 let task_id = ld32(&packet.payload[0..]);
+diff --git a/crates/reims-vgpu/src/runtime/drain/tests.rs b/crates/reims-vgpu/src/runtime/drain/tests.rs
+index 61e8163b2..c6ab95b5a 100644
+--- a/crates/reims-vgpu/src/runtime/drain/tests.rs
++++ b/crates/reims-vgpu/src/runtime/drain/tests.rs
+@@ -6834,3 +6834,34 @@ fn set_object_list_converts_wire_byte_length_to_12_byte_slot_count() {
+     assert_eq!(state.tasks[3].object_list_pfn, 0x914);
+     assert_eq!(state.tasks[3].object_list_count, 8192);
+ }
++
++/// macOS 27's `0x44` names the same object list by task GVA; the payload
++/// below is the first one a 27.2 boot sent for task 1.
++#[test]
++fn set_object_list2_applies_its_first_list_like_set_object_list() {
++    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
++    let mut host = FakeHost::new();
++    state.define_task(1, 0x1000, 1);
++
++    let mut payload = Vec::with_capacity(SET_OBJECT_LIST2_LEN);
++    payload.extend_from_slice(&1u32.to_le_bytes());
++    payload.extend_from_slice(&0x4000u64.to_le_bytes());
++    payload.extend_from_slice(&0x10_4000u64.to_le_bytes());
++    payload.extend_from_slice(&0xc000u32.to_le_bytes());
++    payload.extend_from_slice(&0x1_0000u32.to_le_bytes());
++    process_child_packet(
++        &mut state,
++        &mut host,
++        2,
++        &Packet {
++            opcode: CHILD_OP_SET_OBJECT_LIST2,
++            stamp_waits: Vec::new(),
++            total_size: PACKET_HEADER_LEN + SET_OBJECT_LIST2_LEN as u32,
++            completion_stamp: 0,
++            payload,
++            next_head: 0,
++        },
++    );
++    assert_eq!(state.tasks[1].object_list_pfn, 1);
++    assert_eq!(state.tasks[1].object_list_count, 4096);
++}
+-- 
+2.43.0
+
