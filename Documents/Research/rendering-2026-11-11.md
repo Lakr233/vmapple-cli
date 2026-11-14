@@ -630,16 +630,21 @@ text on the first open each time.
   levels; see [The Edge at 0084](#the-edge-at-0084). System Settings' symbols
   and a first window's black toolbar, listed here at 0083, are fixed by
   [metal2vulkan 0005](#metal2vulkan-0005).
-- **26.6.2's GPU restarts.** From early boot, 26.6.2's serial log repeats
-  `Trying to restart GPU (Undefined)` about a thousand times, with `stalling for
-  detach from AppleParavirtGPU`, and the guest still reaches its login window.
-  It was seen on 2026-11-14 and is not caused by metal2vulkan 0006 or a cold
-  translation cache: a boot at 0006 logged 1017 cold and 1018 warm, and one at
-  0005 logged 1017. Boots built at reims 0022, 0023, 0025, 0030 and 0040 logged
-  1015–1017 each. Builds at 0020 and 0021 logged none, but their Reims logs
-  stopped after 2 s, so their GPU probably never came up and they say nothing.
-  The golden's own boot of 2026-11-10, with a working GPU, logged none. Its
-  Reims level is not recorded, and what changed since is open. 27.2 logs three.
+- **A first boot restarts its GPU.** With no Vulkan pipeline cache, 26.6.2's
+  serial log repeats `Trying to restart GPU (Undefined)` about a thousand
+  times, with `stalling for detach from AppleParavirtGPU`, and the guest still
+  reaches its login window. About 25 s into boot, NVIDIA's driver spends more
+  than 10 s compiling the pipeline for CoreAnimation's uber fragment shader
+  (258,540 words, `driver_call_outstanding ... create_graphics_pipelines`). The
+  submission waits for it, and the guest's watchdog restarts the GPU over and
+  over during that wait; its first restart falls inside it. The same copy,
+  booted again with the pipeline cache the first boot saved, logs none. Reims
+  keeps that cache in the virtual machine's directory, so only a first boot, or
+  one after the cache is deleted, does this. The boot and regression scripts
+  used on 2026-11-13 and 2026-11-14 delete it before every boot, which is why
+  every 26.6.2 regression boot logged about a thousand, at metal2vulkan 0005 and
+  0006 and at reims 0022 through 0040 alike, and 27.2 logged three. Making the
+  compile shorter or not making the guest wait for it is open.
 - **15.6.1** was recorded at 0071, 0076 and 0079 as drawing its language panel
   too dark. At 0081 that was the panel fading in at the 150 s screenshot; 90 s
   later it is drawn.

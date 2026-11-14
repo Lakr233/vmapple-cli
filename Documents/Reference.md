@@ -146,8 +146,9 @@ entered and bypassed a refunnelled arm. 0006 splits that bypass edge; the
 fallback then draws the text like the AIR on Metal. With it, 27.2 opened About
 This Mac with its text in nine cold boots, drew its menus, Dock and System
 Settings, and did not panic; 26.6.2, 15.6.1, 14.6.1 and 13.6 ran once each to
-the same screens as at 0084 with no panic. 26.6.2 logs `Trying to restart GPU`
-about a thousand times from early boot and still reaches its login window; see
+the same screens as at 0084 with no panic. 26.6.2 logged `Trying to restart GPU`
+about a thousand times while its first uber-shader pipeline compiled, because
+the test scripts delete the Vulkan pipeline cache; see
 [What Is Still Wrong](Research/rendering-2026-11-11.md#what-is-still-wrong). See
 [rendering-2026-11-11.md](Research/rendering-2026-11-11.md#metal2vulkan-0006).
 
