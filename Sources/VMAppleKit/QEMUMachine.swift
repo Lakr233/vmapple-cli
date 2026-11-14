@@ -151,6 +151,15 @@ public final class QEMUMachine: @unchecked Sendable {
             environment[name] = "1"
         }
         environment["VK_DRIVER_FILES"] = "/usr/share/vulkan/icd.d/nvidia_icd.json"
+        // Compiled pipelines and translated shaders depend on the host's GPU and
+        // the guest's build, not on the machine. Machines of one build share them,
+        // so a new machine does not compile CoreAnimation's largest pipeline on
+        // its first boot; that compile takes over ten seconds, and the guest
+        // restarts its GPU about a thousand times while it waits.
+        if environment["REIMS_VGPU_CACHE_DIR"] == nil,
+           let cache = Self.sharedCacheDirectory(installed: machine.configuration.installed, environment: environment) {
+            environment["REIMS_VGPU_CACHE_DIR"] = cache.path
+        }
         environment["TMPDIR"] = machine.directory.path
         environment["XDG_CACHE_HOME"] = machine.directory.appending(path: ".cache").path
         process.environment = environment
@@ -176,6 +185,21 @@ public final class QEMUMachine: @unchecked Sendable {
 
     /// Sends SIGTERM and, if QEMU still runs after `timeout`, SIGKILL. QEMU
     /// can take a minute to act on SIGTERM under a busy guest.
+    /// The cache directory machines with this installed build share, under
+    /// `$XDG_CACHE_HOME` or `~/.cache`; nil when the build is not known.
+    /// `installed` reads like "26.6.2 (25G83)".
+    static func sharedCacheDirectory(installed: String?, environment: [String: String]) -> URL? {
+        guard let installed,
+              let open = installed.lastIndex(of: "("),
+              let close = installed.lastIndex(of: ")"),
+              open < close else { return nil }
+        let build = installed[installed.index(after: open)..<close]
+        guard !build.isEmpty, build.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) }) else { return nil }
+        let base = environment["XDG_CACHE_HOME"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
+            ?? FileManager.default.homeDirectoryForCurrentUser.appending(path: ".cache")
+        return base.appending(path: "vmapple-cli/reims/\(build)")
+    }
+
     static func terminate(_ process: Process, timeout: TimeInterval = 90) {
         guard process.isRunning else { return }
         process.terminate()

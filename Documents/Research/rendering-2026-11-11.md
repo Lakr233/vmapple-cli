@@ -630,7 +630,7 @@ text on the first open each time.
   levels; see [The Edge at 0084](#the-edge-at-0084). System Settings' symbols
   and a first window's black toolbar, listed here at 0083, are fixed by
   [metal2vulkan 0005](#metal2vulkan-0005).
-- **A first boot restarts its GPU.** With no Vulkan pipeline cache, 26.6.2's
+- **The first machine of a build restarts its GPU on its first boot.** With no Vulkan pipeline cache, 26.6.2's
   serial log repeats `Trying to restart GPU (Undefined)` about a thousand
   times, with `stalling for detach from AppleParavirtGPU`, and the guest still
   reaches its login window. About 25 s into boot, NVIDIA's driver spends more
@@ -645,6 +645,16 @@ text on the first open each time.
   every 26.6.2 regression boot logged about a thousand, at metal2vulkan 0005 and
   0006 and at reims 0022 through 0040 alike, and 27.2 logged three. Making the
   compile shorter or not making the guest wait for it is open.
+
+  Reims 0085 lets a launcher name the directory both caches live in
+  (`REIMS_VGPU_CACHE_DIR`), and vmapple-cli points it at
+  `~/.cache/vmapple-cli/reims/<build>`, shared by every machine with that
+  installed build. Two fresh copies of the 26.6.2 golden were booted one after
+  the other: the first, with an empty shared directory, logged 1018 restarts
+  and compiled the pipeline for over ten seconds; the second found 92 of its
+  translations and the pipeline in the shared directory, logged none, and did
+  not wait on a compile. Now only the first machine of a build on a host pays
+  it.
 - **15.6.1** was recorded at 0071, 0076 and 0079 as drawing its language panel
   too dark. At 0081 that was the panel fading in at the 150 s screenshot; 90 s
   later it is drawn.
