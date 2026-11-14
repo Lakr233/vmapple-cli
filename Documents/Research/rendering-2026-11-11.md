@@ -576,7 +576,17 @@ kernel is not the cause either.
 
 The reference runs 27.0.1, and its wallpaper is a solid gold, so it would also
 show warmth if it drew these terms the same way. A 27.2 guest on Apple hardware
-has not been captured, and whether 27.2 draws this edge on a Mac is open.
+has not been captured. What remained to check was the backdrop the shader
+samples. On 2026-11-14 level 0 of that texture was read back while About This
+Mac opened at 0085, and compared with a screenshot of the desktop taken just
+before, averaged over 4 by 4 pixels. The window's white footprint covers texels
+65 to 132 by 65 to 176, and the 9,492 texels around it match the desktop at
+x = 564 + 4c, y = 864 − 4r within 3.3 levels on average (42 at worst, on hard
+edges, where the capture's filter is not a box). Left of the window it holds
+(186,149,116) where the desktop has (189,151,118). So every input to the
+glass draw is what 27.2 gives it: the uniforms come from the guest, the
+backdrop is the desktop, and the shader draws on Metal as it does here. The
+warm edge is 27.2's refraction of a warm desktop, not a fault in this stack.
 
 ### metal2vulkan 0006
 
