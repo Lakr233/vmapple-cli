@@ -543,15 +543,50 @@ Two things were tried on the way and are not applied:
   which Vulkan forbids (`VUID-vkCmdDispatch-None-08611`). Folding the offset
   into the coordinate at bind time left the band unchanged.
 
+### The Edge at 0084
+
+At 0084 About This Mac's edge reads (255,237,216) 2 pixels in and (255,245,224)
+at 10, where the 27.0.1 Mac reads 250 and 253. The glass shader was run on
+Metal to see whether the translation causes this. The 27.2 guest's
+`glass_background_sdf_all_lph` AIR was packaged with `metallib` and drawn in the
+27.0.1 Virtualization.framework guest, with what Reims bound for the window's
+corner and edge draws: the vertices, the matrix, the 288-byte uniforms, the
+extension and EDR buffers, and level 0 of the source texture, with the other
+levels made by Metal's blit. The result is the stack's own, within two levels:
+
+| Pixels in from the left edge | 2 | 5 | 10 | 20 | 60 |
+| --- | --- | --- | --- | --- | --- |
+| Metal, the 27.2 shader | 256,237,223 | 260,240,226 | 262,244,230 | 262,247,237 | 254,254,254 |
+| Reims 0084 | 255,237,216 | 255,241,219 | 255,245,224 | 255,248,232 | 254,254,254 |
+
+With the source texture replaced by a gradient that encodes each texel's
+position, Metal and Reims return the same values to within one level, so the
+two sample the same coordinates.
+
+The warmth is what the shader asks for. Three refraction terms move the sample
+outward along the shape's gradient by up to 60, 70 and 98 pixels at the edge.
+The 98-pixel term reads the blur at a LOD of about 4.3. The guest's capture
+covers exactly the window and 98 pixels around it, and around the window that
+capture is the desktop. Inverting the displacement makes the edge read 244, 253
+and 254, the Mac's profile, but the guest's own SDF code gives an outward
+gradient, so that is not a fix. A Gaussian mip chain in place of the box
+filter moves the edge by at most 6 levels and leaves it warm, so the mip
+kernel is not the cause either.
+
+The reference runs 27.0.1, and its wallpaper is a solid gold, so it would also
+show warmth if it drew these terms the same way. A 27.2 guest on Apple hardware
+has not been captured, and whether 27.2 draws this edge on a Mac is open.
+
 ### What Is Still Wrong
 
-- **Blur strength.** The guest builds its backdrop blur's mip levels in compute
+- **Blur levels.** The guest builds its backdrop blur's mip levels in compute
   at a LOD the kernel computes, which neither the translator nor the compute
   rail carries, so the draw generates them by a box filter instead; see
-  [About This Mac's Band](#about-this-macs-band). With 0084 About This Mac
-  draws as one surface, a little warmer at its edge than a Mac's. System
-  Settings' symbols and a first window's black toolbar, listed here at 0083,
-  are fixed by [metal2vulkan 0005](#metal2vulkan-0005).
+  [About This Mac's Band](#about-this-macs-band). Generating the guest's levels
+  did not change the window, and a Gaussian chain moves the edge by at most 6
+  levels; see [The Edge at 0084](#the-edge-at-0084). System Settings' symbols
+  and a first window's black toolbar, listed here at 0083, are fixed by
+  [metal2vulkan 0005](#metal2vulkan-0005).
 - **15.6.1** was recorded at 0071, 0076 and 0079 as drawing its language panel
   too dark. At 0081 that was the panel fading in at the 150 s screenshot; 90 s
   later it is drawn.
