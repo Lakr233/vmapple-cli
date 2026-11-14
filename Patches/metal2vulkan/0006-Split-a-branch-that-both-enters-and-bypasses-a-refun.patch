@@ -1,0 +1,211 @@
+From 38938435eaa1e83e6983a9b0323d8de7ffa2b0e8 Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Sat, 14 Nov 2026 15:24:41 +0800
+Subject: [PATCH] Split a branch that both enters and bypasses a refunnelled
+ arm
+
+refunnel_one_deep_shared_arm sends every entry into a deep shared arm,
+and every bypass into its merge, through one join that phis a route
+bit. A block whose conditional branch enters the arm on one edge and
+bypasses to the merge on the other is both kinds of entry, but a phi
+holds one incoming per predecessor: the dedup kept its entry, so the
+join always took the arm, and the value the bypass edge carried into
+the merge was lost. The emitted module still validated, because SSA
+demotion read the lost value from a Function variable that the bypass
+path never stored.
+
+Give such a bypass edge its own pass-through block first and refunnel
+the split graph, so the route bit and the merge value each name one
+edge.
+
+On macOS 27.2 this is CoreAnimation's A2Xghfc fallback shader. When
+neither colour-op byte is set, the colour it sampled became zero, so
+text drawn through it came out transparent: About This Mac's labels
+were missing whenever the window was drawn before the specialised
+pipeline was ready. Of 184 shaders from a 27.2 boot, A2Xghfc is the
+only one whose translation changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/native/cfg/blocks.rs | 151 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 151 insertions(+)
+
+diff --git a/src/native/cfg/blocks.rs b/src/native/cfg/blocks.rs
+index c8e3348..e6c276b 100644
+--- a/src/native/cfg/blocks.rs
++++ b/src/native/cfg/blocks.rs
+@@ -1319,6 +1319,19 @@ pub(in crate::native) fn refunnel_one_deep_shared_arm(
+             if bypass_entries.is_empty() {
+                 continue;
+             }
++            // A predecessor whose conditional branch enters `shared` on one edge and bypasses to
++            // `merge` on the other is both kinds of entry. The route phi holds one incoming per
++            // predecessor, so it cannot carry both decisions: give that bypass edge its own block
++            // first, then refunnel the split graph.
++            let duals = bypass_entries
++                .iter()
++                .filter(|pred| shared_entries.contains(pred))
++                .cloned()
++                .collect::<Vec<_>>();
++            if !duals.is_empty() {
++                let split = split_bypass_edges(blocks, &duals, merge, counter)?;
++                return refunnel_one_deep_shared_arm(&split, counter);
++            }
+             let mut all_entries = shared_entries
+                 .iter()
+                 .map(|pred| (pred.clone(), true))
+@@ -1429,6 +1442,72 @@ pub(in crate::native) fn refunnel_one_deep_shared_arm(
+     None
+ }
+ 
++/// Route each of `predecessors`' edges into `merge` through a fresh pass-through block, and move
++/// `merge`'s phi incomings from the predecessor to that block. The predecessor's other edges are
++/// unchanged.
++fn split_bypass_edges(
++    blocks: &[BodyBlock],
++    predecessors: &[String],
++    merge: &str,
++    counter: &mut usize,
++) -> Option<Vec<BodyBlock>> {
++    let mut names = blocks
++        .iter()
++        .map(|block| block.name.clone())
++        .collect::<HashSet<_>>();
++    let mut out = blocks.to_vec();
++    for predecessor in predecessors {
++        let mut name = format!("%metal2vulkan.branch_refunnel.bypass.{}", *counter);
++        while names.contains(&name) {
++            *counter += 1;
++            name = format!("%metal2vulkan.branch_refunnel.bypass.{}", *counter);
++        }
++        *counter += 1;
++        names.insert(name.clone());
++        let pass = crate::native::tir::lower_block_carrier(
++            &name,
++            &[format!("br label {merge}")],
++            &HashMap::new(),
++        )?;
++        let predecessor_index = out.iter().position(|block| &block.name == predecessor)?;
++        std::sync::Arc::make_mut(out[predecessor_index].typed.as_mut()?)
++            .redirect_successor(merge, &name);
++        let merge_index = out.iter().position(|block| block.name == merge)?;
++        let merge_typed = std::sync::Arc::make_mut(out[merge_index].typed.as_mut()?);
++        let rewrites = merge_typed
++            .insts
++            .iter()
++            .filter_map(|inst| {
++                let (_, incoming) = inst.phi_incoming.as_ref()?;
++                let incoming = incoming
++                    .iter()
++                    .map(|(value, pred)| {
++                        let pred = if pred == predecessor {
++                            name.clone()
++                        } else {
++                            pred.clone()
++                        };
++                        (value.clone(), pred)
++                    })
++                    .collect::<Vec<_>>();
++                Some((inst.result.clone()?, incoming))
++            })
++            .collect::<Vec<_>>();
++        for (result, incoming) in rewrites {
++            merge_typed.set_phi_incomings(&result, &incoming);
++        }
++        out.insert(
++            merge_index,
++            BodyBlock {
++                name,
++                role: BlockRole::Normal,
++                typed: Some(pass.into()),
++            },
++        );
++    }
++    Some(out)
++}
++
+ pub(in crate::native) fn lower_unstructured_switches(blocks: &[BodyBlock]) -> Vec<BodyBlock> {
+     lower_switches(blocks, false)
+ }
+@@ -2372,6 +2451,78 @@ mod tests {
+         assert_eq!(out.len(), blocks.len() + 1);
+     }
+ 
++    /// A block whose branch enters the shared arm on one edge and bypasses to the merge on the other
++    /// must keep both decisions. Its bypass edge gets its own block, so the route phi and the merge
++    /// value phi each name one edge, and the bypass value still reaches the merge.
++    #[test]
++    fn deep_shared_arm_keeps_a_branch_that_both_enters_and_bypasses() {
++        let blocks = vec![
++            block("%header", "br i1 %outer, label %shared, label %inner"),
++            block("%inner", "br i1 %nested, label %shared, label %merge"),
++            block("%shared", "br label %merge"),
++            synthetic_block(
++                "%merge".to_string(),
++                vec![
++                    "%v = phi i32 [ 1, %shared ], [ 2, %inner ]".to_string(),
++                    "ret void".to_string(),
++                ],
++                BlockRole::Normal,
++            ),
++        ];
++        let out = refunnel_one_deep_shared_arm(&blocks, &mut 0).unwrap();
++        let join = out
++            .iter()
++            .find(|block| {
++                block.name.starts_with("%metal2vulkan.branch_refunnel.")
++                    && !block.name.contains(".bypass.")
++            })
++            .expect("deep shared arm receives a refunnel");
++        let bypass = out
++            .iter()
++            .find(|block| block.name.contains(".bypass."))
++            .expect("the dual edge is split");
++        let inner = out.iter().find(|block| block.name == "%inner").unwrap();
++        assert!(block_successors(inner).contains(&join.name));
++        assert!(block_successors(bypass).contains(&join.name));
++        let phis = join
++            .typed
++            .as_ref()
++            .unwrap()
++            .insts
++            .iter()
++            .filter_map(|inst| inst.phi_incoming.clone())
++            .collect::<Vec<_>>();
++        let route = &phis[0].1;
++        assert!(
++            route
++                .iter()
++                .any(
++                    |(v, p)| crate::native::render::render_value(v).as_deref() == Some("true")
++                        && p == "%inner"
++                ),
++            "{route:?}"
++        );
++        assert!(
++            route
++                .iter()
++                .any(
++                    |(v, p)| crate::native::render::render_value(v).as_deref() == Some("false")
++                        && p == &bypass.name
++                ),
++            "{route:?}"
++        );
++        let value = &phis[1].1;
++        assert!(
++            value
++                .iter()
++                .any(
++                    |(v, p)| crate::native::render::render_value(v).as_deref() == Some("2")
++                        && p == &bypass.name
++                ),
++            "{value:?}"
++        );
++    }
++
+     /// A switch in a natural-loop body whose default directly breaks the loop cannot remain an
+     /// `OpSwitch`: SPIR-V requires every case construct to remain under the switch header. The
+     /// reject-only loop-exit lowering turns it into a comparison ladder, preserving the original
+-- 
+2.43.0
+

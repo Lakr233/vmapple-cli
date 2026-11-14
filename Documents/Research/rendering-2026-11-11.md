@@ -165,6 +165,7 @@ In one boot, the pipelines were already built by re-rendering every icon.
 "About This Mac" then drew its text on first open. After a cold boot it still
 opened without text the first time. That boot had no dropped packet and no
 long compile while the window opened, so the cause is still open.
+metal2vulkan 0006 fixes it; see [metal2vulkan 0006](#metal2vulkan-0006).
 
 Separately, the uber fragment shader's pipelines take 7.7–8.8 s each for
 NVIDIA's driver to compile. A packet that waits on such a compile for 10 s,
@@ -576,6 +577,48 @@ kernel is not the cause either.
 The reference runs 27.0.1, and its wallpaper is a solid gold, so it would also
 show warmth if it drew these terms the same way. A 27.2 guest on Apple hardware
 has not been captured, and whether 27.2 draws this edge on a Mac is open.
+
+### metal2vulkan 0006
+
+About This Mac sometimes opened without any text: no name, no labels, and an
+empty More Info button. In 9 cold boots of 0084 that each opened it once, 3
+were missing the text, and 5 of 24 more with diagnostic builds of it;
+reopening the window drew it. This is the
+[First-Draw Text](#first-draw-text) left open at 0069.
+
+A probe that read back the window's title pixel after every draw into the
+framebuffer showed which draw writes the text. WindowServer draws each label
+from a small CPU-rendered image. While the specialised pipeline for that is
+being built, it uses CoreAnimation's fallback shader `A2Xghfc`, with blending
+done in the shader from the framebuffer. In good and bad boots alike, the
+fallback's draws left the title pixel white; only the specialised pipeline's
+draws wrote the text. A boot was missing the text when the last frame before
+the window settled used the fallback.
+
+`A2Xghfc` and its vertex shader were run on Metal in the 27.0.1
+Virtualization.framework guest with one such draw's buffers, vertices and
+textures. The AIR drew the title (1566 dark pixels in its scissor). The
+translation, turned back into Metal source with spirv-cross and run the same
+way, drew nothing. Recording intermediate values at the title pixel narrowed
+it down: the label image sampled with alpha 0.698, and the colour was zero by
+the time it reached the blend.
+
+The AIR reaches its colour-op stage through block 579, which branches to the
+colour-op work (582) when the second colour-op byte is set and straight to the
+merge (643) with the sampled colour when it is not. metal2vulkan's
+`refunnel_one_deep_shared_arm` routes every entry into the shared arm and every
+bypass into the merge through one join that phis a route bit. Block 579 is
+both, on its two edges, but a phi has one incoming per predecessor; the join
+kept its entry and lost the bypass and its value. SSA demotion then made the
+module validate by reading that value from a Function variable which the
+bypass path never stored.
+
+metal2vulkan 0006 gives such a bypass edge its own pass-through block before
+refunnelling. The translated fallback then draws the title like the AIR, 1566
+dark pixels, with the same values at the probed pixels. Of 184 shaders from a
+27.2 boot, `A2Xghfc` is the only one whose translation changes, and all of them
+validate before and after. In 8 cold boots with 0006, About This Mac had its
+text on the first open each time.
 
 ### What Is Still Wrong
 
