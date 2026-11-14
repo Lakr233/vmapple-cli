@@ -1,0 +1,96 @@
+From 0993dc3473d5855b1786da99404fe65a8308b8a7 Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Sat, 14 Nov 2026 10:41:35 +0800
+Subject: [PATCH] vgpu: let a constexpr sampler take its binding from a stale
+ guest sampler
+
+metal2vulkan gives a constexpr sampler the first sampler binding the
+shader does not declare. A sampler the guest left bound at that index
+from an earlier draw belongs to no argument of the shader, and Metal
+never consults it, but the draw rail provisioned guest samplers first
+and added the constexpr one only where the binding was free, so the
+guest's stale state won.
+
+macOS 27's window glass samples its backdrop blur through a constexpr
+sampler with linear filtering, linear mips and an explicit LOD. A
+nearest, unmipmapped sampler left at fragment index 0 replaced it, so
+About This Mac sampled the sharp base level and drew a band of desktop
+colour around a white rectangle with square corners.
+
+A constexpr sampler now replaces whatever the guest bound at its
+binding, on the draw rail and on the compute rail.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/runtime/compute_exec/mod.rs           |  5 +++
+ crates/reims-vgpu/src/runtime/draw/vulkan.rs  | 37 +++++++++++--------
+ 2 files changed, 27 insertions(+), 15 deletions(-)
+
+diff --git a/crates/reims-vgpu/src/runtime/compute_exec/mod.rs b/crates/reims-vgpu/src/runtime/compute_exec/mod.rs
+index 918b45fe3..c84af95ba 100644
+--- a/crates/reims-vgpu/src/runtime/compute_exec/mod.rs
++++ b/crates/reims-vgpu/src/runtime/compute_exec/mod.rs
+@@ -4349,6 +4349,11 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
+         samplers.push(sampler);
+     }
+     for reflected in reflected_samplers.iter() {
++        // A constexpr sampler's binding is not an argument-table slot; a sampler the guest
++        // left bound at that index is not this kernel's (see the draw path's same rule).
++        if reflected.static_state.is_some() {
++            samplers.retain(|sampler| sampler.binding != reflected.binding);
++        }
+         if !samplers
+             .iter()
+             .any(|sampler| sampler.binding == reflected.binding)
+diff --git a/crates/reims-vgpu/src/runtime/draw/vulkan.rs b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+index fdc57e01d..b79119a2c 100644
+--- a/crates/reims-vgpu/src/runtime/draw/vulkan.rs
++++ b/crates/reims-vgpu/src/runtime/draw/vulkan.rs
+@@ -8802,22 +8802,29 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
+             );
+             for (variant, stage) in [(&v_variant, "vertex"), (&f_variant, "fragment")] {
+                 for reflected in variant.samplers.iter() {
+-                    if sampler_binds.insert(reflected.binding) {
+-                        let binding = reflected.binding;
+-                        if let Some(state) = reflected.static_state {
+-                            sampler_origin.insert(binding, b'c');
+-                            samplers.push(
+-                                reflected_static_sampler_resource(stage, binding, state)
+-                                    .map_err(DrawError::DrawPreparation)?,
+-                            );
+-                        } else {
+-                            sampler_origin.insert(binding, b'd');
+-                            samplers.push(
+-                                crate::backend::vulkan::engine::SamplerResource::normalized_default(
+-                                    binding,
+-                                ),
+-                            );
++                    let binding = reflected.binding;
++                    // A constexpr sampler takes no slot in Metal's argument table, so the
++                    // translator gives it the first sampler binding the shader does not
++                    // declare. A sampler the guest left bound at that index belongs to no
++                    // argument of this shader, and Metal never consults it: the constexpr
++                    // state is what the shader samples with.
++                    if let Some(state) = reflected.static_state {
++                        if !sampler_binds.insert(binding) {
++                            samplers.retain(|sampler| sampler.binding != binding);
++                            crate::runtime::drain::note_store_route("sampler_static_over_bound");
+                         }
++                        sampler_origin.insert(binding, b'c');
++                        samplers.push(
++                            reflected_static_sampler_resource(stage, binding, state)
++                                .map_err(DrawError::DrawPreparation)?,
++                        );
++                    } else if sampler_binds.insert(binding) {
++                        sampler_origin.insert(binding, b'd');
++                        samplers.push(
++                            crate::backend::vulkan::engine::SamplerResource::normalized_default(
++                                binding,
++                            ),
++                        );
+                     }
+                 }
+             }
+-- 
+2.43.0
+
