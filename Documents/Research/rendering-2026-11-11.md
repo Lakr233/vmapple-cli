@@ -452,22 +452,77 @@ Neither changed the rim: screenshots before and after match. The rim comes from
 the glass draws themselves, and whether a Mac draws the same band has not been
 compared on a Mac.
 
+### metal2vulkan 0005
+
+The symbols missing from System Settings' icons and the black toolbar on a
+first window had one cause: the translator lost a pointer that crossed a helper
+call and stood a zero in for it.
+
+When the native emitter cannot trace a pointer, it defines a Private variable
+initialised to `OpConstantNull` and reads through that. The module still passes
+spirv-val, so none of the retry tiers sees anything wrong, and every load
+through the pointer reads zero.
+
+- **Icons.** iconservicesagent rasterises a symbol as a mask, and a Core Image
+  chain (`ci_asgDownH_affine_nearest` and its neighbours) downsamples and blurs
+  it before RenderBox builds the distance field. `_ci_sampler_builder` returns
+  `coreimage::Sampler_h`, whose third member is a `ptr addrspace(2)` to the
+  sampler's transform rows in the argument buffer, and the kernel reads both
+  rows through it after an `extractvalue`. Translated, the rows were zero, every
+  sample landed at (0, 0), and the 31×82 and 31×36 stages came out transparent
+  black. Read back after each draw, the chain was empty from that kernel on,
+  while its 64×74 input held the glyph.
+- **Toolbar.** The CoreAnimation fallback shader `A2Xghfc` read 4,892 values
+  this way and `narrow_blur_19_compute` and `_final` read their offset table
+  through a pointer parameter. The first window an app opened drew its toolbar
+  black.
+
+0005 counts, after translating, the zero-initialised Private variables a module
+loads and never stores. When there are any, it translates again from the text
+with every internal helper inlined and the `insertvalue`/`extractvalue`
+round-trips folded, which forwards the argument-buffer pointer, and keeps that
+result only if it reads fewer of them.
+
+Of the 304 shaders a 27.2 boot that opened System Settings, a Finder window and
+About This Mac translated, four read such a variable before 0005 and none after;
+299 translate to the same bytes. With icon caches cleared, the sidebar and list
+icons draw their symbols, and System Settings' first window draws its toolbar
+light.
+
+### About This Mac's Band
+
+A Mac guest on Virtualization.framework, running 27.0.1 over a colourful
+backdrop, draws About This Mac as one tinted glass surface: the middle
+(255,249,251) and the edge (249,236,240) carry the same tint. This stack draws
+an opaque white rectangle (254,254,254) with square corners inside a 28-pixel
+band of glass.
+
+What WindowServer sends for the window, in order:
+
+1. `inplace_copy_lph` copies the band's region of the display into heap
+   textures.
+2. Two quads with the window's footprint and vertex colour (1,1,1,1), one
+   premultiplied and one opaque, write white over the window on the display.
+3. A compute kernel captures the display around the window into 128×192, and
+   further kernels make a 256×256 blur of it.
+4. `glass_background_sdf_all_lph` draws the band from a blur of step 1.
+5. `BvcmA2Xhfcu` draws the middle from the blur of step 3.
+
+The quads' pipeline writes all channels of colour attachment 0, with no depth
+or stencil, so step 3 captures white and the middle comes out white while the
+band shows the desktop. Masking every quad of that colour at once gives a
+uniform tinted window, as on the Mac, but also removes the traffic lights and
+the computer image. Why this guest sends the white footprint before the
+capture, where the Mac's result says it does not, is open; the capability a
+device reports is a candidate, not a finding.
+
 ### What Is Still Wrong
 
-- **System Settings' symbols.** Its sidebar and list icons draw as coloured
-  squares without their symbols. The 48×48 icons the draws sample already lack
-  them, so they are lost where the icons are rendered, not where they are
-  composited. The guest logs RenderBox `precondition failure` lines from
-  `iconservicesagent` and `DockHelper` around these renders. Clearing the icon
-  caches and reporting argument-buffer tier keys 38 and 39 did not change it.
-- **About This Mac's rim.** See [0082–0083](#00820083): the tinted band around
-  the white content is drawn by the glass draws, and is not yet compared with a
-  Mac.
-- **A first window's black toolbar.** The first window an app opens after a
-  boot sometimes draws its toolbar black until it redraws. The toolbar material
-  is drawn into a linear texture and then overdrawn by a draw whose textures
-  are all 1×1 placeholders. It did not reproduce while every draw was read back,
-  so it depends on timing.
+- **About This Mac's band.** See [About This Mac's Band](#about-this-macs-band):
+  the middle of the window captures the white footprint WindowServer draws
+  before the capture. System Settings' symbols and a first window's black
+  toolbar, listed here at 0083, are fixed by
+  [metal2vulkan 0005](#metal2vulkan-0005).
 - **Blur strength.** Generated mip levels are a box filter, not the guest's
   own downsample kernel, so the blur is close to a Mac's but not the same.
 - **15.6.1** was recorded at 0071, 0076 and 0079 as drawing its language panel
