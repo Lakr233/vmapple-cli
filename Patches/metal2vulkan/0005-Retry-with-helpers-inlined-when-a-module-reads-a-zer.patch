@@ -1,0 +1,293 @@
+From bdc63776d7a06fb4fa1f28d6af90ca792006dfe8 Mon Sep 17 00:00:00 2001
+From: Lakr233 <git@qaq.wiki>
+Date: Sat, 14 Nov 2026 07:19:30 +0800
+Subject: [PATCH] Retry with helpers inlined when a module reads a zero Private
+ stand-in
+
+When the emitter cannot trace a pointer, it defines a Private variable
+initialised to OpConstantNull in its place. The module still validates,
+so no retry tier runs, and every load through that pointer reads zero.
+On macOS 27 this happens where a pointer crosses a helper call:
+
+- Core Image's _ci_sampler_builder returns coreimage::Sampler_h with the
+  sampler transform as a ptr addrspace(2) member. The kernel sampled at
+  (0, 0), so the downsample and blur kernels behind System Settings'
+  icons returned transparent black and the icons lost their symbols.
+- CoreAnimation's narrow_blur_19 kernels read their offset table through
+  a pointer parameter, and the A2Xghfc fallback shader read thousands of
+  values the same way; the first window an app opened drew its toolbar
+  black.
+
+After translating, count the zero-initialised Private variables that are
+loaded and never stored. When there are any, translate again from the
+text with every non-recursive internal helper inlined and the aggregate
+round-trips folded, and keep that result only if it reads strictly fewer.
+Of 304 shaders from a macOS 27.2 boot, four read such a variable before
+and none after; 299 translate to the same bytes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/lib.rs               |  50 +++++++++++++
+ src/native/mod.rs        |  10 +++
+ src/unwritten_private.rs | 153 +++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 213 insertions(+)
+ create mode 100644 src/unwritten_private.rs
+
+diff --git a/src/lib.rs b/src/lib.rs
+index 03153af..9cd3b4a 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -36,6 +36,7 @@ mod spirv_operand;
+ mod spirv_variable_ptr;
+ pub mod tools;
+ pub(crate) mod types;
++mod unwritten_private;
+ 
+ pub use fc_specialize::{
+     specialize_function_constant_bytes, specialize_function_constants,
+@@ -913,6 +914,14 @@ pub fn translate_bda_probe(
+ /// least what a process main thread gets, since that is where the CLI runs the sequential path.
+ const SPECULATIVE_STACK_BYTES: usize = 16 << 20;
+ 
++/// Translate, then retry once with every internal helper inlined when the result still reads a zero
++/// Private variable it never writes.
++///
++/// Such a variable is the emitter's stand-in for a pointer it lost across a helper call, and the
++/// module validates with it, so none of the validation-driven tiers below sees the problem. Inlined,
++/// the pointer and its uses share one body and the aggregate fold forwards it. The retry is adopted
++/// only when it translates and reads strictly fewer such variables; every other module keeps the
++/// bytes the first translation produced. See [`unwritten_private`].
+ fn translate_sanitized_with_meta(
+     san_ll: &str,
+     stage: passes::Stage,
+@@ -924,6 +933,47 @@ fn translate_sanitized_with_meta(
+     tmp: &Path,
+     options: passes::TransformOptions,
+     psb_retry_enabled: bool,
++) -> Result<Vec<u8>, String> {
++    let translate = |san_ll: &str| {
++        translate_sanitized_with_meta_once(
++            san_ll,
++            stage,
++            frag,
++            vert,
++            kern,
++            promoted_kern,
++            entry_name,
++            tmp,
++            options,
++            psb_retry_enabled,
++        )
++    };
++    let spv = translate(san_ll)?;
++    let unwritten = unwritten_private::unwritten_private_reads(&spv);
++    if unwritten == 0 {
++        return Ok(spv);
++    }
++    let inlined = native::inline_and_fold_aggregates(san_ll);
++    if inlined == san_ll {
++        return Ok(spv);
++    }
++    match translate(&inlined) {
++        Ok(retry) if unwritten_private::unwritten_private_reads(&retry) < unwritten => Ok(retry),
++        _ => Ok(spv),
++    }
++}
++
++fn translate_sanitized_with_meta_once(
++    san_ll: &str,
++    stage: passes::Stage,
++    frag: Option<&meta::FragMeta>,
++    vert: Option<&meta::VertMeta>,
++    kern: Option<&meta::KernMeta>,
++    promoted_kern: Option<&meta::KernMeta>,
++    entry_name: Option<&str>,
++    tmp: &Path,
++    options: passes::TransformOptions,
++    psb_retry_enabled: bool,
+ ) -> Result<Vec<u8>, String> {
+     // Build the retry cascade context (S2): the former per-tier closures are now methods on
+     // `RetryCtx`, which captures the same locals (`san_ll`, `tmp`, the meta/stage/options `finish`
+diff --git a/src/native/mod.rs b/src/native/mod.rs
+index bf5d82c..19e999f 100644
+--- a/src/native/mod.rs
++++ b/src/native/mod.rs
+@@ -49,6 +49,16 @@ use crate::spirv_module::Instruction;
+ use crate::spirv_module::Operand;
+ use crate::spirv_module::{load_bytes, Module};
+ pub(crate) use async_copy::lower_simdgroup_async_copy;
++
++/// Inline every non-recursive internal helper and fold the aggregate round-trips that leaves: the
++/// text the inline+SROA tiers emit from, for a caller that decides on the emitted result instead of
++/// a validation error.
++pub(crate) fn inline_and_fold_aggregates(san_ll: &str) -> String {
++    sroa::promote_entry_allocas_and_fold_aggregates(&inline::inline_nonrecursive_internal_calls(
++        san_ll,
++    ))
++}
++
+ pub use diagnostics::{
+     cond_other_witness_report, irreducible_region_report, param_pointee_check,
+     straddle_region_report, straddle_witness_report, structured_reject_loop_classes,
+diff --git a/src/unwritten_private.rs b/src/unwritten_private.rs
+new file mode 100644
+index 0000000..ecb7f47
+--- /dev/null
++++ b/src/unwritten_private.rs
+@@ -0,0 +1,153 @@
++//! Count the zero Private variables a translated module reads but never writes.
++//!
++//! When the emitter cannot trace a pointer, it stands in a Private variable initialised to
++//! `OpConstantNull` (see `emit_private_zero_pointer_value_at`). The module still validates, so no
++//! retry tier fires, but every load through that pointer reads zero. A pointer the emitter loses
++//! this way usually crosses a helper call: an argument-buffer pointer returned inside Core Image's
++//! `coreimage::Sampler_h`, or the offset table CoreAnimation's `narrow_blur_19_sample` receives as
++//! a parameter. Those kernels then sample at (0, 0) or with zero offsets.
++//!
++//! The count walks the binary's words, so it needs no parse of the module: a variable is the root
++//! of every access chain, copy and bitcast taken from it, and it counts when some `OpLoad` or
++//! `OpCopyMemory` reads through it and no `OpStore` or `OpCopyMemory` writes through it.
++
++use std::collections::{HashMap, HashSet};
++
++const OP_CONSTANT_NULL: u32 = 46;
++const OP_VARIABLE: u32 = 59;
++const OP_LOAD: u32 = 61;
++const OP_STORE: u32 = 62;
++const OP_COPY_MEMORY: u32 = 63;
++const OP_ACCESS_CHAIN: u32 = 65;
++const OP_IN_BOUNDS_ACCESS_CHAIN: u32 = 66;
++const OP_PTR_ACCESS_CHAIN: u32 = 67;
++const OP_IN_BOUNDS_PTR_ACCESS_CHAIN: u32 = 70;
++const OP_COPY_OBJECT: u32 = 83;
++const OP_BITCAST: u32 = 124;
++const STORAGE_CLASS_PRIVATE: u32 = 6;
++const HEADER_WORDS: usize = 5;
++
++/// How many zero-initialised Private variables `spv` reads and never writes. Zero for bytes that are
++/// not a little-endian SPIR-V module.
++pub(crate) fn unwritten_private_reads(spv: &[u8]) -> usize {
++    if !spv.len().is_multiple_of(4) {
++        return 0;
++    }
++    let words: Vec<u32> = spv
++        .chunks_exact(4)
++        .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
++        .collect();
++    if words.first() != Some(&spirv::MAGIC_NUMBER) || words.len() < HEADER_WORDS {
++        return 0;
++    }
++    let mut nulls = HashSet::new();
++    let mut root: HashMap<u32, u32> = HashMap::new();
++    let mut read = HashSet::new();
++    let mut written = HashSet::new();
++    let mut at = HEADER_WORDS;
++    while at < words.len() {
++        let count = (words[at] >> 16) as usize;
++        if count == 0 || at + count > words.len() {
++            return 0;
++        }
++        let operands = &words[at + 1..at + count];
++        match words[at] & 0xffff {
++            OP_CONSTANT_NULL if operands.len() >= 2 => {
++                nulls.insert(operands[1]);
++            }
++            OP_VARIABLE if operands.len() >= 4 => {
++                if operands[2] == STORAGE_CLASS_PRIVATE && nulls.contains(&operands[3]) {
++                    root.insert(operands[1], operands[1]);
++                }
++            }
++            OP_ACCESS_CHAIN
++            | OP_IN_BOUNDS_ACCESS_CHAIN
++            | OP_PTR_ACCESS_CHAIN
++            | OP_IN_BOUNDS_PTR_ACCESS_CHAIN
++            | OP_COPY_OBJECT
++            | OP_BITCAST
++                if operands.len() >= 3 =>
++            {
++                if let Some(&variable) = root.get(&operands[2]) {
++                    root.insert(operands[1], variable);
++                }
++            }
++            OP_LOAD if operands.len() >= 3 => {
++                if let Some(&variable) = root.get(&operands[2]) {
++                    read.insert(variable);
++                }
++            }
++            OP_STORE if !operands.is_empty() => {
++                if let Some(&variable) = root.get(&operands[0]) {
++                    written.insert(variable);
++                }
++            }
++            OP_COPY_MEMORY if operands.len() >= 2 => {
++                if let Some(&variable) = root.get(&operands[0]) {
++                    written.insert(variable);
++                }
++                if let Some(&variable) = root.get(&operands[1]) {
++                    read.insert(variable);
++                }
++            }
++            _ => {}
++        }
++        at += count;
++    }
++    read.difference(&written).count()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::unwritten_private_reads;
++
++    fn module(body: &[&[u32]]) -> Vec<u8> {
++        let mut words = vec![spirv::MAGIC_NUMBER, 0x0001_0400, 0, 100, 0];
++        for instruction in body {
++            words.push(((instruction.len() as u32) << 16) | instruction[0]);
++            words.extend_from_slice(&instruction[1..]);
++        }
++        words.iter().flat_map(|word| word.to_le_bytes()).collect()
++    }
++
++    // %1 float, %2 pointer type, %3 null, %4 Private variable initialised to %3.
++    const NULL: &[u32] = &[46, 1, 3];
++    const VARIABLE: &[u32] = &[59, 2, 4, 6, 3];
++
++    #[test]
++    fn a_load_through_a_copy_of_an_unwritten_zero_variable_counts() {
++        let copy: &[u32] = &[83, 2, 5, 4];
++        let load: &[u32] = &[61, 1, 6, 5];
++        assert_eq!(
++            unwritten_private_reads(&module(&[NULL, VARIABLE, copy, load])),
++            1
++        );
++    }
++
++    #[test]
++    fn a_variable_written_through_an_access_chain_does_not_count() {
++        let chain: &[u32] = &[66, 2, 5, 4, 7];
++        let store: &[u32] = &[62, 5, 8];
++        let load: &[u32] = &[61, 1, 6, 4];
++        assert_eq!(
++            unwritten_private_reads(&module(&[NULL, VARIABLE, chain, store, load])),
++            0
++        );
++    }
++
++    #[test]
++    fn a_function_variable_does_not_count() {
++        let function_variable: &[u32] = &[59, 2, 4, 7, 3];
++        let load: &[u32] = &[61, 1, 6, 4];
++        assert_eq!(
++            unwritten_private_reads(&module(&[NULL, function_variable, load])),
++            0
++        );
++    }
++
++    #[test]
++    fn bytes_that_are_not_spir_v_count_nothing() {
++        assert_eq!(unwritten_private_reads(&[1, 2, 3]), 0);
++        assert_eq!(unwritten_private_reads(&[0; 8]), 0);
++    }
++}
+-- 
+2.43.0
+
